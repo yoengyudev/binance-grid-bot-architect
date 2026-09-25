@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from threading import RLock
@@ -26,6 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger(__name__)
 MAX_LEVELS = 50
 SELL_AMOUNT_BUFFER = Decimal("0.002")
+RESET_SPACING_PERCENT = Decimal("2.5")
 
 
 class TradingHalt(RuntimeError):
@@ -158,6 +159,40 @@ class GridBot:
         self.upper_levels: List[Decimal] = []
         self.baseline_base: Optional[Decimal] = None
         self.stop_loss_triggered: Optional[Decimal] = None
+        self._grid_lock = RLock()
+        pending_text = self.database.get_state("grid_reset")
+        pending = json.loads(pending_text) if pending_text else None
+        self.pending_grid_bounds: Optional[Tuple[Decimal, Decimal]] = (
+            (Decimal(pending["lower"]), Decimal(pending["upper"])) if pending else None
+        )
+        self.grid_needs_reset = pending is not None
+
+    def grid_status(self) -> Tuple[Decimal, Decimal, Decimal, int]:
+        price = self._ticker_price()
+        with self._grid_lock:
+            return (price, self.config.lower_price, self.config.upper_price,
+                    len(self.levels) + len(self.upper_levels))
+
+    def request_grid_reset(self, lower_text: str, upper_text: str) -> None:
+        lower = _decimal(lower_text, "lower_price")
+        upper = _decimal(upper_text, "upper_price")
+        if not self.config.stop_loss_price < lower < upper:
+            raise ValueError("Require stop-loss < lower < upper.")
+        price = self._ticker_price()
+        if not lower < price < upper:
+            raise ValueError("Current price must be inside the new bounds.")
+        geometric_levels(price, lower, RESET_SPACING_PERCENT)
+        geometric_upper_levels(price, upper, RESET_SPACING_PERCENT)
+        with self._grid_lock:
+            if self.stop_controller.stop_requested.is_set():
+                raise RuntimeError("Bot is stopping; grid was not changed.")
+            if self.grid_needs_reset or self.database.get_state("grid_reset"):
+                raise RuntimeError("A grid reset is already in progress.")
+            request = {"phase": "canceling", "lower": str(lower),
+                       "upper": str(upper), "spacing": str(RESET_SPACING_PERCENT)}
+            self.database.set_state("grid_reset", json.dumps(request))
+            self.pending_grid_bounds = (lower, upper)
+            self.grid_needs_reset = True
 
     def _call(self, method: Any, *args: Any) -> Any:
         with self.exchange_lock:
@@ -263,6 +298,13 @@ class GridBot:
             raise ValueError("Order notional is below the market minimum.")
 
     def _fetch_order(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        carry_text = self.database.get_state("carry_inventory")
+        carry = json.loads(carry_text) if carry_text else {}
+        if carry.get("order_id") == row["order_id"]:
+            return {"id": row["order_id"], "status": "closed",
+                    "filled": row["amount"], "amount": row["amount"],
+                    "average": row["price"], "price": row["price"],
+                    "cost": carry["cost"], "fees": []}
         reference = row.get("exchange_order_id") or row["order_id"]
         if row.get("client_order_id"):
             order = self._call(
@@ -452,6 +494,12 @@ class GridBot:
     def _bot_base_exposure(self) -> Decimal:
         """Estimate only this bot's acquired base, including partial fills."""
         net_base = Decimal(0)
+        carry_text = self.database.get_state("carry_inventory")
+        carry = json.loads(carry_text) if carry_text else {}
+        if carry.get("order_id"):
+            row = self.database.get_order(carry["order_id"])
+            if row is not None:
+                net_base += _order_decimal(row["amount"])
         for row in self.database.fetch_all_orders():
             if not row.get("client_order_id"):
                 continue
@@ -465,6 +513,131 @@ class GridBot:
             else:
                 net_base -= filled
         return max(Decimal(0), net_base)
+
+    def _carry_inventory(self) -> Tuple[Decimal, Decimal]:
+        """Value remaining BTC by its tracked buy lots after all cancels settle."""
+        rows = self.database.fetch_all_orders()
+        sold_by_buy: Dict[str, Decimal] = {}
+        for row in rows:
+            if row["side"] != "SELL" or row["order_type"] != "LIMIT":
+                continue
+            if not row.get("parent_order_id"):
+                raise TradingHalt("An old sell has no cost-basis parent.")
+            sell = self._fetch_order(row)
+            parent = row["parent_order_id"]
+            sold = _order_decimal(sell.get("filled"))
+            sold_by_buy[parent] = sold_by_buy.get(parent, Decimal(0)) + sold
+            if sold > 0:
+                self._record_filled_sell(row)
+        amount = cost = Decimal(0)
+        prior_carry_text = self.database.get_state("carry_inventory")
+        prior_carry = json.loads(prior_carry_text) if prior_carry_text else {}
+        for row in rows:
+            if row["side"] != "BUY" or not (
+                row.get("client_order_id") or row["order_id"] == prior_carry.get("order_id")
+            ):
+                continue
+            buy = self._fetch_order(row)
+            filled = _order_decimal(buy.get("filled"))
+            if filled <= 0:
+                continue
+            net = filled - _fees_in_asset(buy, self.market["base"])
+            remaining = net - sold_by_buy.get(row["order_id"], Decimal(0))
+            if remaining < 0:
+                raise TradingHalt("Sold BTC exceeds a tracked buy lot.")
+            if net <= 0 or remaining == 0:
+                continue
+            spent = _order_decimal(buy.get("cost"), str(filled *
+                                   _order_decimal(buy.get("average") or buy.get("price"))))
+            spent += _fees_in_asset(buy, self.market["quote"])
+            amount += remaining
+            cost += spent * remaining / net
+        if amount > 0 and cost <= 0:
+            raise TradingHalt("Carried BTC has no verifiable cost basis.")
+        if amount > self._free_bot_base():
+            raise TradingHalt("Tracked BTC is not fully available after cancellation.")
+        return amount, cost
+
+    def _validate_reset_grid(self, new_config: GridConfig, price: Decimal,
+                             carry_amount: Decimal) -> Tuple[List[Decimal], List[Decimal]]:
+        lowers = geometric_levels(price, new_config.lower_price,
+                                  new_config.spacing_percent)
+        uppers = geometric_upper_levels(price, new_config.upper_price,
+                                        new_config.spacing_percent)
+        seed_quote = new_config.investment_quote * new_config.initial_inventory_percent / 100
+        lower_quote = (new_config.investment_quote - seed_quote) / len(lowers)
+        for raw in lowers:
+            level_price = self._price(raw)
+            self._check_order_size(level_price, self._amount(lower_quote / level_price))
+        upper_total = carry_amount if carry_amount > 0 else self._amount(seed_quote / price)
+        upper_amount = self._amount(upper_total * (1 - SELL_AMOUNT_BUFFER) / len(uppers))
+        for raw in uppers:
+            self._check_order_size(self._price(raw), upper_amount)
+        needed_quote = new_config.investment_quote if carry_amount == 0 else (
+            new_config.investment_quote - seed_quote)
+        if self._free_balance(self.market["quote"]) < needed_quote:
+            raise TradingHalt("Insufficient free quote for the replacement grid.")
+        return lowers, uppers
+
+    def reset_grid(self) -> bool:
+        """Process the persisted reset before an ordinary trading cycle."""
+        request_text = self.database.get_state("grid_reset")
+        if request_text is None:
+            self.pending_grid_bounds = None
+            self.grid_needs_reset = False
+            return False
+        request = json.loads(request_text)
+        if self.stop_controller.stop_requested.is_set():
+            raise TradingHalt("Stop requested during grid reset.")
+        if request["phase"] == "canceling":
+            canceled = self.stop_controller.cancel_tracked_orders()
+            if canceled.unresolved or self.database.fetch_active_grids():
+                raise TradingHalt("Old grid cancellation could not be verified.")
+            open_orders = self._call(self.exchange.fetch_open_orders, self.config.symbol)
+            if open_orders:
+                raise TradingHalt("Exchange still has open orders; reset stopped.")
+            carry_amount, carry_cost = self._carry_inventory()
+            price = self._ticker_price()
+            new_config = replace(self.config, lower_price=Decimal(request["lower"]),
+                                 upper_price=Decimal(request["upper"]),
+                                 spacing_percent=Decimal(request["spacing"]))
+            if not new_config.lower_price < price < new_config.upper_price:
+                raise TradingHalt("Price left the requested bounds during reset.")
+            lowers, uppers = self._validate_reset_grid(new_config, price, carry_amount)
+            baseline = self._free_balance(self.market["base"]) - carry_amount
+            if baseline < 0:
+                raise TradingHalt("Carried BTC exceeds the account balance.")
+            state = {"anchor": str(price), "baseline_base": str(baseline),
+                     "fingerprint": new_config.fingerprint()}
+            active = {"lower": request["lower"], "upper": request["upper"],
+                      "spacing": request["spacing"]}
+            request["phase"] = "placing"
+            carry_id = "carry-" + uuid.uuid4().hex if carry_amount > 0 else None
+            self.database.complete_grid_reset(
+                json.dumps(state, sort_keys=True), json.dumps(active),
+                json.dumps(request), carry_order_id=carry_id,
+                carry_price=str(carry_cost / carry_amount) if carry_id else None,
+                carry_amount=str(carry_amount) if carry_id else None,
+                carry_cost=str(carry_cost) if carry_id else None,
+            )
+            with self._grid_lock:
+                self.config = new_config
+                self.anchor = price
+                self.baseline_base = baseline
+                self.levels, self.upper_levels = lowers, uppers
+        elif request["phase"] != "placing":
+            raise TradingHalt("Unknown grid reset phase.")
+        for _ in range(3):
+            self.run_cycle()
+            latest = self.database.fetch_latest_orders_by_level()
+            expected = set(range(1, len(self.levels) + 1)) | set(
+                range(-1, -len(self.upper_levels) - 1, -1)) | {0}
+            if expected <= latest.keys():
+                self.database.finish_grid_reset()
+                self.pending_grid_bounds = None
+                self.grid_needs_reset = False
+                return True
+        raise TradingHalt("Replacement grid did not finish placing orders.")
 
     def _handle_stop_loss(self, price: Decimal) -> None:
         self.stop_loss_triggered = price
@@ -547,8 +720,21 @@ class GridBot:
         try:
             await telegram_bot.notify_startup(self.config.symbol)
             backoff = 1
-            while not self.stop_controller.stop_requested.is_set():
+            while True:
+                if self.stop_controller.stop_requested.is_set():
+                    break
                 try:
+                    if self.grid_needs_reset:
+                        await asyncio.to_thread(self.reset_grid)
+                        backoff = 1
+                        continue
+                    if self.database.get_state("grid_reset_notification_pending"):
+                        try:
+                            await telegram_bot.notify_grid_reset()
+                        except Exception:
+                            LOGGER.warning("Grid reset notification could not be delivered.")
+                        else:
+                            self.database.clear_state("grid_reset_notification_pending")
                     events = await asyncio.to_thread(self.run_cycle)
                     for kind, values in events:
                         if kind == "filled":
@@ -568,6 +754,8 @@ class GridBot:
                     backoff = min(backoff * 2, 60)
                 except Exception as error:
                     self.stop_controller.stop_requested.set()
+                    if self.grid_needs_reset:
+                        self.database.set_state("halt_reason", "grid_reset_failed")
                     if self.stop_loss_triggered is not None and not stop_loss_notified:
                         try:
                             await telegram_bot.notify_stop_loss(
@@ -647,6 +835,12 @@ def main() -> int:
         database = GridDatabase()
         _center_config_at_current_price(exchange, database)
         config = GridConfig.load()
+        active_config_text = database.get_state("active_grid_config")
+        if active_config_text:
+            active = json.loads(active_config_text)
+            config = replace(config, lower_price=Decimal(active["lower"]),
+                             upper_price=Decimal(active["upper"]),
+                             spacing_percent=Decimal(active["spacing"]))
         bot = GridBot(config, exchange, database)
         if arguments.check:
             current, planned, upper_planned = bot.prepare(persist=False)
@@ -664,7 +858,7 @@ def main() -> int:
             )
             return 0
         token, owner_chat_id = load_telegram_credentials()
-        telegram_bot = TelegramBot(token, owner_chat_id, bot.stop_controller)
+        telegram_bot = TelegramBot(token, owner_chat_id, bot.stop_controller, bot)
         asyncio.run(bot.run(telegram_bot))
         return 0
     except (ValueError, TradingHalt, ccxt.BaseError) as error:

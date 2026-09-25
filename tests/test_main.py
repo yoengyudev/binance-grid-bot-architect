@@ -1,5 +1,7 @@
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
@@ -92,6 +94,10 @@ class FakeSpotExchange:
             else:
                 self.base_free += Decimal(order["amount"]) - Decimal(order["filled"])
         return dict(self.orders[order["clientOrderId"]])
+
+    def fetch_open_orders(self, _symbol: str) -> list:
+        return [dict(order) for order in self.orders.values()
+                if order["status"] == "open"]
 
     def fill(self, client_id: str) -> None:
         order = self.orders[client_id]
@@ -199,6 +205,107 @@ class GridBotTests(unittest.TestCase):
             rows = bot.database.fetch_active_grids()
             self.assertEqual(len(rows), 1)
             self.assertIsNone(rows[0]["exchange_order_id"])
+
+    def test_setgrid_carries_btc_and_rebuilds_without_market_sale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.run_cycle()
+            bot.run_cycle()
+            first_seed = bot.database.fetch_latest_orders_by_level()[0]
+            first_seed_amount = Decimal(exchange.orders[first_seed["client_order_id"]]["filled"])
+            bot.request_grid_reset("75", "125")
+            self.assertTrue(bot.grid_needs_reset)
+            self.assertEqual(bot.database.get_state("grid_reset") is not None, True)
+            self.assertTrue(bot.reset_grid())
+            self.assertFalse(bot.grid_needs_reset)
+            self.assertEqual(bot.config.spacing_percent, Decimal("2.5"))
+            self.assertEqual(exchange.base_free, Decimal("1") + first_seed_amount -
+                             sum(Decimal(order["amount"])
+                                 for order in exchange.fetch_open_orders("BTC/USDT")
+                                 if order["side"] == "sell"))
+            self.assertFalse(any(order["side"] == "sell" and order["type"] == "market"
+                                 for order in exchange.orders.values()))
+            carry = bot.database.fetch_latest_orders_by_level()[0]
+            self.assertEqual(carry["status"], "FILLED")
+            self.assertTrue(carry["order_id"].startswith("carry-"))
+            self.assertEqual(Decimal(carry["amount"]), first_seed_amount)
+            self.assertEqual(len(exchange.fetch_open_orders("BTC/USDT")),
+                             len(bot.levels) + len(bot.upper_levels))
+            with closing(sqlite3.connect(path)) as connection:
+                archived = connection.execute(
+                    "SELECT COUNT(*) FROM archived_grid_orders"
+                ).fetchone()[0]
+            self.assertGreater(archived, 0)
+            self.assertEqual(bot.database.get_state("grid_reset"), None)
+
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            self.assertEqual(reopened._bot_base_exposure(), first_seed_amount)
+
+            reopened.request_grid_reset("74", "126")
+            self.assertTrue(reopened.reset_grid())
+            carried_again = reopened.database.fetch_latest_orders_by_level()[0]
+            self.assertEqual(Decimal(carried_again["amount"]), first_seed_amount)
+            self.assertEqual(Decimal(carried_again["price"]),
+                             Decimal(first_seed["price"]))
+
+    def test_setgrid_rejects_bad_bounds_without_canceling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            before = len(exchange.fetch_open_orders("BTC/USDT"))
+            for lower, upper in (("nan", "120"), ("120", "80"),
+                                 ("90", "95"), ("60", "120")):
+                with self.assertRaises(ValueError):
+                    bot.request_grid_reset(lower, upper)
+            self.assertEqual(len(exchange.fetch_open_orders("BTC/USDT")), before)
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+
+    def test_reset_preserves_cost_basis_after_old_sell_fill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            lower_buy = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.fill(lower_buy["client_order_id"])
+            bot.run_cycle()
+            upper_sell = bot.database.fetch_latest_orders_by_level()[-1]
+            sold = Decimal(upper_sell["amount"])
+            exchange.fill(upper_sell["client_order_id"])
+            bot.request_grid_reset("75", "125")
+
+            self.assertTrue(bot.reset_grid())
+
+            carry = bot.database.fetch_latest_orders_by_level()[0]
+            bought = Decimal(lower_buy["amount"])
+            self.assertEqual(Decimal(carry["amount"]), Decimal("5") + bought - sold)
+            expected_cost = Decimal("500") * (Decimal("5") - sold) / 5 + (
+                bought * Decimal(lower_buy["price"]))
+            self.assertAlmostEqual(Decimal(carry["price"]),
+                                   expected_cost / Decimal(carry["amount"]), places=8)
+            self.assertEqual(len(bot.database.fetch_trade_history()), 1)
+            self.assertFalse(any(order["type"] == "market" and order["side"] == "sell"
+                                 for order in exchange.orders.values()))
+
+    def test_reset_halts_if_carried_btc_cannot_fund_upper_sells(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            old_upper = bot.database.fetch_latest_orders_by_level()[-1]
+            exchange.fill(old_upper["client_order_id"])
+            bot.request_grid_reset("75", "125")
+
+            with self.assertRaisesRegex(ValueError, "market minimum"):
+                bot.reset_grid()
+
+            self.assertTrue(bot.grid_needs_reset)
+            self.assertEqual(bot.database.get_state("grid_reset") is not None, True)
+            self.assertFalse(exchange.fetch_open_orders("BTC/USDT"))
+            self.assertFalse(any(order["type"] == "market" and order["side"] == "sell"
+                                 for order in exchange.orders.values()))
 
 
 if __name__ == "__main__":

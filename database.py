@@ -1,5 +1,6 @@
 """Persistent local state for grid orders and completed trades (Phase 2)."""
 
+import json
 import sqlite3
 from contextlib import closing, contextmanager
 from decimal import Decimal, InvalidOperation
@@ -123,6 +124,14 @@ class GridDatabase:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS archived_grid_orders AS
+                SELECT grid_orders.*, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    AS archived_at
+                FROM grid_orders WHERE 0
                 """
             )
 
@@ -264,6 +273,64 @@ class GridDatabase:
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """,
                 (key, value),
+            )
+
+    def complete_grid_reset(self, grid_run: str, active_config: str,
+                            placing_request: str, *, carry_order_id: Optional[str] = None,
+                            carry_price: Optional[str] = None,
+                            carry_amount: Optional[str] = None,
+                            carry_cost: Optional[str] = None) -> None:
+        """Archive old lanes and switch runs in one SQLite transaction."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT COUNT(*) FROM grid_orders "
+                "WHERE status IN ('OPEN', 'PARTIALLY_FILLED')"
+            ).fetchone()[0]
+            if active:
+                raise ValueError("Old grid still has active orders.")
+            connection.execute(
+                "INSERT INTO archived_grid_orders "
+                "SELECT grid_orders.*, strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+                "FROM grid_orders"
+            )
+            connection.execute("DELETE FROM grid_orders")
+            if carry_order_id is not None:
+                if not all((carry_price, carry_amount, carry_cost)):
+                    raise ValueError("Carry inventory has incomplete cost basis.")
+                connection.execute(
+                    "INSERT INTO grid_orders "
+                    "(order_id, order_type, level, side, price, amount, status) "
+                    "VALUES (?, 'MARKET', 0, 'BUY', ?, ?, 'FILLED')",
+                    (carry_order_id, carry_price, carry_amount),
+                )
+            for key, value in (
+                ("grid_run", grid_run),
+                ("active_grid_config", active_config),
+                ("grid_reset", placing_request),
+                ("carry_inventory", json.dumps({
+                    "order_id": carry_order_id, "cost": carry_cost,
+                })),
+            ):
+                connection.execute(
+                    "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+
+    def clear_state(self, key: str) -> None:
+        with self._connection() as connection:
+            connection.execute("DELETE FROM bot_state WHERE key = ?", (key,))
+
+    def finish_grid_reset(self) -> None:
+        """Mark placement complete and queue its owner notification atomically."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM bot_state WHERE key = 'grid_reset'")
+            connection.execute(
+                "INSERT INTO bot_state (key, value) "
+                "VALUES ('grid_reset_notification_pending', '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'"
             )
 
     def record_trade(

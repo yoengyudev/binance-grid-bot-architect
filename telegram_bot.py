@@ -1,4 +1,4 @@
-"""Phase 3: owner-only Telegram alerts and a /stop kill switch."""
+"""Owner-only Telegram alerts and grid controls."""
 
 import argparse
 import asyncio
@@ -65,6 +65,10 @@ class StopController:
     def request_stop(self) -> StopResult:
         """Signal stop before making any exchange calls; retry unresolved rows later."""
         self.stop_requested.set()
+        return self.cancel_tracked_orders()
+
+    def cancel_tracked_orders(self) -> StopResult:
+        """Cancel tracked orders without pausing the trading loop."""
         canceled = filled = unresolved = 0
         with self._lock:
             for order in self.database.fetch_active_grids():
@@ -117,11 +121,13 @@ class StopController:
 class TelegramBot:
     """Use inside the Phase 4 asyncio loop for alerts and polling."""
 
-    def __init__(self, token: str, owner_chat_id: int, stop_controller: StopController) -> None:
+    def __init__(self, token: str, owner_chat_id: int, stop_controller: StopController,
+                 grid_bot: Optional[Any] = None) -> None:
         if not token or owner_chat_id <= 0:
             raise ValueError("A bot token and positive owner private chat ID are required.")
         self.owner_chat_id = owner_chat_id
         self.stop_controller = stop_controller
+        self.grid_bot = grid_bot
         self.application: Application = ApplicationBuilder().token(token).build()
         owner_filter = (
             filters.User(user_id=owner_chat_id)
@@ -131,6 +137,14 @@ class TelegramBot:
         self.application.add_handler(
             CommandHandler("stop", self._handle_stop, filters=owner_filter, has_args=False)
         )
+        if grid_bot is not None:
+            self.application.add_handler(
+                CommandHandler("status", self._handle_status,
+                               filters=owner_filter, has_args=False)
+            )
+            self.application.add_handler(
+                CommandHandler("setgrid", self._handle_setgrid, filters=owner_filter)
+            )
         self._initialized = False
 
     @staticmethod
@@ -160,6 +174,40 @@ class TelegramBot:
             "Trading stopped. "
             f"Canceled: {result.canceled}; already filled: {result.filled}; "
             f"unresolved: {result.unresolved}."
+        )
+
+    async def _handle_status(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
+            return
+        try:
+            price, lower, upper, levels = await asyncio.to_thread(self.grid_bot.grid_status)
+        except Exception:
+            await update.effective_message.reply_text("Could not fetch grid status. Check bot logs.")
+            return
+        await update.effective_message.reply_text(
+            f"BTC/USDT current price: {price} USDT\n"
+            f"Active bounds: {lower}–{upper} USDT\n"
+            f"Total grid levels: {levels}"
+        )
+
+    async def _handle_setgrid(self, update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
+            return
+        args = context.args or []
+        if len(args) != 2:
+            await update.effective_message.reply_text("Usage: /setgrid <lower> <upper>")
+            return
+        try:
+            await asyncio.to_thread(self.grid_bot.request_grid_reset, args[0], args[1])
+        except (ValueError, RuntimeError) as error:
+            await update.effective_message.reply_text(f"Grid update rejected: {error}")
+            return
+        except Exception:
+            await update.effective_message.reply_text("Grid update failed. Check bot logs.")
+            return
+        await update.effective_message.reply_text(
+            "✅ Grid bounds updated. Canceling old orders and rebuilding grid..."
         )
 
     async def start(self) -> None:
@@ -195,6 +243,9 @@ class TelegramBot:
     async def notify_critical_error(self, error: Exception) -> None:
         # Do not send raw exception text: exchange errors may contain request details.
         await self._send(f"Critical bot error: {type(error).__name__}.")
+
+    async def notify_grid_reset(self) -> None:
+        await self._send("✅ New grid successfully placed and active.")
 
 
 async def _send_test_notification() -> None:

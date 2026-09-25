@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -72,6 +73,56 @@ class TelegramBotTests(unittest.TestCase):
             asyncio.run(bot._handle_stop(update(12345, 12345, "private"), None))
             self.assertTrue(controller.stop_requested.is_set())
             self.assertIn("Trading stopped", replies[0])
+
+    def test_status_and_setgrid_are_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            controller = StopController(FakeExchange(), database, "BTC/USDT")
+
+            class GridStub:
+                def __init__(self):
+                    self.requests = []
+                    self.status_calls = 0
+
+                def grid_status(self):
+                    self.status_calls += 1
+                    return (Decimal("100"), Decimal("75"), Decimal("125"), 20)
+
+                def request_grid_reset(self, lower, upper):
+                    self.requests.append((lower, upper))
+
+            grid = GridStub()
+            bot = TelegramBot("123456:ABCDEF", 12345, controller, grid)
+            replies = []
+
+            async def reply_text(value):
+                replies.append(value)
+
+            def update(user_id, chat_id, chat_type):
+                return SimpleNamespace(
+                    effective_user=SimpleNamespace(id=user_id),
+                    effective_chat=SimpleNamespace(id=chat_id, type=chat_type),
+                    effective_message=SimpleNamespace(reply_text=reply_text),
+                )
+
+            outsider = update(999, 12345, "private")
+            owner = update(12345, 12345, "private")
+            asyncio.run(bot._handle_status(outsider, None))
+            asyncio.run(bot._handle_setgrid(outsider, SimpleNamespace(args=["75", "125"])))
+            self.assertEqual(grid.status_calls, 0)
+            self.assertEqual(grid.requests, [])
+            self.assertEqual(replies, [])
+
+            asyncio.run(bot._handle_status(owner, None))
+            self.assertIn("Total grid levels: 20", replies[-1])
+            asyncio.run(bot._handle_setgrid(owner, SimpleNamespace(args=["75"])))
+            self.assertEqual(grid.requests, [])
+            asyncio.run(bot._handle_setgrid(owner, SimpleNamespace(args=["75", "125"])))
+            self.assertEqual(grid.requests, [("75", "125")])
+            self.assertEqual(
+                replies[-1],
+                "✅ Grid bounds updated. Canceling old orders and rebuilding grid...",
+            )
 
 
 if __name__ == "__main__":
