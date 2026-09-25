@@ -10,8 +10,11 @@ from threading import Event, Lock, RLock
 from typing import Any, Optional, Tuple
 
 from dotenv import load_dotenv
-from telegram import Bot, Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, filters
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler,
+    ContextTypes, filters,
+)
 
 from database import GridDatabase
 
@@ -169,6 +172,16 @@ class TelegramBot:
             & filters.ChatType.PRIVATE
         )
         self.application.add_handler(
+            CommandHandler("start", self._handle_start,
+                           filters=owner_filter, has_args=False)
+        )
+        self.application.add_handler(
+            CallbackQueryHandler(
+                self._handle_menu_callback,
+                pattern=r"^menu:(?:status|orders|setgrid|stop)$",
+            )
+        )
+        self.application.add_handler(
             CommandHandler("stop", self._handle_stop, filters=owner_filter, has_args=False)
         )
         if grid_bot is not None:
@@ -199,6 +212,47 @@ class TelegramBot:
             and chat.id == owner_chat_id
             and chat.type == "private"
         )
+
+    async def _handle_start(self, update: Update,
+                            _context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update, self.owner_chat_id):
+            return
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 Status", callback_data="menu:status"),
+             InlineKeyboardButton("📋 Open Orders", callback_data="menu:orders")],
+            [InlineKeyboardButton("⚙️ Set Grid", callback_data="menu:setgrid"),
+             InlineKeyboardButton("🛑 Stop Bot", callback_data="menu:stop")],
+        ])
+        await update.effective_message.reply_text(
+            "🤖 <b>Welcome to your Grid Bot</b>\n\n"
+            "Manage your BTC/USDT Spot Testnet grid from here. "
+            "Choose an action below:",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+
+    async def _handle_menu_callback(self, update: Update,
+                                    context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        if not self._is_owner(update, self.owner_chat_id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        await query.answer()
+        action = query.data
+        if action == "menu:status":
+            await self._handle_status(update, context)
+        elif action == "menu:orders":
+            await self._handle_orders(update, context)
+        elif action == "menu:setgrid":
+            await update.effective_message.reply_text(
+                "⚙️ To update the grid, send /setgrid <lower> <upper>\n"
+                "Example: /setgrid 72000 95000\n"
+                "The stop-loss must be below the new lower bound."
+            )
+        elif action == "menu:stop":
+            await self._handle_stop(update, context)
 
     async def _handle_stop(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id):

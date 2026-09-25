@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from telegram.ext import CallbackQueryHandler
+
 from database import GridDatabase
 from telegram_bot import StopController, TelegramBot, _format_open_order_messages
 
@@ -30,6 +32,73 @@ class FakeExchange:
 
 
 class TelegramBotTests(unittest.TestCase):
+    def test_start_menu_and_callbacks_are_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            controller = StopController(FakeExchange(), database, "BTC/USDT")
+            grid = SimpleNamespace(
+                grid_status=lambda: (Decimal("100"), Decimal("75"), Decimal("125"),
+                                     20, Decimal("70")),
+                open_order_summary=lambda _price: (1, 1, Decimal("99"), Decimal("101")),
+                list_open_orders=lambda: (
+                    "BTC", "USDT", [(Decimal("0.01"), Decimal("99"))],
+                    [(Decimal("0.02"), Decimal("101"))],
+                ),
+            )
+            bot = TelegramBot("123456:ABCDEF", 12345, controller, grid)
+            self.assertTrue(any(
+                isinstance(handler, CallbackQueryHandler)
+                for handlers in bot.application.handlers.values()
+                for handler in handlers
+            ))
+            replies = []
+            acknowledgements = []
+
+            async def reply_text(message, **kwargs):
+                replies.append((message, kwargs))
+
+            async def answer(*args, **kwargs):
+                acknowledgements.append((args, kwargs))
+
+            def update(user_id, chat_id, action=None):
+                return SimpleNamespace(
+                    effective_user=SimpleNamespace(id=user_id),
+                    effective_chat=SimpleNamespace(id=chat_id, type="private"),
+                    effective_message=SimpleNamespace(reply_text=reply_text),
+                    callback_query=(SimpleNamespace(data=action, answer=answer)
+                                    if action else None),
+                )
+
+            asyncio.run(bot._handle_start(update(999, 12345), None))
+            self.assertEqual(replies, [])
+            asyncio.run(bot._handle_start(update(12345, 12345), None))
+            welcome, options = replies.pop()
+            self.assertIn("Welcome", welcome)
+            self.assertEqual(options["parse_mode"], "HTML")
+            buttons = options["reply_markup"].inline_keyboard
+            self.assertEqual([len(row) for row in buttons], [2, 2])
+            self.assertEqual(
+                [button.callback_data for row in buttons for button in row],
+                ["menu:status", "menu:orders", "menu:setgrid", "menu:stop"],
+            )
+
+            asyncio.run(bot._handle_menu_callback(update(999, 12345, "menu:stop"), None))
+            self.assertFalse(controller.stop_requested.is_set())
+            self.assertEqual(replies, [])
+            self.assertEqual(acknowledgements[-1][1],
+                             {"show_alert": True})
+
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:status"), None))
+            self.assertIn("Total grid levels: 20", replies.pop()[0])
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:orders"), None))
+            self.assertIn("Buy 0.01 BTC @ 99 USDT", replies.pop()[0])
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
+            self.assertIn("/setgrid <lower> <upper>", replies.pop()[0])
+            self.assertFalse(controller.stop_requested.is_set())
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:stop"), None))
+            self.assertTrue(controller.stop_requested.is_set())
+            self.assertIn("Trading stopped", replies.pop()[0])
+
     def test_stop_pauses_and_reconciles_tracked_orders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
