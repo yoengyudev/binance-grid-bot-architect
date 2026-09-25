@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,8 @@ from database import GridDatabase
 
 
 BASE_DIR = Path(__file__).resolve().parent
+STATUS_API_TIMEOUT_SECONDS = 12
+LOGGER = logging.getLogger(__name__)
 
 
 def load_telegram_credentials() -> Tuple[str, int]:
@@ -183,17 +186,45 @@ class TelegramBot:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
         try:
-            price, lower, upper, levels, stop_loss = await asyncio.to_thread(
-                self.grid_bot.grid_status
+            price, lower, upper, levels, stop_loss = await asyncio.wait_for(
+                asyncio.to_thread(self.grid_bot.grid_status),
+                timeout=STATUS_API_TIMEOUT_SECONDS,
             )
-        except Exception:
-            await update.effective_message.reply_text("Could not fetch grid status. Check bot logs.")
-            return
+        except Exception as error:
+            LOGGER.warning("Status price request failed: %s", type(error).__name__)
+            price = None
+            try:
+                lower, upper, levels, stop_loss = self.grid_bot.grid_configuration()
+            except Exception:
+                await update.effective_message.reply_text(
+                    "Could not read grid settings. Check bot logs."
+                )
+                return
+        try:
+            buy_count, sell_count, closest_buy, closest_sell = await asyncio.wait_for(
+                asyncio.to_thread(self.grid_bot.open_order_summary, price),
+                timeout=STATUS_API_TIMEOUT_SECONDS,
+            )
+            buy_price = (f"{closest_buy} USDT" if closest_buy is not None else
+                         "none" if buy_count == 0 else "unavailable")
+            sell_price = (f"{closest_sell} USDT" if closest_sell is not None else
+                          "none" if sell_count == 0 else "unavailable")
+            orders_text = (
+                f"BUY limit orders: {buy_count}\n"
+                f"SELL limit orders: {sell_count}\n"
+                f"Closest BUY: {buy_price}\n"
+                f"Closest SELL: {sell_price}"
+            )
+        except Exception as error:
+            LOGGER.warning("Status open-order request failed: %s", type(error).__name__)
+            orders_text = "Open orders unavailable (exchange request failed or timed out)."
         await update.effective_message.reply_text(
-            f"BTC/USDT current price: {price} USDT\n"
+            f"BTC/USDT current price: {price if price is not None else 'unavailable'}"
+            f"{' USDT' if price is not None else ''}\n"
             f"Active bounds: {lower}–{upper} USDT\n"
             f"Total grid levels: {levels}\n"
-            f"Stop-loss: {stop_loss} USDT"
+            f"Stop-loss: {stop_loss} USDT\n\n"
+            f"Live open orders:\n{orders_text}"
         )
 
     async def _handle_setgrid(self, update: Update,

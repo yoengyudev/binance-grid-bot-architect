@@ -169,10 +169,64 @@ class GridBot:
 
     def grid_status(self) -> Tuple[Decimal, Decimal, Decimal, int, Decimal]:
         price = self._ticker_price()
+        lower, upper, levels, stop_loss = self.grid_configuration()
+        return price, lower, upper, levels, stop_loss
+
+    def grid_configuration(self) -> Tuple[Decimal, Decimal, int, Decimal]:
+        """Read the active settings without making an exchange request."""
         with self._grid_lock:
-            return (price, self.config.lower_price, self.config.upper_price,
+            return (self.config.lower_price, self.config.upper_price,
                     len(self.levels) + len(self.upper_levels),
                     self.config.stop_loss_price)
+
+    def open_order_summary(
+        self, current_price: Optional[Decimal]
+    ) -> Tuple[int, int, Optional[Decimal], Optional[Decimal]]:
+        """Count live Spot limit orders, including orders outside local SQLite tracking."""
+        with self._grid_lock:
+            symbol = self.config.symbol
+        orders = self._call(self.exchange.fetch_open_orders, symbol)
+        if not isinstance(orders, list):
+            raise TradingHalt("Exchange returned an invalid open-order list.")
+        buy_count = sell_count = 0
+        buy_prices: List[Decimal] = []
+        sell_prices: List[Decimal] = []
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            info = order.get("info")
+            raw_type = order.get("type") or (
+                info.get("type") if isinstance(info, dict) else None
+            )
+            order_type = str(raw_type or "").lower()
+            if order_type not in ("limit", "limit_maker"):
+                continue
+            if str(order.get("status") or "open").lower() != "open":
+                continue
+            side = str(order.get("side") or "").lower()
+            if side == "buy":
+                buy_count += 1
+                prices = buy_prices
+            elif side == "sell":
+                sell_count += 1
+                prices = sell_prices
+            else:
+                continue
+            try:
+                price = Decimal(str(order.get("price")))
+            except InvalidOperation:
+                continue
+            if price.is_finite() and price > 0:
+                prices.append(price)
+        closest_buy = (
+            min(buy_prices, key=lambda price: abs(price - current_price))
+            if buy_prices and current_price is not None else None
+        )
+        closest_sell = (
+            min(sell_prices, key=lambda price: abs(price - current_price))
+            if sell_prices and current_price is not None else None
+        )
+        return buy_count, sell_count, closest_buy, closest_sell
 
     def set_stop_loss(self, price_text: str) -> Decimal:
         try:

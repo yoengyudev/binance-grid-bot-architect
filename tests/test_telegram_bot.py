@@ -1,9 +1,11 @@
 import asyncio
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from database import GridDatabase
 from telegram_bot import StopController, TelegramBot
@@ -84,11 +86,26 @@ class TelegramBotTests(unittest.TestCase):
                     self.requests = []
                     self.stop_requests = []
                     self.status_calls = 0
+                    self.fail_price = False
+                    self.fail_orders = False
+                    self.slow_price = False
 
                 def grid_status(self):
                     self.status_calls += 1
+                    if self.slow_price:
+                        time.sleep(0.05)
+                    if self.fail_price:
+                        raise RuntimeError("Ticker unavailable")
                     return (Decimal("100"), Decimal("75"), Decimal("125"), 20,
                             Decimal("70"))
+
+                def grid_configuration(self):
+                    return (Decimal("75"), Decimal("125"), 20, Decimal("70"))
+
+                def open_order_summary(self, _price):
+                    if self.fail_orders:
+                        raise RuntimeError("Exchange unavailable")
+                    return (3, 2, Decimal("99"), Decimal("101"))
 
                 def request_grid_reset(self, lower, upper):
                     self.requests.append((lower, upper))
@@ -128,6 +145,20 @@ class TelegramBotTests(unittest.TestCase):
             asyncio.run(bot._handle_status(owner, None))
             self.assertIn("Total grid levels: 20", replies[-1])
             self.assertIn("Stop-loss: 70 USDT", replies[-1])
+            self.assertIn("BUY limit orders: 3", replies[-1])
+            self.assertIn("SELL limit orders: 2", replies[-1])
+            self.assertIn("Closest BUY: 99 USDT", replies[-1])
+            self.assertIn("Closest SELL: 101 USDT", replies[-1])
+            grid.fail_orders = True
+            asyncio.run(bot._handle_status(owner, None))
+            self.assertIn("Active bounds: 75–125 USDT", replies[-1])
+            self.assertIn("Open orders unavailable", replies[-1])
+            grid.fail_orders = False
+            grid.slow_price = True
+            with patch("telegram_bot.STATUS_API_TIMEOUT_SECONDS", 0.01):
+                asyncio.run(bot._handle_status(owner, None))
+            self.assertIn("current price: unavailable", replies[-1])
+            self.assertIn("BUY limit orders: 3", replies[-1])
             asyncio.run(bot._handle_setgrid(owner, SimpleNamespace(args=["75"])))
             self.assertEqual(grid.requests, [])
             asyncio.run(bot._handle_setgrid(owner, SimpleNamespace(args=["75", "125"])))

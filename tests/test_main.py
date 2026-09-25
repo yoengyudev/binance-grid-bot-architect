@@ -314,6 +314,28 @@ class GridBotTests(unittest.TestCase):
             )
             self.assertIsNone(bot.database.get_state("active_grid_config"))
 
+    def test_status_counts_live_limit_orders_and_nearest_prices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.orders["external-buy"] = {
+                "id": "external-buy", "type": "limit", "side": "buy",
+                "status": "open", "price": "99",
+            }
+            exchange.orders["external-market"] = {
+                "id": "external-market", "type": "market", "side": "buy",
+                "status": "open", "price": "100",
+            }
+
+            self.assertEqual(
+                bot.open_order_summary(Decimal("100")),
+                (3, 1, Decimal("99"), Decimal("110.00")),
+            )
+            self.assertEqual(
+                bot.open_order_summary(None), (3, 1, None, None)
+            )
+
     def test_reset_preserves_cost_basis_after_old_sell_fill(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
