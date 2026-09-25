@@ -27,6 +27,7 @@ LOGGER = logging.getLogger(__name__)
 MAX_LEVELS = 50
 SELL_AMOUNT_BUFFER = Decimal("0.002")
 RESET_SPACING_PERCENT = Decimal("2.5")
+OpenOrderEntry = Tuple[Optional[Decimal], Optional[Decimal]]
 
 
 class TradingHalt(RuntimeError):
@@ -183,11 +184,7 @@ class GridBot:
         self, current_price: Optional[Decimal]
     ) -> Tuple[int, int, Optional[Decimal], Optional[Decimal]]:
         """Count live Spot limit orders, including orders outside local SQLite tracking."""
-        with self._grid_lock:
-            symbol = self.config.symbol
-        orders = self._call(self.exchange.fetch_open_orders, symbol)
-        if not isinstance(orders, list):
-            raise TradingHalt("Exchange returned an invalid open-order list.")
+        orders = self._live_open_orders()
         buy_count = sell_count = 0
         buy_prices: List[Decimal] = []
         sell_prices: List[Decimal] = []
@@ -227,6 +224,51 @@ class GridBot:
             if sell_prices and current_price is not None else None
         )
         return buy_count, sell_count, closest_buy, closest_sell
+
+    def _live_open_orders(self) -> List[Dict[str, Any]]:
+        with self._grid_lock:
+            symbol = self.config.symbol
+        orders = self._call(self.exchange.fetch_open_orders, symbol)
+        if not isinstance(orders, list):
+            raise TradingHalt("Exchange returned an invalid open-order list.")
+        return orders
+
+    def list_open_orders(
+        self,
+    ) -> Tuple[str, str, List[OpenOrderEntry], List[OpenOrderEntry]]:
+        """Return every live order by side, sorted nearest to market by limit price."""
+        with self._grid_lock:
+            base, quote = self.config.symbol.split("/")
+        buys: List[OpenOrderEntry] = []
+        sells: List[OpenOrderEntry] = []
+        orders = self._live_open_orders()
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("status") or "open").lower() != "open":
+                continue
+            side = str(order.get("side") or "").lower()
+            if side not in ("buy", "sell"):
+                continue
+            raw_amount = order.get("remaining")
+            if raw_amount is None:
+                raw_amount = order.get("amount")
+            try:
+                amount = Decimal(str(raw_amount))
+                if not amount.is_finite() or amount < 0:
+                    amount = None
+            except InvalidOperation:
+                amount = None
+            try:
+                price = Decimal(str(order.get("price")))
+            except InvalidOperation:
+                price = None
+            if price is not None and (not price.is_finite() or price <= 0):
+                price = None
+            (buys if side == "buy" else sells).append((amount, price))
+        buys.sort(key=lambda item: (item[1] is None, -(item[1] or Decimal(0))))
+        sells.sort(key=lambda item: (item[1] is None, item[1] or Decimal(0)))
+        return base, quote, buys, sells
 
     def set_stop_loss(self, price_text: str) -> Decimal:
         try:

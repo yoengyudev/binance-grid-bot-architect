@@ -336,6 +336,33 @@ class GridBotTests(unittest.TestCase):
                 bot.open_order_summary(None), (3, 1, None, None)
             )
 
+    def test_orders_lists_all_live_orders_sorted_by_price(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.orders["external-buy"] = {
+                "id": "external-buy", "side": "buy", "status": "open",
+                "type": "limit", "amount": "0.10", "remaining": "0.03", "price": "95",
+            }
+            exchange.orders["external-sell"] = {
+                "id": "external-sell", "side": "sell", "status": "open",
+                "type": "limit", "amount": "0.04", "price": "105",
+            }
+            exchange.orders["no-price"] = {
+                "id": "no-price", "side": "buy", "status": "open",
+                "type": "market", "amount": "0.02", "price": None,
+            }
+
+            base, quote, buys, sells = bot.list_open_orders()
+
+            self.assertEqual((base, quote), ("BTC", "USDT"))
+            self.assertEqual([price for _, price in buys],
+                             [Decimal("95"), Decimal("90"), Decimal("81"), None])
+            self.assertEqual(buys[0][0], Decimal("0.03"))
+            self.assertEqual([price for _, price in sells],
+                             [Decimal("105"), Decimal("110")])
+
     def test_reset_preserves_cost_basis_after_old_sell_fill(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")

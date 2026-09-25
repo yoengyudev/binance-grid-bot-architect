@@ -18,7 +18,38 @@ from database import GridDatabase
 
 BASE_DIR = Path(__file__).resolve().parent
 STATUS_API_TIMEOUT_SECONDS = 12
+TELEGRAM_MESSAGE_CHUNK_LENGTH = 4000
 LOGGER = logging.getLogger(__name__)
+
+
+def _format_open_order_messages(
+    base: str, quote: str, buys: Any, sells: Any
+) -> list[str]:
+    """Keep every order visible without exceeding Telegram's message limit."""
+    messages: list[str] = []
+    current = ""
+    for heading, side, orders in (
+        ("🟢 BUY Orders:", "Buy", buys),
+        ("🔴 SELL Orders:", "Sell", sells),
+    ):
+        if current and len(current) + len(heading) + 2 > TELEGRAM_MESSAGE_CHUNK_LENGTH:
+            messages.append(current)
+            current = ""
+        current += ("\n\n" if current else "") + heading
+        lines = []
+        for amount, price in orders:
+            amount_text = (f"{format(amount.normalize(), ',f')} {base}"
+                           if amount is not None else "amount unavailable")
+            price_text = (f"{format(price.normalize(), ',f')} {quote}"
+                          if price is not None else "price unavailable")
+            lines.append(f"{side} {amount_text} @ {price_text}")
+        for line in lines or ["None"]:
+            if len(current) + len(line) + 1 > TELEGRAM_MESSAGE_CHUNK_LENGTH:
+                messages.append(current)
+                current = f"{heading} (continued)"
+            current += "\n" + line
+    messages.append(current)
+    return messages
 
 
 def load_telegram_credentials() -> Tuple[str, int]:
@@ -151,6 +182,10 @@ class TelegramBot:
             self.application.add_handler(
                 CommandHandler("setstop", self._handle_setstop, filters=owner_filter)
             )
+            self.application.add_handler(
+                CommandHandler("orders", self._handle_orders,
+                               filters=owner_filter, has_args=False)
+            )
         self._initialized = False
 
     @staticmethod
@@ -226,6 +261,24 @@ class TelegramBot:
             f"Stop-loss: {stop_loss} USDT\n\n"
             f"Live open orders:\n{orders_text}"
         )
+
+    async def _handle_orders(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
+            return
+        try:
+            base, quote, buys, sells = await asyncio.wait_for(
+                asyncio.to_thread(self.grid_bot.list_open_orders),
+                timeout=STATUS_API_TIMEOUT_SECONDS,
+            )
+        except Exception as error:
+            LOGGER.warning("Orders request failed: %s", type(error).__name__)
+            await update.effective_message.reply_text(
+                "Could not fetch open orders (exchange request failed or timed out). "
+                "Please try again."
+            )
+            return
+        for message in _format_open_order_messages(base, quote, buys, sells):
+            await update.effective_message.reply_text(message)
 
     async def _handle_setgrid(self, update: Update,
                               context: ContextTypes.DEFAULT_TYPE) -> None:

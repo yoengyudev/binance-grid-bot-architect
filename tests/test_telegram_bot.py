@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from database import GridDatabase
-from telegram_bot import StopController, TelegramBot
+from telegram_bot import StopController, TelegramBot, _format_open_order_messages
 
 
 class FakeExchange:
@@ -76,7 +76,7 @@ class TelegramBotTests(unittest.TestCase):
             self.assertTrue(controller.stop_requested.is_set())
             self.assertIn("Trading stopped", replies[0])
 
-    def test_status_and_grid_controls_are_owner_only(self) -> None:
+    def test_status_orders_and_grid_controls_are_owner_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
             controller = StopController(FakeExchange(), database, "BTC/USDT")
@@ -86,9 +86,12 @@ class TelegramBotTests(unittest.TestCase):
                     self.requests = []
                     self.stop_requests = []
                     self.status_calls = 0
+                    self.order_list_calls = 0
                     self.fail_price = False
                     self.fail_orders = False
+                    self.fail_order_list = False
                     self.slow_price = False
+                    self.slow_order_list = False
 
                 def grid_status(self):
                     self.status_calls += 1
@@ -106,6 +109,18 @@ class TelegramBotTests(unittest.TestCase):
                     if self.fail_orders:
                         raise RuntimeError("Exchange unavailable")
                     return (3, 2, Decimal("99"), Decimal("101"))
+
+                def list_open_orders(self):
+                    self.order_list_calls += 1
+                    if self.slow_order_list:
+                        time.sleep(0.05)
+                    if self.fail_order_list:
+                        raise RuntimeError("Exchange unavailable")
+                    return (
+                        "BTC", "USDT",
+                        [(Decimal("0.01"), Decimal("82500"))],
+                        [(Decimal("0.02"), Decimal("87500"))],
+                    )
 
                 def request_grid_reset(self, lower, upper):
                     self.requests.append((lower, upper))
@@ -135,9 +150,11 @@ class TelegramBotTests(unittest.TestCase):
             outsider = update(999, 12345, "private")
             owner = update(12345, 12345, "private")
             asyncio.run(bot._handle_status(outsider, None))
+            asyncio.run(bot._handle_orders(outsider, None))
             asyncio.run(bot._handle_setgrid(outsider, SimpleNamespace(args=["75", "125"])))
             asyncio.run(bot._handle_setstop(outsider, SimpleNamespace(args=["70"])))
             self.assertEqual(grid.status_calls, 0)
+            self.assertEqual(grid.order_list_calls, 0)
             self.assertEqual(grid.requests, [])
             self.assertEqual(grid.stop_requests, [])
             self.assertEqual(replies, [])
@@ -159,6 +176,20 @@ class TelegramBotTests(unittest.TestCase):
                 asyncio.run(bot._handle_status(owner, None))
             self.assertIn("current price: unavailable", replies[-1])
             self.assertIn("BUY limit orders: 3", replies[-1])
+            asyncio.run(bot._handle_orders(owner, None))
+            self.assertIn("🟢 BUY Orders:", replies[-1])
+            self.assertIn("Buy 0.01 BTC @ 82,500 USDT", replies[-1])
+            self.assertIn("🔴 SELL Orders:", replies[-1])
+            self.assertIn("Sell 0.02 BTC @ 87,500 USDT", replies[-1])
+            grid.fail_order_list = True
+            asyncio.run(bot._handle_orders(owner, None))
+            self.assertIn("Could not fetch open orders", replies[-1])
+            grid.fail_order_list = False
+            grid.slow_order_list = True
+            with patch("telegram_bot.STATUS_API_TIMEOUT_SECONDS", 0.01):
+                asyncio.run(bot._handle_orders(owner, None))
+            self.assertIn("Could not fetch open orders", replies[-1])
+            grid.slow_order_list = False
             asyncio.run(bot._handle_setgrid(owner, SimpleNamespace(args=["75"])))
             self.assertEqual(grid.requests, [])
             asyncio.run(bot._handle_setgrid(owner, SimpleNamespace(args=["75", "125"])))
@@ -176,6 +207,14 @@ class TelegramBotTests(unittest.TestCase):
             asyncio.run(bot._handle_setstop(owner, SimpleNamespace(args=["70"])))
             self.assertEqual(replies[-1], "✅ Stop-loss successfully updated to: $70")
             self.assertEqual(grid.stop_requests, ["75", "70"])
+
+    def test_large_order_list_is_split_without_losing_orders(self) -> None:
+        buys = [(Decimal("0.01"), Decimal(80000 + index)) for index in range(150)]
+        messages = _format_open_order_messages("BTC", "USDT", buys, [])
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(message) <= 4000 for message in messages))
+        self.assertEqual(sum(message.count("Buy 0.01 BTC @") for message in messages), 150)
+        self.assertIn("🔴 SELL Orders:\nNone", messages[-1])
 
 
 if __name__ == "__main__":
