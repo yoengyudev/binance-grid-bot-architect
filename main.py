@@ -173,6 +173,35 @@ class GridBot:
         lower, upper, levels, stop_loss = self.grid_configuration()
         return price, lower, upper, levels, stop_loss
 
+    def wallet_balances(self) -> Dict[str, Dict[str, Optional[Decimal]]]:
+        """Read free and locked Spot balances for the configured pair."""
+        with self._grid_lock:
+            base, quote = self.config.symbol.split("/")
+        response = self._call(self.exchange.fetch_balance, {"type": "spot"})
+        if not isinstance(response, dict):
+            raise ValueError("Exchange returned an invalid balance response.")
+
+        balances: Dict[str, Dict[str, Optional[Decimal]]] = {}
+        for asset in (quote, base):
+            asset_data = response.get(asset)
+            balances[asset] = {}
+            for field in ("free", "used"):
+                raw = asset_data.get(field) if isinstance(asset_data, dict) else None
+                if raw is None:
+                    by_field = response.get(field)
+                    raw = by_field.get(asset) if isinstance(by_field, dict) else None
+                if raw is None:
+                    balances[asset][field] = None
+                    continue
+                try:
+                    value = Decimal(str(raw))
+                except InvalidOperation as error:
+                    raise ValueError("Exchange returned an invalid balance value.") from error
+                if not value.is_finite() or value < 0:
+                    raise ValueError("Exchange returned an invalid balance value.")
+                balances[asset][field] = value
+        return balances
+
     def grid_configuration(self) -> Tuple[Decimal, Decimal, int, Decimal]:
         """Read the active settings without making an exchange request."""
         with self._grid_lock:

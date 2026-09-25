@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from html import escape
 from pathlib import Path
 from threading import Event, Lock, RLock
@@ -30,6 +31,16 @@ TELEGRAM_MESSAGE_CHUNK_LENGTH = 4000
 ACTION_SESSION_SECONDS = 300
 PIN_LOCKOUT_SECONDS = 60
 LOGGER = logging.getLogger(__name__)
+
+
+def _format_balance_amount(value: Optional[Decimal], minimum_decimals: int) -> str:
+    if value is None:
+        return "Unavailable"
+    amount = format(value, ",f")
+    _, separator, fractional = amount.partition(".")
+    if not separator:
+        amount += "."
+    return amount + "0" * max(0, minimum_decimals - len(fractional))
 
 
 def _format_open_order_messages(
@@ -742,12 +753,29 @@ class TelegramBot:
             LOGGER.warning("Status open-order request failed: %s", type(error).__name__)
             buy_count = sell_count = "Unavailable"
             buy_price = sell_price = "Unavailable"
+        try:
+            balances = await asyncio.wait_for(
+                asyncio.to_thread(self.grid_bot.wallet_balances),
+                timeout=STATUS_API_TIMEOUT_SECONDS,
+            )
+        except Exception as error:
+            LOGGER.warning("Status balance request failed: %s", type(error).__name__)
+            balances = {}
+        usdt = balances.get("USDT") or {}
+        btc = balances.get("BTC") or {}
+        usdt_free = _format_balance_amount(usdt.get("free"), 2)
+        usdt_used = _format_balance_amount(usdt.get("used"), 2)
+        btc_free = _format_balance_amount(btc.get("free"), 8)
+        btc_used = _format_balance_amount(btc.get("used"), 8)
         current_price = f"{price} USDT" if price is not None else "Unavailable"
         return (
             "📊 <b>BOT STATUS &amp; ANALYTICS</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "💰 <b>Market:</b> BTC/USDT\n"
             f"📈 <b>Current Price:</b> {escape(current_price)}\n\n"
+            "💼 <b>Wallet Balance</b>\n"
+            f"• <b>Free USDT:</b> {usdt_free} | <b>Locked:</b> {usdt_used}\n"
+            f"• <b>Free BTC:</b> {btc_free} | <b>Locked:</b> {btc_used}\n\n"
             "⚙️ <b>Grid Configuration</b>\n"
             f"• <b>Bounds:</b> {escape(str(lower))} - {escape(str(upper))} USDT\n"
             f"• <b>Levels:</b> {escape(str(levels))}\n"

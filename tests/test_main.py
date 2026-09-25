@@ -4,6 +4,7 @@ import unittest
 from contextlib import closing
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
+from unittest.mock import patch
 
 from database import GridDatabase
 from main import (
@@ -335,6 +336,33 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(
                 bot.open_order_summary(None), (3, 1, None, None)
             )
+
+    def test_wallet_balances_reads_spot_free_and_used_without_trading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            with patch.object(exchange, "fetch_balance", return_value={
+                "USDT": {"free": "250.00", "used": "150.00"},
+                "BTC": {"free": "0.01234567", "used": "0.004"},
+            }) as fetch_balance:
+                self.assertEqual(bot.wallet_balances(), {
+                    "USDT": {"free": Decimal("250.00"), "used": Decimal("150.00")},
+                    "BTC": {"free": Decimal("0.01234567"), "used": Decimal("0.004")},
+                })
+                fetch_balance.assert_called_once_with({"type": "spot"})
+            self.assertEqual(exchange.orders, {})
+
+            with patch.object(exchange, "fetch_balance", return_value={
+                "free": {"USDT": 250}, "used": {"USDT": 0},
+            }):
+                self.assertEqual(bot.wallet_balances(), {
+                    "USDT": {"free": Decimal("250"), "used": Decimal("0")},
+                    "BTC": {"free": None, "used": None},
+                })
+            with patch.object(exchange, "fetch_balance", return_value={
+                "USDT": {"free": "-1", "used": "0"},
+            }):
+                with self.assertRaisesRegex(ValueError, "invalid balance value"):
+                    bot.wallet_balances()
 
     def test_orders_lists_all_live_orders_sorted_by_price(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
