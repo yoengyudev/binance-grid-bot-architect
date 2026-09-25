@@ -93,6 +93,18 @@ class PendingMenuInput:
     message_id: int
 
 
+class _PendingMenuInputFilter(filters.MessageFilter):
+    """Match owner text only while a settings prompt awaits a reply."""
+
+    def __init__(self, telegram_bot: "TelegramBot") -> None:
+        super().__init__(name="PendingMenuInput")
+        self.telegram_bot = telegram_bot
+
+    def filter(self, message: Any) -> bool:
+        pending = self.telegram_bot._pending_menu_input
+        return pending is not None and message.chat_id == pending.chat_id
+
+
 class StopController:
     """Pause the future trading loop and cancel only orders tracked by this bot."""
 
@@ -220,7 +232,8 @@ class TelegramBot:
             )
         )
         self.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND & owner_filter,
+            MessageHandler(filters.TEXT & ~filters.COMMAND & owner_filter
+                           & _PendingMenuInputFilter(self),
                            self._handle_menu_input)
         )
         self.application.add_handler(
@@ -241,6 +254,11 @@ class TelegramBot:
                 CommandHandler("orders", self._handle_orders,
                                filters=owner_filter, has_args=False)
             )
+        # Keep this last in group 0: PTB runs only the first matching handler
+        # in a group, so recognized commands and active inputs stay intact.
+        self.application.add_handler(
+            MessageHandler(filters.ALL, self._handle_unexpected_message), group=0
+        )
         self._initialized = False
 
     @staticmethod
@@ -564,19 +582,6 @@ class TelegramBot:
         pending = self._pending_menu_input
         message = update.effective_message
         if pending is None:
-            if (message is not None and self._pin_chat_id == update.effective_chat.id
-                    and self._pin_message_id is not None):
-                try:
-                    await message.delete()
-                except Exception as error:
-                    LOGGER.warning("Could not delete text sent during PIN entry: %s",
-                                   type(error).__name__)
-                await self._edit_pending_menu(
-                    context,
-                    PendingMenuInput("pin", self._pin_chat_id, self._pin_message_id),
-                    self._pin_prompt_view("Use the on-screen keypad, not chat text."),
-                    self._pin_keyboard(),
-                )
             return
         if (pending is None or self.grid_bot is None or message is None
                 or update.effective_chat.id != pending.chat_id):
@@ -663,6 +668,21 @@ class TelegramBot:
         await self._edit_pending_menu(
             context, pending, self._input_prompt(pending.action, error_text),
         )
+
+    async def _handle_unexpected_message(
+        self, update: Update, _context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Silently remove unmatched owner messages from the private chat."""
+        if not self._is_owner(update, self.owner_chat_id):
+            return
+        message = update.effective_message
+        if message is None:
+            return
+        try:
+            await message.delete()
+        except Exception as error:
+            LOGGER.warning("Could not delete unexpected message: %s",
+                           type(error).__name__)
 
     async def _handle_stop(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id):

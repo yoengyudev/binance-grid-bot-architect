@@ -2,11 +2,13 @@ import asyncio
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from telegram import Chat, Message, MessageEntity, Update, User
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, MessageHandler
@@ -34,6 +36,74 @@ class FakeExchange:
 
 
 class TelegramBotTests(unittest.TestCase):
+    def test_unexpected_messages_use_last_handler_and_delete_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            controller = StopController(FakeExchange(), database, "BTC/USDT")
+            bot = TelegramBot("123456:ABCDEF", 12345, controller,
+                              action_pin="1234")
+            handlers = bot.application.handlers[0]
+            fallback = handlers[-1]
+            self.assertIsInstance(fallback, MessageHandler)
+            self.assertEqual(fallback.callback, bot._handle_unexpected_message)
+
+            owner = User(id=12345, first_name="Owner", is_bot=False)
+            chat = Chat(id=12345, type="private")
+            bot.application.bot._bot_user = User(
+                id=123456, first_name="Grid Bot", is_bot=True,
+                username="grid_test_bot",
+            )
+
+            def update(**content):
+                message = Message(message_id=9, date=datetime.now(timezone.utc),
+                                  chat=chat, from_user=owner, **content)
+                message.set_bot(bot.application.bot)
+                return Update(update_id=1, message=message)
+
+            def first_match(item):
+                return next(handler for handler in handlers
+                            if handler.check_update(item))
+
+            for content in (
+                {"text": "unexpected"},
+                {"text": "/unknown", "entities": [
+                    MessageEntity(type="bot_command", offset=0, length=8)]},
+                {"sticker": object()},
+                {"photo": [object()]},
+                {"voice": object()},
+            ):
+                self.assertIs(first_match(update(**content)), fallback)
+
+            bot._pending_menu_input = SimpleNamespace(
+                action="grid", chat_id=12345, message_id=77,
+            )
+            self.assertEqual(first_match(update(text="75 125")).callback,
+                             bot._handle_menu_input)
+            self.assertIs(first_match(update(sticker=object())), fallback)
+
+            deletes = []
+            replies = []
+
+            async def delete():
+                deletes.append(True)
+                return True
+
+            async def reply_text(*_args, **_kwargs):
+                replies.append(True)
+
+            incoming = SimpleNamespace(
+                effective_user=SimpleNamespace(id=12345),
+                effective_chat=SimpleNamespace(id=12345, type="private"),
+                effective_message=SimpleNamespace(delete=delete, reply_text=reply_text),
+            )
+            asyncio.run(bot._handle_unexpected_message(incoming, None))
+            self.assertEqual(deletes, [True])
+            self.assertEqual(replies, [])
+
+            incoming.effective_user.id = 999
+            asyncio.run(bot._handle_unexpected_message(incoming, None))
+            self.assertEqual(deletes, [True])
+
     def test_start_menu_and_callbacks_are_owner_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
