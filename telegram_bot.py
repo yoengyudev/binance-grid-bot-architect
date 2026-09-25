@@ -2,8 +2,10 @@
 
 import argparse
 import asyncio
+import hmac
 import logging
 import os
+import time
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
@@ -25,6 +27,8 @@ from database import GridDatabase
 BASE_DIR = Path(__file__).resolve().parent
 STATUS_API_TIMEOUT_SECONDS = 12
 TELEGRAM_MESSAGE_CHUNK_LENGTH = 4000
+ACTION_SESSION_SECONDS = 300
+PIN_LOCKOUT_SECONDS = 60
 LOGGER = logging.getLogger(__name__)
 
 
@@ -170,13 +174,32 @@ class TelegramBot:
     """Use inside the Phase 4 asyncio loop for alerts and polling."""
 
     def __init__(self, token: str, owner_chat_id: int, stop_controller: StopController,
-                 grid_bot: Optional[Any] = None) -> None:
+                 grid_bot: Optional[Any] = None,
+                 action_pin: Optional[str] = None) -> None:
         if not token or owner_chat_id <= 0:
             raise ValueError("A bot token and positive owner private chat ID are required.")
         self.owner_chat_id = owner_chat_id
         self.stop_controller = stop_controller
         self.grid_bot = grid_bot
         self._pending_menu_input: Optional[PendingMenuInput] = None
+        self._action_pin = (
+            action_pin if action_pin is not None
+            else os.getenv("TELEGRAM_ACTION_PIN", "").strip()
+        )
+        if self._action_pin and not (
+            len(self._action_pin) == 4
+            and self._action_pin.isascii()
+            and self._action_pin.isdigit()
+        ):
+            LOGGER.error("TELEGRAM_ACTION_PIN must contain exactly four ASCII digits.")
+            self._action_pin = ""
+        self._clock = time.monotonic
+        self.session_expiry = 0.0
+        self._pin_buffer = ""
+        self._pin_chat_id: Optional[int] = None
+        self._pin_message_id: Optional[int] = None
+        self._failed_pin_attempts = 0
+        self._pin_locked_until = 0.0
         self.application: Application = ApplicationBuilder().token(token).build()
         owner_filter = (
             filters.User(user_id=owner_chat_id)
@@ -190,7 +213,10 @@ class TelegramBot:
         self.application.add_handler(
             CallbackQueryHandler(
                 self._handle_menu_callback,
-                pattern=r"^menu:(?:status|orders|setgrid|setstop|stop|back)$",
+                pattern=(
+                    r"^(?:menu:(?:root|views|actions|status|orders|setgrid|"
+                    r"setstop|stop|lock|back)|pin:(?:[0-9]|clear|cancel))$"
+                ),
             )
         )
         self.application.add_handler(
@@ -232,26 +258,87 @@ class TelegramBot:
     @staticmethod
     def _main_menu_view() -> Tuple[str, InlineKeyboardMarkup]:
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Bot Status", callback_data="menu:status"),
-             InlineKeyboardButton("📋 Open Orders", callback_data="menu:orders")],
-            [InlineKeyboardButton("⚙️ Set Grid Bounds", callback_data="menu:setgrid"),
-             InlineKeyboardButton("🛡️ Set Stop-Loss", callback_data="menu:setstop")],
-            [InlineKeyboardButton("🛑 Stop Bot", callback_data="menu:stop")],
+            [InlineKeyboardButton("👁️ View Analytics", callback_data="menu:views")],
+            [InlineKeyboardButton("🔐 Execute Actions", callback_data="menu:actions")],
         ])
         text = (
             "🤖 <b>Welcome to BTC/USDT Grid Master</b>\n\n"
             "<i>Your automated trading engine is online.</i>\n\n"
             "⚙️ <b>Current Mode:</b> Spot Testnet\n"
             "🛡️ <b>Security:</b> Owner Access Only\n\n"
-            "👇 Please select an operation from the menu below:"
+            "👇 Please select a section from the menu below:"
         )
         return text, keyboard
 
     @staticmethod
-    def _back_keyboard() -> InlineKeyboardMarkup:
+    def _views_menu_view() -> Tuple[str, InlineKeyboardMarkup]:
+        return (
+            "👁️ <b>VIEW ANALYTICS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Choose the information you want to see.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 Bot Status", callback_data="menu:status"),
+                 InlineKeyboardButton("📋 Open Orders", callback_data="menu:orders")],
+                [InlineKeyboardButton("🔙 Back", callback_data="menu:root")],
+            ]),
+        )
+
+    def _actions_menu_view(self) -> Tuple[str, InlineKeyboardMarkup]:
+        remaining = max(0, int(self.session_expiry - self._clock()))
+        return (
+            "🔐 <b>EXECUTE ACTIONS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 <b>Session:</b> {remaining} seconds remaining\n\n"
+            "Choose an action below.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Set Grid Bounds", callback_data="menu:setgrid"),
+                 InlineKeyboardButton("🛡️ Set Stop-Loss", callback_data="menu:setstop")],
+                [InlineKeyboardButton("🛑 Stop Bot", callback_data="menu:stop")],
+                [InlineKeyboardButton("🔒 Lock Session Now", callback_data="menu:lock")],
+                [InlineKeyboardButton("🔙 Back", callback_data="menu:root")],
+            ]),
+        )
+
+    @staticmethod
+    def _back_keyboard(target: str = "menu:root") -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔙 Back to Main Menu", callback_data="menu:back")
+            InlineKeyboardButton("🔙 Back", callback_data=target)
         ]])
+
+    @staticmethod
+    def _pin_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(str(digit), callback_data=f"pin:{digit}")
+             for digit in (1, 2, 3)],
+            [InlineKeyboardButton(str(digit), callback_data=f"pin:{digit}")
+             for digit in (4, 5, 6)],
+            [InlineKeyboardButton(str(digit), callback_data=f"pin:{digit}")
+             for digit in (7, 8, 9)],
+            [InlineKeyboardButton("Clear", callback_data="pin:clear"),
+             InlineKeyboardButton("0", callback_data="pin:0"),
+             InlineKeyboardButton("Cancel", callback_data="pin:cancel")],
+        ])
+
+    def _pin_prompt_view(self, error: Optional[str] = None) -> str:
+        masked = "●" * len(self._pin_buffer) + "○" * (4 - len(self._pin_buffer))
+        notice = f"\n\n⚠️ {escape(error)}" if error else ""
+        if self._clock() < self._pin_locked_until:
+            remaining = max(1, int(self._pin_locked_until - self._clock()))
+            notice = f"\n\n🔒 Too many attempts. Try again in {remaining} seconds."
+        return (
+            "🔐 <b>ENTER ACTION PIN</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Use the keypad to enter your four-digit PIN.\n\n"
+            f"<b>PIN:</b> {masked}{notice}"
+        )
+
+    def _actions_unlocked(self) -> bool:
+        return bool(self._action_pin and self._clock() < self.session_expiry)
+
+    def _reset_pin_entry(self) -> None:
+        self._pin_buffer = ""
+        self._pin_chat_id = None
+        self._pin_message_id = None
 
     @staticmethod
     def _input_prompt(action: str, error: Optional[str] = None) -> str:
@@ -287,12 +374,79 @@ class TelegramBot:
         if not self._is_owner(update, self.owner_chat_id):
             return
         self._pending_menu_input = None
+        self._reset_pin_entry()
         text, keyboard = self._main_menu_view()
         await update.effective_message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
+
+    async def _show_pin_challenge(self, update: Update) -> None:
+        query = update.callback_query
+        self._pending_menu_input = None
+        self._reset_pin_entry()
+        if not self._action_pin:
+            await self._edit_menu_message(
+                query,
+                "🔒 <b>ACTIONS UNAVAILABLE</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "The action PIN is not configured on the server.",
+                self._back_keyboard("menu:root"), ParseMode.HTML,
+            )
+            return
+        await self._edit_menu_message(
+            query, self._pin_prompt_view(), self._pin_keyboard(), ParseMode.HTML,
+        )
+        self._pin_chat_id = update.effective_chat.id
+        self._pin_message_id = query.message.message_id
+
+    async def _handle_pin_callback(self, update: Update) -> dict[str, Any]:
+        query = update.callback_query
+        if (query.message is None or self._pin_chat_id != update.effective_chat.id
+                or self._pin_message_id != query.message.message_id):
+            return {"text": "Open Execute Actions again.", "show_alert": True}
+        action = query.data
+        if action == "pin:cancel":
+            self._reset_pin_entry()
+            text, keyboard = self._main_menu_view()
+            await self._edit_menu_message(query, text, keyboard, ParseMode.HTML)
+            return {}
+        if self._clock() < self._pin_locked_until:
+            await self._edit_menu_message(
+                query, self._pin_prompt_view(), self._pin_keyboard(), ParseMode.HTML,
+            )
+            return {"text": "Try again after the lockout.", "show_alert": True}
+        if action == "pin:clear":
+            self._pin_buffer = ""
+        else:
+            self._pin_buffer += action.removeprefix("pin:")
+            if len(self._pin_buffer) == 4:
+                if hmac.compare_digest(self._pin_buffer, self._action_pin):
+                    self.session_expiry = self._clock() + ACTION_SESSION_SECONDS
+                    self._failed_pin_attempts = 0
+                    self._pin_locked_until = 0.0
+                    self._reset_pin_entry()
+                    text, keyboard = self._actions_menu_view()
+                    await self._edit_menu_message(query, text, keyboard, ParseMode.HTML)
+                    return {}
+                self._pin_buffer = ""
+                self._failed_pin_attempts += 1
+                if self._failed_pin_attempts >= 3:
+                    self._pin_locked_until = self._clock() + PIN_LOCKOUT_SECONDS
+                    self._failed_pin_attempts = 0
+                    error = None
+                else:
+                    error = "Incorrect PIN. Try again."
+                await self._edit_menu_message(
+                    query, self._pin_prompt_view(error),
+                    self._pin_keyboard(), ParseMode.HTML,
+                )
+                return {}
+        await self._edit_menu_message(
+            query, self._pin_prompt_view(), self._pin_keyboard(), ParseMode.HTML,
+        )
+        return {}
 
     async def _handle_menu_callback(self, update: Update,
                                     _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -305,6 +459,51 @@ class TelegramBot:
                 answer_options = {"text": "Not authorized.", "show_alert": True}
                 return
             action = query.data
+            if action.startswith("pin:"):
+                answer_options = await self._handle_pin_callback(update)
+                return
+            if action in ("menu:root", "menu:back"):
+                self._pending_menu_input = None
+                self._reset_pin_entry()
+                text, keyboard = self._main_menu_view()
+                await self._edit_menu_message(query, text, keyboard, ParseMode.HTML)
+                return
+            if action == "menu:views":
+                self._pending_menu_input = None
+                self._reset_pin_entry()
+                text, keyboard = self._views_menu_view()
+                await self._edit_menu_message(query, text, keyboard, ParseMode.HTML)
+                return
+            if action == "menu:lock":
+                self.session_expiry = 0.0
+                self._pending_menu_input = None
+                self._reset_pin_entry()
+                text, keyboard = self._main_menu_view()
+                await self._edit_menu_message(
+                    query, "🔒 <b>Session locked.</b>\n\n" + text,
+                    keyboard, ParseMode.HTML,
+                )
+                return
+            if action == "menu:actions":
+                self._pending_menu_input = None
+                if not self._actions_unlocked():
+                    if query.message is None:
+                        answer_options = {"text": "Menu unavailable.", "show_alert": True}
+                        return
+                    await self._show_pin_challenge(update)
+                    return
+                self._reset_pin_entry()
+                text, keyboard = self._actions_menu_view()
+                await self._edit_menu_message(query, text, keyboard, ParseMode.HTML)
+                return
+            if action in ("menu:setgrid", "menu:setstop", "menu:stop"):
+                if not self._actions_unlocked():
+                    if query.message is None:
+                        answer_options = {"text": "Menu unavailable.", "show_alert": True}
+                        return
+                    await self._show_pin_challenge(update)
+                    return
+                self._reset_pin_entry()
             if action in ("menu:setgrid", "menu:setstop"):
                 if self.grid_bot is None or query.message is None:
                     answer_options = {"text": "Menu unavailable.", "show_alert": True}
@@ -312,17 +511,13 @@ class TelegramBot:
                 input_action = "grid" if action == "menu:setgrid" else "stop"
                 await self._edit_menu_message(
                     query, self._input_prompt(input_action),
-                    self._back_keyboard(), ParseMode.HTML,
+                    self._back_keyboard("menu:actions"), ParseMode.HTML,
                 )
                 self._pending_menu_input = PendingMenuInput(
                     input_action, update.effective_chat.id, query.message.message_id,
                 )
                 return
             self._pending_menu_input = None
-            if action == "menu:back":
-                text, keyboard = self._main_menu_view()
-                await self._edit_menu_message(query, text, keyboard, ParseMode.HTML)
-                return
             if action == "menu:status":
                 text = await self._status_text()
             elif action == "menu:orders":
@@ -334,21 +529,26 @@ class TelegramBot:
                 text = await self._stop_text()
             else:
                 return
+            back_target = (
+                "menu:views" if action in ("menu:status", "menu:orders")
+                else "menu:actions"
+            )
             await self._edit_menu_message(
-                query, text, self._back_keyboard(), ParseMode.HTML,
+                query, text, self._back_keyboard(back_target), ParseMode.HTML,
             )
         finally:
             await query.answer(**answer_options)
 
     async def _edit_pending_menu(self, context: ContextTypes.DEFAULT_TYPE,
-                                 pending: PendingMenuInput, text: str) -> None:
+                                 pending: PendingMenuInput, text: str,
+                                 keyboard: Optional[InlineKeyboardMarkup] = None) -> None:
         try:
             await context.bot.edit_message_text(
                 chat_id=pending.chat_id,
                 message_id=pending.message_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=self._back_keyboard(),
+                reply_markup=keyboard or self._back_keyboard("menu:actions"),
             )
         except BadRequest as error:
             if "message is not modified" not in str(error).lower():
@@ -363,6 +563,21 @@ class TelegramBot:
             return
         pending = self._pending_menu_input
         message = update.effective_message
+        if pending is None:
+            if (message is not None and self._pin_chat_id == update.effective_chat.id
+                    and self._pin_message_id is not None):
+                try:
+                    await message.delete()
+                except Exception as error:
+                    LOGGER.warning("Could not delete text sent during PIN entry: %s",
+                                   type(error).__name__)
+                await self._edit_pending_menu(
+                    context,
+                    PendingMenuInput("pin", self._pin_chat_id, self._pin_message_id),
+                    self._pin_prompt_view("Use the on-screen keypad, not chat text."),
+                    self._pin_keyboard(),
+                )
+            return
         if (pending is None or self.grid_bot is None or message is None
                 or update.effective_chat.id != pending.chat_id):
             return
@@ -379,6 +594,24 @@ class TelegramBot:
                     "Could not delete your message. Delete it manually, then try again.",
                 ),
             )
+            return
+
+        if not self._actions_unlocked():
+            self._pending_menu_input = None
+            self._reset_pin_entry()
+            if self._action_pin:
+                self._pin_chat_id = pending.chat_id
+                self._pin_message_id = pending.message_id
+                await self._edit_pending_menu(
+                    context, pending, self._pin_prompt_view(), self._pin_keyboard(),
+                )
+            else:
+                await self._edit_pending_menu(
+                    context, pending,
+                    "🔒 <b>ACTIONS UNAVAILABLE</b>\n"
+                    "The action PIN is not configured on the server.",
+                    self._back_keyboard("menu:root"),
+                )
             return
 
         values = (message.text or "").split()
@@ -435,6 +668,11 @@ class TelegramBot:
         if not self._is_owner(update, self.owner_chat_id):
             return
         self._pending_menu_input = None
+        if not self._actions_unlocked():
+            await update.effective_message.reply_text(
+                "🔒 Unlock Execute Actions from /start before using /stop."
+            )
+            return
         await update.effective_message.reply_text(await self._stop_text())
 
     async def _stop_text(self) -> str:
@@ -531,6 +769,11 @@ class TelegramBot:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
         self._pending_menu_input = None
+        if not self._actions_unlocked():
+            await update.effective_message.reply_text(
+                "🔒 Unlock Execute Actions from /start before using /setgrid."
+            )
+            return
         args = context.args or []
         if len(args) != 2:
             await update.effective_message.reply_text("Usage: /setgrid <lower> <upper>")
@@ -552,6 +795,11 @@ class TelegramBot:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
         self._pending_menu_input = None
+        if not self._actions_unlocked():
+            await update.effective_message.reply_text(
+                "🔒 Unlock Execute Actions from /start before using /setstop."
+            )
+            return
         args = context.args or []
         if len(args) != 1:
             await update.effective_message.reply_text("Usage: /setstop <price>")

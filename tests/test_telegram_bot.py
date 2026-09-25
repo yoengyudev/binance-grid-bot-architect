@@ -47,7 +47,8 @@ class TelegramBotTests(unittest.TestCase):
                     [(Decimal("0.02"), Decimal("101"))],
                 ),
             )
-            bot = TelegramBot("123456:ABCDEF", 12345, controller, grid)
+            bot = TelegramBot("123456:ABCDEF", 12345, controller, grid,
+                              action_pin="1234")
             self.assertTrue(any(
                 isinstance(handler, CallbackQueryHandler)
                 for handlers in bot.application.handlers.values()
@@ -100,16 +101,14 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("<b>Security:</b> Owner Access Only", welcome)
             self.assertEqual(options["parse_mode"], ParseMode.HTML)
             buttons = options["reply_markup"].inline_keyboard
-            self.assertEqual([len(row) for row in buttons], [2, 2, 1])
+            self.assertEqual([len(row) for row in buttons], [1, 1])
             self.assertEqual(
                 [button.text for row in buttons for button in row],
-                ["📊 Bot Status", "📋 Open Orders", "⚙️ Set Grid Bounds",
-                 "🛡️ Set Stop-Loss", "🛑 Stop Bot"],
+                ["👁️ View Analytics", "🔐 Execute Actions"],
             )
             self.assertEqual(
                 [button.callback_data for row in buttons for button in row],
-                ["menu:status", "menu:orders", "menu:setgrid", "menu:setstop",
-                 "menu:stop"],
+                ["menu:views", "menu:actions"],
             )
 
             asyncio.run(bot._handle_menu_callback(update(999, 12345, "menu:stop"), None))
@@ -119,24 +118,30 @@ class TelegramBotTests(unittest.TestCase):
             self.assertEqual(acknowledgements[-1][1],
                              {"text": "Not authorized.", "show_alert": True})
 
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:views"), None))
+            self.assertEqual(
+                [button.text for row in edits[-1][1]["reply_markup"].inline_keyboard
+                 for button in row],
+                ["📊 Bot Status", "📋 Open Orders", "🔙 Back"],
+            )
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:status"), None))
             self.assertIn("📊 <b>BOT STATUS &amp; ANALYTICS</b>", edits[-1][0])
             self.assertIn("• <b>Levels:</b> 20", edits[-1][0])
             self.assertEqual(edits[-1][1]["parse_mode"], ParseMode.HTML)
             self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
-                             "menu:back")
+                             "menu:views")
             self.assertEqual(events[-2:], ["edit", "answer"])
             self.assertEqual(replies, [])
 
-            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:back"), None))
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:root"), None))
             self.assertEqual(edits[-1][0], welcome)
             self.assertEqual(edits[-1][1]["parse_mode"], ParseMode.HTML)
             self.assertEqual([len(row) for row in edits[-1][1]["reply_markup"].inline_keyboard],
-                             [2, 2, 1])
+                             [1, 1])
 
             not_modified[0] = True
             answer_count = len(acknowledgements)
-            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:back"), None))
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:root"), None))
             self.assertEqual(len(acknowledgements), answer_count + 1)
             self.assertEqual(events[-2:], ["edit", "answer"])
             not_modified[0] = False
@@ -145,17 +150,43 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("📋 <b>OPEN ORDERS</b>", edits[-1][0])
             self.assertIn("• Buy <b>0.01 BTC</b> @ <b>99 USDT</b>", edits[-1][0])
             self.assertEqual(edits[-1][1]["parse_mode"], ParseMode.HTML)
+            self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
+                             "menu:views")
+
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:actions"), None))
+            self.assertIn("ENTER ACTION PIN", edits[-1][0])
+            self.assertEqual([len(row) for row in edits[-1][1]["reply_markup"].inline_keyboard],
+                             [3, 3, 3, 3])
+            self.assertFalse(bot._actions_unlocked())
+            for digit in "1234":
+                asyncio.run(bot._handle_menu_callback(update(12345, 12345, f"pin:{digit}"), None))
+            self.assertTrue(bot._actions_unlocked())
+            self.assertIn("EXECUTE ACTIONS", edits[-1][0])
+            self.assertEqual(
+                [button.text for row in edits[-1][1]["reply_markup"].inline_keyboard
+                 for button in row],
+                ["⚙️ Set Grid Bounds", "🛡️ Set Stop-Loss", "🛑 Stop Bot",
+                 "🔒 Lock Session Now", "🔙 Back"],
+            )
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
             self.assertIn("Send the new bounds as <code>lower upper</code>", edits[-1][0])
             self.assertEqual(bot._pending_menu_input.action, "grid")
             self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
-                             "menu:back")
+                             "menu:actions")
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setstop"), None))
             self.assertIn("Send the new stop-loss price", edits[-1][0])
             self.assertEqual(bot._pending_menu_input.action, "stop")
             self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
-                             "menu:back")
+                             "menu:actions")
             self.assertFalse(controller.stop_requested.is_set())
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:lock"), None))
+            self.assertFalse(bot._actions_unlocked())
+            self.assertIn("Session locked", edits[-1][0])
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:stop"), None))
+            self.assertIn("ENTER ACTION PIN", edits[-1][0])
+            self.assertFalse(controller.stop_requested.is_set())
+            for digit in "1234":
+                asyncio.run(bot._handle_menu_callback(update(12345, 12345, f"pin:{digit}"), None))
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:stop"), None))
             self.assertIsNone(bot._pending_menu_input)
             self.assertTrue(controller.stop_requested.is_set())
@@ -164,6 +195,71 @@ class TelegramBotTests(unittest.TestCase):
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
             asyncio.run(bot._handle_start(update(12345, 12345), None))
             self.assertIsNone(bot._pending_menu_input)
+
+    def test_pin_lockout_expiry_and_unconfigured_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            controller = StopController(FakeExchange(), database, "BTC/USDT")
+            bot = TelegramBot("123456:ABCDEF", 12345, controller,
+                              action_pin="1234")
+            now = [10.0]
+            bot._clock = lambda: now[0]
+            edits = []
+            answers = []
+
+            async def edit(text, **_kwargs):
+                edits.append(text)
+
+            async def answer(**kwargs):
+                answers.append(kwargs)
+
+            def callback(action, message_id=77):
+                return SimpleNamespace(
+                    effective_user=SimpleNamespace(id=12345),
+                    effective_chat=SimpleNamespace(id=12345, type="private"),
+                    callback_query=SimpleNamespace(
+                        data=action, message=SimpleNamespace(message_id=message_id),
+                        edit_message_text=edit, answer=answer,
+                    ),
+                )
+
+            def click(action, message_id=77):
+                asyncio.run(bot._handle_menu_callback(callback(action, message_id), None))
+
+            click("menu:actions")
+            click("pin:1")
+            click("pin:clear")
+            self.assertEqual(bot._pin_buffer, "")
+            click("pin:1", message_id=88)
+            self.assertEqual(bot._pin_buffer, "")
+            self.assertEqual(answers[-1]["show_alert"], True)
+
+            for _ in range(3):
+                for digit in "0000":
+                    click(f"pin:{digit}")
+            self.assertFalse(bot._actions_unlocked())
+            self.assertIn("Too many attempts", edits[-1])
+            click("pin:1")
+            self.assertEqual(bot._pin_buffer, "")
+            self.assertEqual(answers[-1]["show_alert"], True)
+
+            now[0] = 71.0
+            for digit in "1234":
+                click(f"pin:{digit}")
+            self.assertTrue(bot._actions_unlocked())
+            self.assertEqual(bot.session_expiry, 371.0)
+            now[0] = 372.0
+            click("menu:stop")
+            self.assertIn("ENTER ACTION PIN", edits[-1])
+            self.assertFalse(controller.stop_requested.is_set())
+            click("pin:cancel")
+            self.assertIn("Welcome", edits[-1])
+
+            unconfigured = TelegramBot("123456:ABCDEF", 12345, controller,
+                                       action_pin="")
+            asyncio.run(unconfigured._handle_menu_callback(callback("menu:actions"), None))
+            self.assertIn("ACTIONS UNAVAILABLE", edits[-1])
+            self.assertFalse(controller.stop_requested.is_set())
 
     def test_menu_input_deletes_text_and_edits_same_message(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -184,7 +280,11 @@ class TelegramBotTests(unittest.TestCase):
                         raise ValueError("Enter a valid stop-loss price.")
                     return Decimal(price)
 
-            bot = TelegramBot("123456:ABCDEF", 12345, controller, GridStub())
+            bot = TelegramBot("123456:ABCDEF", 12345, controller, GridStub(),
+                              action_pin="1234")
+            now = [100.0]
+            bot._clock = lambda: now[0]
+            bot.session_expiry = now[0] + 300
 
             async def query_edit(text, **kwargs):
                 edits.append(("callback", text, kwargs))
@@ -240,7 +340,7 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("GRID BOUNDS UPDATED", edits[-1][1])
             self.assertEqual(edits[-1][2]["message_id"], 77)
             self.assertEqual(edits[-1][2]["reply_markup"].inline_keyboard[0][0].callback_data,
-                             "menu:back")
+                             "menu:actions")
             self.assertIsNone(bot._pending_menu_input)
 
             asyncio.run(bot._handle_menu_callback(callback("menu:setstop"), None))
@@ -262,6 +362,13 @@ class TelegramBotTests(unittest.TestCase):
             before = len(events)
             asyncio.run(bot._handle_menu_input(message("75 125"), context))
             self.assertEqual(len(events), before)
+
+            asyncio.run(bot._handle_menu_callback(callback("menu:setgrid"), None))
+            now[0] = 401.0
+            asyncio.run(bot._handle_menu_input(message("75 125"), context))
+            self.assertEqual(events[-2:], ["delete", "edit"])
+            self.assertIn("ENTER ACTION PIN", edits[-1][1])
+            self.assertIsNone(bot._pending_menu_input)
 
     def test_stop_pauses_and_reconciles_tracked_orders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -287,7 +394,8 @@ class TelegramBotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
             controller = StopController(FakeExchange(), database, "BTC/USDT")
-            bot = TelegramBot("123456:ABCDEF", 12345, controller)
+            bot = TelegramBot("123456:ABCDEF", 12345, controller,
+                              action_pin="1234")
             replies = []
 
             async def reply_text(text: str) -> None:
@@ -306,8 +414,12 @@ class TelegramBotTests(unittest.TestCase):
             self.assertEqual(replies, [])
 
             asyncio.run(bot._handle_stop(update(12345, 12345, "private"), None))
+            self.assertFalse(controller.stop_requested.is_set())
+            self.assertIn("Unlock Execute Actions", replies[-1])
+            bot.session_expiry = bot._clock() + 300
+            asyncio.run(bot._handle_stop(update(12345, 12345, "private"), None))
             self.assertTrue(controller.stop_requested.is_set())
-            self.assertIn("Trading stopped", replies[0])
+            self.assertIn("Trading stopped", replies[-1])
 
     def test_status_orders_and_grid_controls_are_owner_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -367,7 +479,9 @@ class TelegramBotTests(unittest.TestCase):
                     return Decimal(price)
 
             grid = GridStub()
-            bot = TelegramBot("123456:ABCDEF", 12345, controller, grid)
+            bot = TelegramBot("123456:ABCDEF", 12345, controller, grid,
+                              action_pin="1234")
+            bot.session_expiry = bot._clock() + 300
             replies = []
             reply_options = []
 
