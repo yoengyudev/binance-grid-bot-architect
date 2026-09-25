@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.ext import CallbackQueryHandler
+from telegram.ext import CallbackQueryHandler, MessageHandler
 
 from database import GridDatabase
 from telegram_bot import StopController, TelegramBot, _format_open_order_messages
@@ -53,6 +53,11 @@ class TelegramBotTests(unittest.TestCase):
                 for handlers in bot.application.handlers.values()
                 for handler in handlers
             ))
+            self.assertTrue(any(
+                isinstance(handler, MessageHandler)
+                for handlers in bot.application.handlers.values()
+                for handler in handlers
+            ))
             replies = []
             edits = []
             acknowledgements = []
@@ -80,6 +85,7 @@ class TelegramBotTests(unittest.TestCase):
                     callback_query=(SimpleNamespace(
                         data=action, answer=answer,
                         edit_message_text=edit_message_text,
+                        message=SimpleNamespace(message_id=77),
                     )
                                     if action else None),
                 )
@@ -140,18 +146,122 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("• Buy <b>0.01 BTC</b> @ <b>99 USDT</b>", edits[-1][0])
             self.assertEqual(edits[-1][1]["parse_mode"], ParseMode.HTML)
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
-            self.assertIn("<code>/setgrid &lt;lower&gt; &lt;upper&gt;</code>", edits[-1][0])
+            self.assertIn("Send the new bounds as <code>lower upper</code>", edits[-1][0])
+            self.assertEqual(bot._pending_menu_input.action, "grid")
             self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
                              "menu:back")
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setstop"), None))
-            self.assertIn("<code>/setstop &lt;price&gt;</code>", edits[-1][0])
+            self.assertIn("Send the new stop-loss price", edits[-1][0])
+            self.assertEqual(bot._pending_menu_input.action, "stop")
             self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
                              "menu:back")
             self.assertFalse(controller.stop_requested.is_set())
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:stop"), None))
+            self.assertIsNone(bot._pending_menu_input)
             self.assertTrue(controller.stop_requested.is_set())
             self.assertIn("Trading stopped", edits[-1][0])
             self.assertEqual(replies, [])
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
+            asyncio.run(bot._handle_start(update(12345, 12345), None))
+            self.assertIsNone(bot._pending_menu_input)
+
+    def test_menu_input_deletes_text_and_edits_same_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            controller = StopController(FakeExchange(), database, "BTC/USDT")
+            events = []
+            edits = []
+
+            class GridStub:
+                def request_grid_reset(self, lower, upper):
+                    events.append(("grid", lower, upper))
+                    if lower == "bad":
+                        raise ValueError("Enter a valid lower price.")
+
+                def set_stop_loss(self, price):
+                    events.append(("stop", price))
+                    if price == "bad":
+                        raise ValueError("Enter a valid stop-loss price.")
+                    return Decimal(price)
+
+            bot = TelegramBot("123456:ABCDEF", 12345, controller, GridStub())
+
+            async def query_edit(text, **kwargs):
+                edits.append(("callback", text, kwargs))
+
+            async def answer(**_kwargs):
+                events.append("answer")
+
+            def callback(action):
+                return SimpleNamespace(
+                    effective_user=SimpleNamespace(id=12345),
+                    effective_chat=SimpleNamespace(id=12345, type="private"),
+                    callback_query=SimpleNamespace(
+                        data=action, message=SimpleNamespace(message_id=77),
+                        edit_message_text=query_edit, answer=answer,
+                    ),
+                )
+
+            async def bot_edit(**kwargs):
+                edits.append(("message", kwargs["text"], kwargs))
+                events.append("edit")
+
+            context = SimpleNamespace(bot=SimpleNamespace(edit_message_text=bot_edit))
+
+            def message(text, user_id=12345, delete_fails=False):
+                async def delete():
+                    events.append("delete")
+                    if delete_fails:
+                        raise RuntimeError("Delete failed")
+                    return True
+
+                return SimpleNamespace(
+                    effective_user=SimpleNamespace(id=user_id),
+                    effective_chat=SimpleNamespace(id=12345, type="private"),
+                    effective_message=SimpleNamespace(text=text, delete=delete),
+                )
+
+            asyncio.run(bot._handle_menu_callback(callback("menu:setgrid"), None))
+            self.assertEqual(bot._pending_menu_input.message_id, 77)
+            self.assertIn("Send the new bounds", edits[-1][1])
+
+            asyncio.run(bot._handle_menu_input(message("bad"), context))
+            self.assertEqual(events[-2:], ["delete", "edit"])
+            self.assertIn("Enter exactly two numbers", edits[-1][1])
+            self.assertEqual(bot._pending_menu_input.action, "grid")
+
+            asyncio.run(bot._handle_menu_input(message("bad 125"), context))
+            self.assertEqual(events[-3:], ["delete", ("grid", "bad", "125"), "edit"])
+            self.assertIn("Enter a valid lower price", edits[-1][1])
+            self.assertEqual(bot._pending_menu_input.action, "grid")
+
+            asyncio.run(bot._handle_menu_input(message("75 125"), context))
+            self.assertEqual(events[-3:], ["delete", ("grid", "75", "125"), "edit"])
+            self.assertIn("GRID BOUNDS UPDATED", edits[-1][1])
+            self.assertEqual(edits[-1][2]["message_id"], 77)
+            self.assertEqual(edits[-1][2]["reply_markup"].inline_keyboard[0][0].callback_data,
+                             "menu:back")
+            self.assertIsNone(bot._pending_menu_input)
+
+            asyncio.run(bot._handle_menu_callback(callback("menu:setstop"), None))
+            asyncio.run(bot._handle_menu_input(message("70", user_id=999), context))
+            self.assertEqual(bot._pending_menu_input.action, "stop")
+            asyncio.run(bot._handle_menu_input(message("70", delete_fails=True), context))
+            self.assertIn("Could not delete your message", edits[-1][1])
+            self.assertEqual(bot._pending_menu_input.action, "stop")
+            asyncio.run(bot._handle_menu_input(message("bad"), context))
+            self.assertIn("Enter a valid stop-loss price", edits[-1][1])
+            asyncio.run(bot._handle_menu_input(message("70"), context))
+            self.assertEqual(events[-3:], ["delete", ("stop", "70"), "edit"])
+            self.assertIn("STOP-LOSS UPDATED", edits[-1][1])
+            self.assertIsNone(bot._pending_menu_input)
+
+            asyncio.run(bot._handle_menu_callback(callback("menu:setgrid"), None))
+            asyncio.run(bot._handle_menu_callback(callback("menu:back"), None))
+            self.assertIsNone(bot._pending_menu_input)
+            before = len(events)
+            asyncio.run(bot._handle_menu_input(message("75 125"), context))
+            self.assertEqual(len(events), before)
 
     def test_stop_pauses_and_reconciles_tracked_orders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

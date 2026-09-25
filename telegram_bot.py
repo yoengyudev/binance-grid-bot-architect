@@ -16,7 +16,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler,
-    ContextTypes, filters,
+    ContextTypes, MessageHandler, filters,
 )
 
 from database import GridDatabase
@@ -80,6 +80,13 @@ class StopResult:
     canceled: int = 0
     filled: int = 0
     unresolved: int = 0
+
+
+@dataclass(frozen=True)
+class PendingMenuInput:
+    action: str
+    chat_id: int
+    message_id: int
 
 
 class StopController:
@@ -169,6 +176,7 @@ class TelegramBot:
         self.owner_chat_id = owner_chat_id
         self.stop_controller = stop_controller
         self.grid_bot = grid_bot
+        self._pending_menu_input: Optional[PendingMenuInput] = None
         self.application: Application = ApplicationBuilder().token(token).build()
         owner_filter = (
             filters.User(user_id=owner_chat_id)
@@ -184,6 +192,10 @@ class TelegramBot:
                 self._handle_menu_callback,
                 pattern=r"^menu:(?:status|orders|setgrid|setstop|stop|back)$",
             )
+        )
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND & owner_filter,
+                           self._handle_menu_input)
         )
         self.application.add_handler(
             CommandHandler("stop", self._handle_stop, filters=owner_filter, has_args=False)
@@ -241,6 +253,24 @@ class TelegramBot:
             InlineKeyboardButton("🔙 Back to Main Menu", callback_data="menu:back")
         ]])
 
+    @staticmethod
+    def _input_prompt(action: str, error: Optional[str] = None) -> str:
+        if action == "grid":
+            title = "⚙️ <b>SET GRID BOUNDS</b>"
+            instruction = "👇 Send the new bounds as <code>lower upper</code>."
+            example = "<i>Example: 72000 95000</i>"
+            rule = "🛡️ Stop-loss must be below the new lower bound."
+        else:
+            title = "🛡️ <b>SET STOP-LOSS</b>"
+            instruction = "👇 Send the new stop-loss price as a number."
+            example = "<i>Example: 64000</i>"
+            rule = "⚠️ The price must be below the current lower grid bound."
+        warning = f"\n\n❌ <b>Update rejected:</b> {escape(error)}" if error else ""
+        return (
+            f"{title}\n━━━━━━━━━━━━━━━━━━\n"
+            f"{instruction}\n{example}\n\n{rule}{warning}"
+        )
+
     async def _edit_menu_message(self, query: Any, text: str,
                                  keyboard: InlineKeyboardMarkup,
                                  parse_mode: Optional[str] = None) -> None:
@@ -256,6 +286,7 @@ class TelegramBot:
                             _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id):
             return
+        self._pending_menu_input = None
         text, keyboard = self._main_menu_view()
         await update.effective_message.reply_text(
             text,
@@ -274,6 +305,20 @@ class TelegramBot:
                 answer_options = {"text": "Not authorized.", "show_alert": True}
                 return
             action = query.data
+            if action in ("menu:setgrid", "menu:setstop"):
+                if self.grid_bot is None or query.message is None:
+                    answer_options = {"text": "Menu unavailable.", "show_alert": True}
+                    return
+                input_action = "grid" if action == "menu:setgrid" else "stop"
+                await self._edit_menu_message(
+                    query, self._input_prompt(input_action),
+                    self._back_keyboard(), ParseMode.HTML,
+                )
+                self._pending_menu_input = PendingMenuInput(
+                    input_action, update.effective_chat.id, query.message.message_id,
+                )
+                return
+            self._pending_menu_input = None
             if action == "menu:back":
                 text, keyboard = self._main_menu_view()
                 await self._edit_menu_message(query, text, keyboard, ParseMode.HTML)
@@ -285,21 +330,6 @@ class TelegramBot:
                 text = messages[0]
                 if len(messages) > 1:
                     text += "\n\n<i>More orders: send /orders to see the full list.</i>"
-            elif action == "menu:setgrid":
-                text = (
-                    "⚙️ <b>SET GRID BOUNDS</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "• <b>Command:</b> <code>/setgrid &lt;lower&gt; &lt;upper&gt;</code>\n"
-                    "• <b>Example:</b> <code>/setgrid 72000 95000</code>\n\n"
-                    "🛡️ <i>Stop-loss must be below the new lower bound.</i>"
-                )
-            elif action == "menu:setstop":
-                text = (
-                    "🛡️ <b>SET STOP-LOSS</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "• <b>Command:</b> <code>/setstop &lt;price&gt;</code>\n\n"
-                    "⚠️ <i>The price must be below the current lower grid bound.</i>"
-                )
             elif action == "menu:stop":
                 text = await self._stop_text()
             else:
@@ -310,9 +340,101 @@ class TelegramBot:
         finally:
             await query.answer(**answer_options)
 
+    async def _edit_pending_menu(self, context: ContextTypes.DEFAULT_TYPE,
+                                 pending: PendingMenuInput, text: str) -> None:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=pending.chat_id,
+                message_id=pending.message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._back_keyboard(),
+            )
+        except BadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                LOGGER.warning("Could not edit input prompt: %s", type(error).__name__)
+                self._pending_menu_input = None
+        except Exception as error:
+            LOGGER.warning("Could not edit input prompt: %s", type(error).__name__)
+
+    async def _handle_menu_input(self, update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update, self.owner_chat_id):
+            return
+        pending = self._pending_menu_input
+        message = update.effective_message
+        if (pending is None or self.grid_bot is None or message is None
+                or update.effective_chat.id != pending.chat_id):
+            return
+        try:
+            deleted = await message.delete()
+            if deleted is False:
+                raise RuntimeError("Telegram did not delete the input message.")
+        except Exception as error:
+            LOGGER.warning("Could not delete menu input: %s", type(error).__name__)
+            await self._edit_pending_menu(
+                context, pending,
+                self._input_prompt(
+                    pending.action,
+                    "Could not delete your message. Delete it manually, then try again.",
+                ),
+            )
+            return
+
+        values = (message.text or "").split()
+        if pending.action == "grid":
+            if len(values) != 2:
+                error_text = "Enter exactly two numbers: lower upper."
+            else:
+                try:
+                    await asyncio.to_thread(
+                        self.grid_bot.request_grid_reset, values[0], values[1],
+                    )
+                except (ValueError, RuntimeError) as error:
+                    error_text = str(error)
+                except Exception as error:
+                    LOGGER.warning("Grid input failed: %s", type(error).__name__)
+                    error_text = "Grid update failed. Please try again."
+                else:
+                    self._pending_menu_input = None
+                    await self._edit_pending_menu(
+                        context, pending,
+                        "✅ <b>GRID BOUNDS UPDATED</b>\n"
+                        "━━━━━━━━━━━━━━━━━━\n"
+                        f"• <b>Lower:</b> {escape(values[0])} USDT\n"
+                        f"• <b>Upper:</b> {escape(values[1])} USDT\n\n"
+                        "The bot will cancel old orders and rebuild the grid.",
+                    )
+                    return
+        else:
+            if len(values) != 1:
+                error_text = "Enter exactly one numeric stop-loss price."
+            else:
+                try:
+                    price = await asyncio.to_thread(self.grid_bot.set_stop_loss, values[0])
+                except (ValueError, RuntimeError) as error:
+                    error_text = str(error)
+                except Exception as error:
+                    LOGGER.warning("Stop-loss input failed: %s", type(error).__name__)
+                    error_text = "Stop-loss update failed. Please try again."
+                else:
+                    self._pending_menu_input = None
+                    await self._edit_pending_menu(
+                        context, pending,
+                        "✅ <b>STOP-LOSS UPDATED</b>\n"
+                        "━━━━━━━━━━━━━━━━━━\n"
+                        f"• <b>New price:</b> {escape(format(price, 'f'))} USDT\n\n"
+                        "Existing grid orders were left in place.",
+                    )
+                    return
+        await self._edit_pending_menu(
+            context, pending, self._input_prompt(pending.action, error_text),
+        )
+
     async def _handle_stop(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id):
             return
+        self._pending_menu_input = None
         await update.effective_message.reply_text(await self._stop_text())
 
     async def _stop_text(self) -> str:
@@ -408,6 +530,7 @@ class TelegramBot:
                               context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
+        self._pending_menu_input = None
         args = context.args or []
         if len(args) != 2:
             await update.effective_message.reply_text("Usage: /setgrid <lower> <upper>")
@@ -428,6 +551,7 @@ class TelegramBot:
                               context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
+        self._pending_menu_input = None
         args = context.args or []
         if len(args) != 1:
             await update.effective_message.reply_text("Usage: /setstop <price>")
