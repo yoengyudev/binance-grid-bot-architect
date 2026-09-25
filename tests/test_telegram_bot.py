@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from telegram.constants import ParseMode
 from telegram.ext import CallbackQueryHandler
 
 from database import GridDatabase
@@ -73,13 +74,22 @@ class TelegramBotTests(unittest.TestCase):
             self.assertEqual(replies, [])
             asyncio.run(bot._handle_start(update(12345, 12345), None))
             welcome, options = replies.pop()
-            self.assertIn("Welcome", welcome)
-            self.assertEqual(options["parse_mode"], "HTML")
+            self.assertIn("<b>Welcome to BTC/USDT Grid Master</b>", welcome)
+            self.assertIn("<i>Your automated trading engine is online.</i>", welcome)
+            self.assertIn("<b>Current Mode:</b> Spot Testnet", welcome)
+            self.assertIn("<b>Security:</b> Owner Access Only", welcome)
+            self.assertEqual(options["parse_mode"], ParseMode.HTML)
             buttons = options["reply_markup"].inline_keyboard
-            self.assertEqual([len(row) for row in buttons], [2, 2])
+            self.assertEqual([len(row) for row in buttons], [2, 2, 1])
+            self.assertEqual(
+                [button.text for row in buttons for button in row],
+                ["📊 Bot Status", "📋 Open Orders", "⚙️ Set Grid Bounds",
+                 "🛡️ Set Stop-Loss", "🛑 Stop Bot"],
+            )
             self.assertEqual(
                 [button.callback_data for row in buttons for button in row],
-                ["menu:status", "menu:orders", "menu:setgrid", "menu:stop"],
+                ["menu:status", "menu:orders", "menu:setgrid", "menu:setstop",
+                 "menu:stop"],
             )
 
             asyncio.run(bot._handle_menu_callback(update(999, 12345, "menu:stop"), None))
@@ -94,6 +104,8 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("Buy 0.01 BTC @ 99 USDT", replies.pop()[0])
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
             self.assertIn("/setgrid <lower> <upper>", replies.pop()[0])
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setstop"), None))
+            self.assertIn("/setstop <price>", replies.pop()[0])
             self.assertFalse(controller.stop_requested.is_set())
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:stop"), None))
             self.assertTrue(controller.stop_requested.is_set())

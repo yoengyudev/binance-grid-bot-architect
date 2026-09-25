@@ -11,6 +11,7 @@ from typing import Any, Optional, Tuple
 
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler,
     ContextTypes, filters,
@@ -178,7 +179,7 @@ class TelegramBot:
         self.application.add_handler(
             CallbackQueryHandler(
                 self._handle_menu_callback,
-                pattern=r"^menu:(?:status|orders|setgrid|stop)$",
+                pattern=r"^menu:(?:status|orders|setgrid|setstop|stop)$",
             )
         )
         self.application.add_handler(
@@ -218,16 +219,19 @@ class TelegramBot:
         if not self._is_owner(update, self.owner_chat_id):
             return
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Status", callback_data="menu:status"),
+            [InlineKeyboardButton("📊 Bot Status", callback_data="menu:status"),
              InlineKeyboardButton("📋 Open Orders", callback_data="menu:orders")],
-            [InlineKeyboardButton("⚙️ Set Grid", callback_data="menu:setgrid"),
-             InlineKeyboardButton("🛑 Stop Bot", callback_data="menu:stop")],
+            [InlineKeyboardButton("⚙️ Set Grid Bounds", callback_data="menu:setgrid"),
+             InlineKeyboardButton("🛡️ Set Stop-Loss", callback_data="menu:setstop")],
+            [InlineKeyboardButton("🛑 Stop Bot", callback_data="menu:stop")],
         ])
         await update.effective_message.reply_text(
-            "🤖 <b>Welcome to your Grid Bot</b>\n\n"
-            "Manage your BTC/USDT Spot Testnet grid from here. "
-            "Choose an action below:",
-            parse_mode="HTML",
+            "🤖 <b>Welcome to BTC/USDT Grid Master</b>\n\n"
+            "<i>Your automated trading engine is online.</i>\n\n"
+            "⚙️ <b>Current Mode:</b> Spot Testnet\n"
+            "🛡️ <b>Security:</b> Owner Access Only\n\n"
+            "👇 Please select an operation from the menu below:",
+            parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
 
@@ -250,6 +254,11 @@ class TelegramBot:
                 "⚙️ To update the grid, send /setgrid <lower> <upper>\n"
                 "Example: /setgrid 72000 95000\n"
                 "The stop-loss must be below the new lower bound."
+            )
+        elif action == "menu:setstop":
+            await update.effective_message.reply_text(
+                "🛡️ To update the stop-loss, send /setstop <price>\n"
+                "The price must be below the current lower grid bound."
             )
         elif action == "menu:stop":
             await self._handle_stop(update, context)
