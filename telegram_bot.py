@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from threading import Event, Lock, RLock
 from typing import Any, Optional, Tuple
@@ -30,28 +31,29 @@ LOGGER = logging.getLogger(__name__)
 def _format_open_order_messages(
     base: str, quote: str, buys: Any, sells: Any
 ) -> list[str]:
-    """Keep every order visible without exceeding Telegram's message limit."""
+    """Format live orders as HTML without exceeding Telegram's message limit."""
     messages: list[str] = []
-    current = ""
+    title = "📋 <b>OPEN ORDERS</b>\n━━━━━━━━━━━━━━━━━━"
+    current = title
     for heading, side, orders in (
-        ("🟢 BUY Orders:", "Buy", buys),
-        ("🔴 SELL Orders:", "Sell", sells),
+        ("🟢 <b>BUY LIMIT ORDERS</b>", "Buy", buys),
+        ("🔴 <b>SELL LIMIT ORDERS</b>", "Sell", sells),
     ):
-        if current and len(current) + len(heading) + 2 > TELEGRAM_MESSAGE_CHUNK_LENGTH:
+        if len(current) + len(heading) + 2 > TELEGRAM_MESSAGE_CHUNK_LENGTH:
             messages.append(current)
-            current = ""
-        current += ("\n\n" if current else "") + heading
+            current = title
+        current += "\n\n" + heading
         lines = []
         for amount, price in orders:
-            amount_text = (f"{format(amount.normalize(), ',f')} {base}"
+            amount_text = (f"{format(amount.normalize(), ',f')} {escape(base)}"
                            if amount is not None else "amount unavailable")
-            price_text = (f"{format(price.normalize(), ',f')} {quote}"
+            price_text = (f"{format(price.normalize(), ',f')} {escape(quote)}"
                           if price is not None else "price unavailable")
-            lines.append(f"{side} {amount_text} @ {price_text}")
-        for line in lines or ["None"]:
+            lines.append(f"• {side} <b>{amount_text}</b> @ <b>{price_text}</b>")
+        for line in lines or [f"• <i>No open {side.upper()} orders</i>"]:
             if len(current) + len(line) + 1 > TELEGRAM_MESSAGE_CHUNK_LENGTH:
                 messages.append(current)
-                current = f"{heading} (continued)"
+                current = f"{title}\n\n{heading} <i>(continued)</i>"
             current += "\n" + line
     messages.append(current)
     return messages
@@ -282,23 +284,29 @@ class TelegramBot:
                 messages = await self._open_order_messages()
                 text = messages[0]
                 if len(messages) > 1:
-                    text += "\n\nMore orders: send /orders to see the full list."
+                    text += "\n\n<i>More orders: send /orders to see the full list.</i>"
             elif action == "menu:setgrid":
                 text = (
-                    "⚙️ To update the grid, send /setgrid <lower> <upper>\n"
-                    "Example: /setgrid 72000 95000\n"
-                    "The stop-loss must be below the new lower bound."
+                    "⚙️ <b>SET GRID BOUNDS</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "• <b>Command:</b> <code>/setgrid &lt;lower&gt; &lt;upper&gt;</code>\n"
+                    "• <b>Example:</b> <code>/setgrid 72000 95000</code>\n\n"
+                    "🛡️ <i>Stop-loss must be below the new lower bound.</i>"
                 )
             elif action == "menu:setstop":
                 text = (
-                    "🛡️ To update the stop-loss, send /setstop <price>\n"
-                    "The price must be below the current lower grid bound."
+                    "🛡️ <b>SET STOP-LOSS</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "• <b>Command:</b> <code>/setstop &lt;price&gt;</code>\n\n"
+                    "⚠️ <i>The price must be below the current lower grid bound.</i>"
                 )
             elif action == "menu:stop":
                 text = await self._stop_text()
             else:
                 return
-            await self._edit_menu_message(query, text, self._back_keyboard())
+            await self._edit_menu_message(
+                query, text, self._back_keyboard(), ParseMode.HTML,
+            )
         finally:
             await query.answer(**answer_options)
 
@@ -322,7 +330,9 @@ class TelegramBot:
     async def _handle_status(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
-        await update.effective_message.reply_text(await self._status_text())
+        await update.effective_message.reply_text(
+            await self._status_text(), parse_mode=ParseMode.HTML,
+        )
 
     async def _status_text(self) -> str:
         if self.grid_bot is None:
@@ -338,39 +348,45 @@ class TelegramBot:
             try:
                 lower, upper, levels, stop_loss = self.grid_bot.grid_configuration()
             except Exception:
-                return "Could not read grid settings. Check bot logs."
+                return "⚠️ <b>Grid settings unavailable.</b> Check bot logs."
         try:
             buy_count, sell_count, closest_buy, closest_sell = await asyncio.wait_for(
                 asyncio.to_thread(self.grid_bot.open_order_summary, price),
                 timeout=STATUS_API_TIMEOUT_SECONDS,
             )
             buy_price = (f"{closest_buy} USDT" if closest_buy is not None else
-                         "none" if buy_count == 0 else "unavailable")
+                         "None" if buy_count == 0 else "Unavailable")
             sell_price = (f"{closest_sell} USDT" if closest_sell is not None else
-                          "none" if sell_count == 0 else "unavailable")
-            orders_text = (
-                f"BUY limit orders: {buy_count}\n"
-                f"SELL limit orders: {sell_count}\n"
-                f"Closest BUY: {buy_price}\n"
-                f"Closest SELL: {sell_price}"
-            )
+                          "None" if sell_count == 0 else "Unavailable")
         except Exception as error:
             LOGGER.warning("Status open-order request failed: %s", type(error).__name__)
-            orders_text = "Open orders unavailable (exchange request failed or timed out)."
+            buy_count = sell_count = "Unavailable"
+            buy_price = sell_price = "Unavailable"
+        current_price = f"{price} USDT" if price is not None else "Unavailable"
         return (
-            f"BTC/USDT current price: {price if price is not None else 'unavailable'}"
-            f"{' USDT' if price is not None else ''}\n"
-            f"Active bounds: {lower}–{upper} USDT\n"
-            f"Total grid levels: {levels}\n"
-            f"Stop-loss: {stop_loss} USDT\n\n"
-            f"Live open orders:\n{orders_text}"
+            "📊 <b>BOT STATUS &amp; ANALYTICS</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "💰 <b>Market:</b> BTC/USDT\n"
+            f"📈 <b>Current Price:</b> {escape(current_price)}\n\n"
+            "⚙️ <b>Grid Configuration</b>\n"
+            f"• <b>Bounds:</b> {escape(str(lower))} - {escape(str(upper))} USDT\n"
+            f"• <b>Levels:</b> {escape(str(levels))}\n"
+            f"• <b>Stop-Loss:</b> {escape(str(stop_loss))} USDT\n\n"
+            "📋 <b>Live Order Summary</b>\n"
+            f"• 🟢 <b>BUY Limits:</b> {escape(str(buy_count))} "
+            f"(Closest: {escape(buy_price)})\n"
+            f"• 🔴 <b>SELL Limits:</b> {escape(str(sell_count))} "
+            f"(Closest: {escape(sell_price)})\n"
+            "━━━━━━━━━━━━━━━━━━"
         )
 
     async def _handle_orders(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
         for message in await self._open_order_messages():
-            await update.effective_message.reply_text(message)
+            await update.effective_message.reply_text(
+                message, parse_mode=ParseMode.HTML,
+            )
 
     async def _open_order_messages(self) -> list[str]:
         if self.grid_bot is None:

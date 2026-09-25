@@ -114,7 +114,9 @@ class TelegramBotTests(unittest.TestCase):
                              {"text": "Not authorized.", "show_alert": True})
 
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:status"), None))
-            self.assertIn("Total grid levels: 20", edits[-1][0])
+            self.assertIn("📊 <b>BOT STATUS &amp; ANALYTICS</b>", edits[-1][0])
+            self.assertIn("• <b>Levels:</b> 20", edits[-1][0])
+            self.assertEqual(edits[-1][1]["parse_mode"], ParseMode.HTML)
             self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
                              "menu:back")
             self.assertEqual(events[-2:], ["edit", "answer"])
@@ -134,11 +136,17 @@ class TelegramBotTests(unittest.TestCase):
             not_modified[0] = False
 
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:orders"), None))
-            self.assertIn("Buy 0.01 BTC @ 99 USDT", edits[-1][0])
+            self.assertIn("📋 <b>OPEN ORDERS</b>", edits[-1][0])
+            self.assertIn("• Buy <b>0.01 BTC</b> @ <b>99 USDT</b>", edits[-1][0])
+            self.assertEqual(edits[-1][1]["parse_mode"], ParseMode.HTML)
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
-            self.assertIn("/setgrid <lower> <upper>", edits[-1][0])
+            self.assertIn("<code>/setgrid &lt;lower&gt; &lt;upper&gt;</code>", edits[-1][0])
+            self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
+                             "menu:back")
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setstop"), None))
-            self.assertIn("/setstop <price>", edits[-1][0])
+            self.assertIn("<code>/setstop &lt;price&gt;</code>", edits[-1][0])
+            self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
+                             "menu:back")
             self.assertFalse(controller.stop_requested.is_set())
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:stop"), None))
             self.assertTrue(controller.stop_requested.is_set())
@@ -251,9 +259,11 @@ class TelegramBotTests(unittest.TestCase):
             grid = GridStub()
             bot = TelegramBot("123456:ABCDEF", 12345, controller, grid)
             replies = []
+            reply_options = []
 
-            async def reply_text(value):
+            async def reply_text(value, **kwargs):
                 replies.append(value)
+                reply_options.append(kwargs)
 
             def update(user_id, chat_id, chat_type):
                 return SimpleNamespace(
@@ -275,27 +285,27 @@ class TelegramBotTests(unittest.TestCase):
             self.assertEqual(replies, [])
 
             asyncio.run(bot._handle_status(owner, None))
-            self.assertIn("Total grid levels: 20", replies[-1])
-            self.assertIn("Stop-loss: 70 USDT", replies[-1])
-            self.assertIn("BUY limit orders: 3", replies[-1])
-            self.assertIn("SELL limit orders: 2", replies[-1])
-            self.assertIn("Closest BUY: 99 USDT", replies[-1])
-            self.assertIn("Closest SELL: 101 USDT", replies[-1])
+            self.assertIn("• <b>Levels:</b> 20", replies[-1])
+            self.assertIn("• <b>Stop-Loss:</b> 70 USDT", replies[-1])
+            self.assertIn("🟢 <b>BUY Limits:</b> 3 (Closest: 99 USDT)", replies[-1])
+            self.assertIn("🔴 <b>SELL Limits:</b> 2 (Closest: 101 USDT)", replies[-1])
+            self.assertEqual(reply_options[-1]["parse_mode"], ParseMode.HTML)
             grid.fail_orders = True
             asyncio.run(bot._handle_status(owner, None))
-            self.assertIn("Active bounds: 75–125 USDT", replies[-1])
-            self.assertIn("Open orders unavailable", replies[-1])
+            self.assertIn("• <b>Bounds:</b> 75 - 125 USDT", replies[-1])
+            self.assertIn("🟢 <b>BUY Limits:</b> Unavailable", replies[-1])
             grid.fail_orders = False
             grid.slow_price = True
             with patch("telegram_bot.STATUS_API_TIMEOUT_SECONDS", 0.01):
                 asyncio.run(bot._handle_status(owner, None))
-            self.assertIn("current price: unavailable", replies[-1])
-            self.assertIn("BUY limit orders: 3", replies[-1])
+            self.assertIn("📈 <b>Current Price:</b> Unavailable", replies[-1])
+            self.assertIn("🟢 <b>BUY Limits:</b> 3", replies[-1])
             asyncio.run(bot._handle_orders(owner, None))
-            self.assertIn("🟢 BUY Orders:", replies[-1])
-            self.assertIn("Buy 0.01 BTC @ 82,500 USDT", replies[-1])
-            self.assertIn("🔴 SELL Orders:", replies[-1])
-            self.assertIn("Sell 0.02 BTC @ 87,500 USDT", replies[-1])
+            self.assertIn("🟢 <b>BUY LIMIT ORDERS</b>", replies[-1])
+            self.assertIn("• Buy <b>0.01 BTC</b> @ <b>82,500 USDT</b>", replies[-1])
+            self.assertIn("🔴 <b>SELL LIMIT ORDERS</b>", replies[-1])
+            self.assertIn("• Sell <b>0.02 BTC</b> @ <b>87,500 USDT</b>", replies[-1])
+            self.assertEqual(reply_options[-1]["parse_mode"], ParseMode.HTML)
             grid.fail_order_list = True
             asyncio.run(bot._handle_orders(owner, None))
             self.assertIn("Could not fetch open orders", replies[-1])
@@ -328,8 +338,10 @@ class TelegramBotTests(unittest.TestCase):
         messages = _format_open_order_messages("BTC", "USDT", buys, [])
         self.assertGreater(len(messages), 1)
         self.assertTrue(all(len(message) <= 4000 for message in messages))
-        self.assertEqual(sum(message.count("Buy 0.01 BTC @") for message in messages), 150)
-        self.assertIn("🔴 SELL Orders:\nNone", messages[-1])
+        self.assertEqual(sum(message.count("Buy <b>0.01 BTC</b> @")
+                             for message in messages), 150)
+        self.assertIn("🔴 <b>SELL LIMIT ORDERS</b>\n• <i>No open SELL orders</i>",
+                      messages[-1])
 
 
 if __name__ == "__main__":
