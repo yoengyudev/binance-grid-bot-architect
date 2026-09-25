@@ -12,6 +12,7 @@ from typing import Any, Optional, Tuple
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler,
     ContextTypes, filters,
@@ -179,7 +180,7 @@ class TelegramBot:
         self.application.add_handler(
             CallbackQueryHandler(
                 self._handle_menu_callback,
-                pattern=r"^menu:(?:status|orders|setgrid|setstop|stop)$",
+                pattern=r"^menu:(?:status|orders|setgrid|setstop|stop|back)$",
             )
         )
         self.application.add_handler(
@@ -214,10 +215,8 @@ class TelegramBot:
             and chat.type == "private"
         )
 
-    async def _handle_start(self, update: Update,
-                            _context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._is_owner(update, self.owner_chat_id):
-            return
+    @staticmethod
+    def _main_menu_view() -> Tuple[str, InlineKeyboardMarkup]:
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 Bot Status", callback_data="menu:status"),
              InlineKeyboardButton("📋 Open Orders", callback_data="menu:orders")],
@@ -225,56 +224,96 @@ class TelegramBot:
              InlineKeyboardButton("🛡️ Set Stop-Loss", callback_data="menu:setstop")],
             [InlineKeyboardButton("🛑 Stop Bot", callback_data="menu:stop")],
         ])
-        await update.effective_message.reply_text(
+        text = (
             "🤖 <b>Welcome to BTC/USDT Grid Master</b>\n\n"
             "<i>Your automated trading engine is online.</i>\n\n"
             "⚙️ <b>Current Mode:</b> Spot Testnet\n"
             "🛡️ <b>Security:</b> Owner Access Only\n\n"
-            "👇 Please select an operation from the menu below:",
+            "👇 Please select an operation from the menu below:"
+        )
+        return text, keyboard
+
+    @staticmethod
+    def _back_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 Back to Main Menu", callback_data="menu:back")
+        ]])
+
+    async def _edit_menu_message(self, query: Any, text: str,
+                                 keyboard: InlineKeyboardMarkup,
+                                 parse_mode: Optional[str] = None) -> None:
+        try:
+            await query.edit_message_text(
+                text=text, reply_markup=keyboard, parse_mode=parse_mode,
+            )
+        except BadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
+
+    async def _handle_start(self, update: Update,
+                            _context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update, self.owner_chat_id):
+            return
+        text, keyboard = self._main_menu_view()
+        await update.effective_message.reply_text(
+            text,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
 
     async def _handle_menu_callback(self, update: Update,
-                                    context: ContextTypes.DEFAULT_TYPE) -> None:
+                                    _context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         if query is None:
             return
-        if not self._is_owner(update, self.owner_chat_id):
-            await query.answer("Not authorized.", show_alert=True)
-            return
-        await query.answer()
-        action = query.data
-        if action == "menu:status":
-            await self._handle_status(update, context)
-        elif action == "menu:orders":
-            await self._handle_orders(update, context)
-        elif action == "menu:setgrid":
-            await update.effective_message.reply_text(
-                "⚙️ To update the grid, send /setgrid <lower> <upper>\n"
-                "Example: /setgrid 72000 95000\n"
-                "The stop-loss must be below the new lower bound."
-            )
-        elif action == "menu:setstop":
-            await update.effective_message.reply_text(
-                "🛡️ To update the stop-loss, send /setstop <price>\n"
-                "The price must be below the current lower grid bound."
-            )
-        elif action == "menu:stop":
-            await self._handle_stop(update, context)
+        answer_options = {}
+        try:
+            if not self._is_owner(update, self.owner_chat_id):
+                answer_options = {"text": "Not authorized.", "show_alert": True}
+                return
+            action = query.data
+            if action == "menu:back":
+                text, keyboard = self._main_menu_view()
+                await self._edit_menu_message(query, text, keyboard, ParseMode.HTML)
+                return
+            if action == "menu:status":
+                text = await self._status_text()
+            elif action == "menu:orders":
+                messages = await self._open_order_messages()
+                text = messages[0]
+                if len(messages) > 1:
+                    text += "\n\nMore orders: send /orders to see the full list."
+            elif action == "menu:setgrid":
+                text = (
+                    "⚙️ To update the grid, send /setgrid <lower> <upper>\n"
+                    "Example: /setgrid 72000 95000\n"
+                    "The stop-loss must be below the new lower bound."
+                )
+            elif action == "menu:setstop":
+                text = (
+                    "🛡️ To update the stop-loss, send /setstop <price>\n"
+                    "The price must be below the current lower grid bound."
+                )
+            elif action == "menu:stop":
+                text = await self._stop_text()
+            else:
+                return
+            await self._edit_menu_message(query, text, self._back_keyboard())
+        finally:
+            await query.answer(**answer_options)
 
     async def _handle_stop(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id):
             return
+        await update.effective_message.reply_text(await self._stop_text())
+
+    async def _stop_text(self) -> str:
         self.stop_controller.stop_requested.set()
         try:
             result = await asyncio.to_thread(self.stop_controller.request_stop)
         except Exception:
-            await update.effective_message.reply_text(
-                "Trading paused. Order cancellation could not be verified; inspect local state."
-            )
-            return
-        await update.effective_message.reply_text(
+            return "Trading paused. Order cancellation could not be verified; inspect local state."
+        return (
             "Trading stopped. "
             f"Canceled: {result.canceled}; already filled: {result.filled}; "
             f"unresolved: {result.unresolved}."
@@ -283,6 +322,11 @@ class TelegramBot:
     async def _handle_status(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
+        await update.effective_message.reply_text(await self._status_text())
+
+    async def _status_text(self) -> str:
+        if self.grid_bot is None:
+            return "Bot status unavailable."
         try:
             price, lower, upper, levels, stop_loss = await asyncio.wait_for(
                 asyncio.to_thread(self.grid_bot.grid_status),
@@ -294,10 +338,7 @@ class TelegramBot:
             try:
                 lower, upper, levels, stop_loss = self.grid_bot.grid_configuration()
             except Exception:
-                await update.effective_message.reply_text(
-                    "Could not read grid settings. Check bot logs."
-                )
-                return
+                return "Could not read grid settings. Check bot logs."
         try:
             buy_count, sell_count, closest_buy, closest_sell = await asyncio.wait_for(
                 asyncio.to_thread(self.grid_bot.open_order_summary, price),
@@ -316,7 +357,7 @@ class TelegramBot:
         except Exception as error:
             LOGGER.warning("Status open-order request failed: %s", type(error).__name__)
             orders_text = "Open orders unavailable (exchange request failed or timed out)."
-        await update.effective_message.reply_text(
+        return (
             f"BTC/USDT current price: {price if price is not None else 'unavailable'}"
             f"{' USDT' if price is not None else ''}\n"
             f"Active bounds: {lower}–{upper} USDT\n"
@@ -328,6 +369,12 @@ class TelegramBot:
     async def _handle_orders(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
+        for message in await self._open_order_messages():
+            await update.effective_message.reply_text(message)
+
+    async def _open_order_messages(self) -> list[str]:
+        if self.grid_bot is None:
+            return ["Open orders unavailable."]
         try:
             base, quote, buys, sells = await asyncio.wait_for(
                 asyncio.to_thread(self.grid_bot.list_open_orders),
@@ -335,13 +382,11 @@ class TelegramBot:
             )
         except Exception as error:
             LOGGER.warning("Orders request failed: %s", type(error).__name__)
-            await update.effective_message.reply_text(
+            return [
                 "Could not fetch open orders (exchange request failed or timed out). "
                 "Please try again."
-            )
-            return
-        for message in _format_open_order_messages(base, quote, buys, sells):
-            await update.effective_message.reply_text(message)
+            ]
+        return _format_open_order_messages(base, quote, buys, sells)
 
     async def _handle_setgrid(self, update: Update,
                               context: ContextTypes.DEFAULT_TYPE) -> None:

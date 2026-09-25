@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler
 
 from database import GridDatabase
@@ -53,12 +54,22 @@ class TelegramBotTests(unittest.TestCase):
                 for handler in handlers
             ))
             replies = []
+            edits = []
             acknowledgements = []
+            events = []
+            not_modified = [False]
 
             async def reply_text(message, **kwargs):
                 replies.append((message, kwargs))
 
+            async def edit_message_text(text, **kwargs):
+                events.append("edit")
+                if not_modified[0]:
+                    raise BadRequest("Message is not modified")
+                edits.append((text, kwargs))
+
             async def answer(*args, **kwargs):
+                events.append("answer")
                 acknowledgements.append((args, kwargs))
 
             def update(user_id, chat_id, action=None):
@@ -66,7 +77,10 @@ class TelegramBotTests(unittest.TestCase):
                     effective_user=SimpleNamespace(id=user_id),
                     effective_chat=SimpleNamespace(id=chat_id, type="private"),
                     effective_message=SimpleNamespace(reply_text=reply_text),
-                    callback_query=(SimpleNamespace(data=action, answer=answer)
+                    callback_query=(SimpleNamespace(
+                        data=action, answer=answer,
+                        edit_message_text=edit_message_text,
+                    )
                                     if action else None),
                 )
 
@@ -95,21 +109,41 @@ class TelegramBotTests(unittest.TestCase):
             asyncio.run(bot._handle_menu_callback(update(999, 12345, "menu:stop"), None))
             self.assertFalse(controller.stop_requested.is_set())
             self.assertEqual(replies, [])
+            self.assertEqual(edits, [])
             self.assertEqual(acknowledgements[-1][1],
-                             {"show_alert": True})
+                             {"text": "Not authorized.", "show_alert": True})
 
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:status"), None))
-            self.assertIn("Total grid levels: 20", replies.pop()[0])
+            self.assertIn("Total grid levels: 20", edits[-1][0])
+            self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
+                             "menu:back")
+            self.assertEqual(events[-2:], ["edit", "answer"])
+            self.assertEqual(replies, [])
+
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:back"), None))
+            self.assertEqual(edits[-1][0], welcome)
+            self.assertEqual(edits[-1][1]["parse_mode"], ParseMode.HTML)
+            self.assertEqual([len(row) for row in edits[-1][1]["reply_markup"].inline_keyboard],
+                             [2, 2, 1])
+
+            not_modified[0] = True
+            answer_count = len(acknowledgements)
+            asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:back"), None))
+            self.assertEqual(len(acknowledgements), answer_count + 1)
+            self.assertEqual(events[-2:], ["edit", "answer"])
+            not_modified[0] = False
+
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:orders"), None))
-            self.assertIn("Buy 0.01 BTC @ 99 USDT", replies.pop()[0])
+            self.assertIn("Buy 0.01 BTC @ 99 USDT", edits[-1][0])
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
-            self.assertIn("/setgrid <lower> <upper>", replies.pop()[0])
+            self.assertIn("/setgrid <lower> <upper>", edits[-1][0])
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setstop"), None))
-            self.assertIn("/setstop <price>", replies.pop()[0])
+            self.assertIn("/setstop <price>", edits[-1][0])
             self.assertFalse(controller.stop_requested.is_set())
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:stop"), None))
             self.assertTrue(controller.stop_requested.is_set())
-            self.assertIn("Trading stopped", replies.pop()[0])
+            self.assertIn("Trading stopped", edits[-1][0])
+            self.assertEqual(replies, [])
 
     def test_stop_pauses_and_reconciles_tracked_orders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
