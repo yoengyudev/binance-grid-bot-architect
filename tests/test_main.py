@@ -6,7 +6,10 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
 from database import GridDatabase
-from main import GridBot, GridConfig, UncertainOrderError, geometric_levels
+from main import (
+    GridBot, GridConfig, UncertainOrderError, _apply_active_grid_config,
+    geometric_levels,
+)
 
 
 class FakeSpotExchange:
@@ -262,6 +265,54 @@ class GridBotTests(unittest.TestCase):
                     bot.request_grid_reset(lower, upper)
             self.assertEqual(len(exchange.fetch_open_orders("BTC/USDT")), before)
             self.assertIsNone(bot.database.get_state("grid_reset"))
+
+    def test_setstop_updates_saved_run_without_touching_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            original_config = bot.config
+            bot.run_cycle()
+            bot.run_cycle()
+            original_ids = {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")}
+
+            self.assertEqual(bot.set_stop_loss("74"), Decimal("74"))
+
+            self.assertEqual(bot.config.stop_loss_price, Decimal("74"))
+            self.assertFalse(bot.grid_needs_reset)
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            self.assertEqual(
+                {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")},
+                original_ids,
+            )
+            saved_config = _apply_active_grid_config(original_config, GridDatabase(path))
+            self.assertEqual(saved_config.stop_loss_price, Decimal("74"))
+            reopened = GridBot(saved_config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+
+            reopened.request_grid_reset("75", "125")
+            self.assertTrue(reopened.reset_grid())
+            after_reset = _apply_active_grid_config(original_config, GridDatabase(path))
+            self.assertEqual(after_reset.stop_loss_price, Decimal("74"))
+            GridBot(after_reset, exchange, GridDatabase(path)).prepare(persist=False)
+
+    def test_setstop_rejects_invalid_price_without_touching_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            original_ids = {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")}
+            for price in ("nan", "inf", "abc", "0", "-1"):
+                with self.assertRaisesRegex(ValueError, "valid positive"):
+                    bot.set_stop_loss(price)
+            for price in ("80", "90"):
+                with self.assertRaisesRegex(ValueError, "lower than the current lower bound"):
+                    bot.set_stop_loss(price)
+            self.assertEqual(bot.config.stop_loss_price, Decimal("70"))
+            self.assertEqual(
+                {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")},
+                original_ids,
+            )
+            self.assertIsNone(bot.database.get_state("active_grid_config"))
 
     def test_reset_preserves_cost_basis_after_old_sell_fill(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

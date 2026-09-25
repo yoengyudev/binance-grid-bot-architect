@@ -167,11 +167,46 @@ class GridBot:
         )
         self.grid_needs_reset = pending is not None
 
-    def grid_status(self) -> Tuple[Decimal, Decimal, Decimal, int]:
+    def grid_status(self) -> Tuple[Decimal, Decimal, Decimal, int, Decimal]:
         price = self._ticker_price()
         with self._grid_lock:
             return (price, self.config.lower_price, self.config.upper_price,
-                    len(self.levels) + len(self.upper_levels))
+                    len(self.levels) + len(self.upper_levels),
+                    self.config.stop_loss_price)
+
+    def set_stop_loss(self, price_text: str) -> Decimal:
+        try:
+            stop_loss = _decimal(price_text, "stop_loss_price")
+        except ValueError as error:
+            raise ValueError("Enter a valid positive stop-loss price.") from error
+        with self._grid_lock:
+            if stop_loss >= self.config.lower_price:
+                raise ValueError(
+                    "❌ Rejected: Stop-loss must be lower than the current lower bound."
+                )
+            if self.stop_controller.stop_requested.is_set():
+                raise RuntimeError("Bot is stopping; stop-loss was not changed.")
+            if self.grid_needs_reset:
+                raise RuntimeError("A grid reset is in progress; stop-loss was not changed.")
+            saved_text = self.database.get_state("grid_run")
+            if saved_text is None:
+                raise RuntimeError("No active grid run is available.")
+            saved = json.loads(saved_text)
+            if saved["fingerprint"] != self.config.fingerprint():
+                raise TradingHalt("Saved grid settings do not match the active run.")
+            new_config = replace(self.config, stop_loss_price=stop_loss)
+            saved["fingerprint"] = new_config.fingerprint()
+            active = {
+                "lower": str(new_config.lower_price),
+                "upper": str(new_config.upper_price),
+                "spacing": str(new_config.spacing_percent),
+                "stop_loss_price": str(stop_loss),
+            }
+            self.database.update_runtime_grid_settings(
+                json.dumps(saved, sort_keys=True), json.dumps(active, sort_keys=True)
+            )
+            self.config = new_config
+        return stop_loss
 
     def request_grid_reset(self, lower_text: str, upper_text: str) -> None:
         lower = _decimal(lower_text, "lower_price")
@@ -610,7 +645,8 @@ class GridBot:
             state = {"anchor": str(price), "baseline_base": str(baseline),
                      "fingerprint": new_config.fingerprint()}
             active = {"lower": request["lower"], "upper": request["upper"],
-                      "spacing": request["spacing"]}
+                      "spacing": request["spacing"],
+                      "stop_loss_price": str(new_config.stop_loss_price)}
             request["phase"] = "placing"
             carry_id = "carry-" + uuid.uuid4().hex if carry_amount > 0 else None
             self.database.complete_grid_reset(
@@ -818,6 +854,22 @@ def _center_config_at_current_price(exchange: Any, database: GridDatabase) -> No
     )
 
 
+def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> GridConfig:
+    active_config_text = database.get_state("active_grid_config")
+    if not active_config_text:
+        return config
+    active = json.loads(active_config_text)
+    return replace(
+        config,
+        lower_price=Decimal(active["lower"]),
+        upper_price=Decimal(active["upper"]),
+        spacing_percent=Decimal(active["spacing"]),
+        stop_loss_price=Decimal(
+            active.get("stop_loss_price", str(config.stop_loss_price))
+        ),
+    )
+
+
 def main() -> int:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -834,13 +886,7 @@ def main() -> int:
         exchange = create_exchange(key, secret)
         database = GridDatabase()
         _center_config_at_current_price(exchange, database)
-        config = GridConfig.load()
-        active_config_text = database.get_state("active_grid_config")
-        if active_config_text:
-            active = json.loads(active_config_text)
-            config = replace(config, lower_price=Decimal(active["lower"]),
-                             upper_price=Decimal(active["upper"]),
-                             spacing_percent=Decimal(active["spacing"]))
+        config = _apply_active_grid_config(GridConfig.load(), database)
         bot = GridBot(config, exchange, database)
         if arguments.check:
             current, planned, upper_planned = bot.prepare(persist=False)

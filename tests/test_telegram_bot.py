@@ -74,7 +74,7 @@ class TelegramBotTests(unittest.TestCase):
             self.assertTrue(controller.stop_requested.is_set())
             self.assertIn("Trading stopped", replies[0])
 
-    def test_status_and_setgrid_are_owner_only(self) -> None:
+    def test_status_and_grid_controls_are_owner_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
             controller = StopController(FakeExchange(), database, "BTC/USDT")
@@ -82,14 +82,24 @@ class TelegramBotTests(unittest.TestCase):
             class GridStub:
                 def __init__(self):
                     self.requests = []
+                    self.stop_requests = []
                     self.status_calls = 0
 
                 def grid_status(self):
                     self.status_calls += 1
-                    return (Decimal("100"), Decimal("75"), Decimal("125"), 20)
+                    return (Decimal("100"), Decimal("75"), Decimal("125"), 20,
+                            Decimal("70"))
 
                 def request_grid_reset(self, lower, upper):
                     self.requests.append((lower, upper))
+
+                def set_stop_loss(self, price):
+                    self.stop_requests.append(price)
+                    if Decimal(price) >= Decimal("75"):
+                        raise ValueError(
+                            "❌ Rejected: Stop-loss must be lower than the current lower bound."
+                        )
+                    return Decimal(price)
 
             grid = GridStub()
             bot = TelegramBot("123456:ABCDEF", 12345, controller, grid)
@@ -109,12 +119,15 @@ class TelegramBotTests(unittest.TestCase):
             owner = update(12345, 12345, "private")
             asyncio.run(bot._handle_status(outsider, None))
             asyncio.run(bot._handle_setgrid(outsider, SimpleNamespace(args=["75", "125"])))
+            asyncio.run(bot._handle_setstop(outsider, SimpleNamespace(args=["70"])))
             self.assertEqual(grid.status_calls, 0)
             self.assertEqual(grid.requests, [])
+            self.assertEqual(grid.stop_requests, [])
             self.assertEqual(replies, [])
 
             asyncio.run(bot._handle_status(owner, None))
             self.assertIn("Total grid levels: 20", replies[-1])
+            self.assertIn("Stop-loss: 70 USDT", replies[-1])
             asyncio.run(bot._handle_setgrid(owner, SimpleNamespace(args=["75"])))
             self.assertEqual(grid.requests, [])
             asyncio.run(bot._handle_setgrid(owner, SimpleNamespace(args=["75", "125"])))
@@ -123,6 +136,15 @@ class TelegramBotTests(unittest.TestCase):
                 replies[-1],
                 "✅ Grid bounds updated. Canceling old orders and rebuilding grid...",
             )
+
+            asyncio.run(bot._handle_setstop(owner, SimpleNamespace(args=["75"])))
+            self.assertEqual(
+                replies[-1],
+                "❌ Rejected: Stop-loss must be lower than the current lower bound.",
+            )
+            asyncio.run(bot._handle_setstop(owner, SimpleNamespace(args=["70"])))
+            self.assertEqual(replies[-1], "✅ Stop-loss successfully updated to: $70")
+            self.assertEqual(grid.stop_requests, ["75", "70"])
 
 
 if __name__ == "__main__":

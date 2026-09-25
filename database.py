@@ -275,6 +275,28 @@ class GridDatabase:
                 (key, value),
             )
 
+    def update_runtime_grid_settings(self, grid_run: str, active_config: str) -> None:
+        """Persist a setting change with its matching run fingerprint atomically."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            saved_run = connection.execute(
+                "SELECT value FROM bot_state WHERE key = 'grid_run'"
+            ).fetchone()
+            pending_reset = connection.execute(
+                "SELECT 1 FROM bot_state WHERE key = 'grid_reset'"
+            ).fetchone()
+            if saved_run is None or pending_reset is not None:
+                raise ValueError("A running grid without a pending reset is required.")
+            for key, value in (
+                ("grid_run", grid_run),
+                ("active_grid_config", active_config),
+            ):
+                connection.execute(
+                    "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+
     def complete_grid_reset(self, grid_run: str, active_config: str,
                             placing_request: str, *, carry_order_id: Optional[str] = None,
                             carry_price: Optional[str] = None,

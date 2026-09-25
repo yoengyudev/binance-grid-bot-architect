@@ -145,6 +145,9 @@ class TelegramBot:
             self.application.add_handler(
                 CommandHandler("setgrid", self._handle_setgrid, filters=owner_filter)
             )
+            self.application.add_handler(
+                CommandHandler("setstop", self._handle_setstop, filters=owner_filter)
+            )
         self._initialized = False
 
     @staticmethod
@@ -180,14 +183,17 @@ class TelegramBot:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
         try:
-            price, lower, upper, levels = await asyncio.to_thread(self.grid_bot.grid_status)
+            price, lower, upper, levels, stop_loss = await asyncio.to_thread(
+                self.grid_bot.grid_status
+            )
         except Exception:
             await update.effective_message.reply_text("Could not fetch grid status. Check bot logs.")
             return
         await update.effective_message.reply_text(
             f"BTC/USDT current price: {price} USDT\n"
             f"Active bounds: {lower}–{upper} USDT\n"
-            f"Total grid levels: {levels}"
+            f"Total grid levels: {levels}\n"
+            f"Stop-loss: {stop_loss} USDT"
         )
 
     async def _handle_setgrid(self, update: Update,
@@ -208,6 +214,32 @@ class TelegramBot:
             return
         await update.effective_message.reply_text(
             "✅ Grid bounds updated. Canceling old orders and rebuilding grid..."
+        )
+
+    async def _handle_setstop(self, update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
+            return
+        args = context.args or []
+        if len(args) != 1:
+            await update.effective_message.reply_text("Usage: /setstop <price>")
+            return
+        try:
+            price = await asyncio.to_thread(self.grid_bot.set_stop_loss, args[0])
+        except ValueError as error:
+            message = str(error)
+            if not message.startswith("❌ Rejected:"):
+                message = f"❌ Rejected: {message}"
+            await update.effective_message.reply_text(message)
+            return
+        except RuntimeError as error:
+            await update.effective_message.reply_text(f"❌ Rejected: {error}")
+            return
+        except Exception:
+            await update.effective_message.reply_text("Stop-loss update failed. Check bot logs.")
+            return
+        await update.effective_message.reply_text(
+            f"✅ Stop-loss successfully updated to: ${format(price, 'f')}"
         )
 
     async def start(self) -> None:
