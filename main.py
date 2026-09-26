@@ -18,7 +18,7 @@ import ccxt
 from dotenv import load_dotenv
 
 from database import GridDatabase
-from exchange_handler import create_exchange, load_config
+from exchange_handler import config_path, create_exchange, load_config
 from telegram_bot import StopController, TelegramBot, load_telegram_credentials
 
 
@@ -66,7 +66,7 @@ class GridConfig:
     poll_seconds: int
 
     @classmethod
-    def load(cls, path: Path = BASE_DIR / "config.json") -> "GridConfig":
+    def load(cls, path: Optional[Path] = None) -> "GridConfig":
         raw = load_config(path)
         grid = raw["grid"]
         investment = _decimal(grid.get("investment_quote"), "investment_quote")
@@ -950,7 +950,7 @@ def _center_config_at_current_price(exchange: Any, database: GridDatabase) -> No
     """Center bounds once per new run; preserve them on restart."""
     if database.get_state("grid_run") is not None:
         return
-    path = BASE_DIR / "config.json"
+    path = config_path()
     raw = load_config(path)
     percent_value = raw["grid"].get("auto_center_percent")
     if percent_value is None:

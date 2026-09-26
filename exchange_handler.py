@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import ccxt
 from dotenv import load_dotenv
@@ -13,8 +13,14 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 
 
-def load_config(path: Path = BASE_DIR / "config.json") -> Dict[str, Any]:
+def config_path() -> Path:
+    """Allow container deployments to keep mutable config outside the image."""
+    return Path(os.getenv("GRID_BOT_CONFIG_PATH", str(BASE_DIR / "config.json")))
+
+
+def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     """Load the grid configuration and reject non-testnet exchange settings."""
+    path = path if path is not None else config_path()
     with path.open("r", encoding="utf-8") as config_file:
         config = json.load(config_file)
 

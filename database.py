@@ -1,6 +1,7 @@
 """Persistent local state for grid orders and completed trades (Phase 2)."""
 
 import json
+import os
 import sqlite3
 from contextlib import closing, contextmanager
 from decimal import Decimal, InvalidOperation
@@ -38,8 +39,10 @@ def _decimal_text(value: NumberValue, *, positive: bool = True) -> str:
 class GridDatabase:
     """Each operation commits atomically and can be recovered after a restart."""
 
-    def __init__(self, path: PathValue = DATABASE_PATH) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Optional[PathValue] = None) -> None:
+        self.path = Path(path) if path is not None else Path(
+            os.getenv("GRID_BOT_DB_PATH", str(DATABASE_PATH))
+        )
         self.initialize()
 
     @contextmanager
