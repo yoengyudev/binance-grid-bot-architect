@@ -1032,9 +1032,12 @@ def main() -> int:
         telegram_bot = TelegramBot(token, owner_chat_id, bot.stop_controller, bot)
         asyncio.run(bot.run(telegram_bot))
         return 0
-    except (ValueError, TradingHalt, ccxt.BaseError) as error:
+    except ccxt.NetworkError as error:
         print(f"Bot stopped: {error}", file=sys.stderr)
         return 1
+    except (ValueError, TradingHalt, ccxt.BaseError) as error:
+        print(f"Bot stopped: {error}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("Interrupted. Check open orders before restarting.", file=sys.stderr)
         return 130

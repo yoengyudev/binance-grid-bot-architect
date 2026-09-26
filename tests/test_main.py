@@ -1,14 +1,18 @@
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 from decimal import Decimal, ROUND_DOWN
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+import ccxt
+
+import main as grid_main
 from database import GridDatabase
 from main import (
-    GridBot, GridConfig, UncertainOrderError, _apply_active_grid_config,
+    GridBot, GridConfig, TradingHalt, UncertainOrderError, _apply_active_grid_config,
     geometric_levels,
 )
 
@@ -114,6 +118,21 @@ class FakeSpotExchange:
 
 
 class GridBotTests(unittest.TestCase):
+    def test_process_exit_codes_separate_retry_from_safety_halt(self) -> None:
+        for error, expected in (
+            (ccxt.NetworkError("Temporary network failure"), 1),
+            (ccxt.AuthenticationError("Invalid API credentials"), 2),
+            (TradingHalt("Order state requires review"), 2),
+            (ValueError("Invalid configuration"), 2),
+            (KeyboardInterrupt(), 130),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with (patch("sys.argv", ["main.py", "--execute"]),
+                      patch.object(grid_main, "_credentials", side_effect=error),
+                      patch.object(grid_main.LOGGER, "addHandler"),
+                      redirect_stderr(StringIO())):
+                    self.assertEqual(grid_main.main(), expected)
+
     def make_bot(self, path: Path):
         config = GridConfig(
             "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
