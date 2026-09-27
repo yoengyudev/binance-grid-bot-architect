@@ -604,6 +604,98 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(bot._sellable_hard_stop_amount(
                 Decimal("0.2"), Decimal("69")), Decimal("0.200"))
 
+    def test_hard_stop_caps_sell_at_fresh_free_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            original_cancel = bot._cancel_bot_orders
+
+            def cancel_then_reduce_balance(*args, **kwargs):
+                result = original_cancel(*args, **kwargs)
+                exchange.base_free = Decimal("2.5")
+                return result
+
+            with patch.object(bot, "_cancel_bot_orders", side_effect=cancel_then_reduce_balance):
+                exchange.price = Decimal("69")
+                bot.run_cycle()
+            sales = [order for order in exchange.orders.values()
+                     if order["type"] == "market" and order["side"] == "sell"]
+            self.assertEqual(len(sales), 1)
+            self.assertEqual(Decimal(sales[0]["amount"]), Decimal("2.5"))
+            state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
+            self.assertEqual(state["phase"], "failed")
+            self.assertEqual(Decimal(state["sold_base"]), Decimal("2.5"))
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATION_HALTED)
+            self.assertEqual(Decimal(state["unavailable_base"]), Decimal("2.5"))
+
+    def test_hard_stop_closes_genuine_dust_without_market_sell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            client_id = bot.order_client_prefix + "b" * 20
+            buy = exchange.create_order(
+                "BTC/USDT", "market", "buy", 0.1, None,
+                {"newClientOrderId": client_id},
+            )
+            bot.database.insert_order(
+                client_id, 0, "BUY", Decimal("100"), Decimal("0.1"),
+                client_order_id=client_id, exchange_order_id=buy["id"],
+                order_type="MARKET",
+            )
+            exchange.price = Decimal("69")
+            with self.assertLogs(grid_main.LOGGER, level="WARNING") as captured:
+                bot.run_cycle()
+            state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+            self.assertEqual(state["residual_base"], "0")
+            self.assertEqual(Decimal(state["dust_base"]), Decimal("0.1"))
+            self.assertEqual(exchange.market_sell_calls, 0)
+            self.assertTrue(any("Sellable inventory is below Binance dust/notional"
+                                in line for line in captured.output))
+
+    def test_hard_stop_balance_retry_does_not_count_confirmed_sale_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            original_balance = exchange.fetch_balance
+            calls = 0
+
+            def transient_balance_error(params):
+                nonlocal calls
+                calls += 1
+                if calls == 3:
+                    raise ccxt.NetworkError("Temporary balance timeout after sale")
+                return original_balance(params)
+
+            exchange.fetch_balance = transient_balance_error
+            exchange.price = Decimal("69")
+            with patch.object(grid_main.time, "sleep"):
+                bot.run_cycle()
+            state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+            self.assertEqual(Decimal(state["sold_base"]), Decimal("5"))
+            self.assertEqual(exchange.market_sell_calls, 1)
+
+    def test_hard_stop_applies_market_filters_and_requires_valid_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.market["info"] = {"filters": [
+                {"filterType": "MARKET_LOT_SIZE", "minQty": "0.5", "stepSize": "0.1"},
+                {"filterType": "NOTIONAL", "minNotional": "50",
+                 "applyMinToMarket": True},
+            ]}
+            self.assertEqual(bot._sellable_hard_stop_amount(
+                Decimal("0.6"), Decimal("69")), Decimal(0))
+            self.assertEqual(bot._sellable_hard_stop_amount(
+                Decimal("0.8"), Decimal("69")), Decimal("0.800"))
+            exchange.fetch_balance = lambda _params: {"BTC": {}}
+            with self.assertRaises(TradingHalt):
+                bot._available_base_for_liquidation()
+
     def test_hard_stop_verifies_timed_out_targeted_cancel(self) -> None:
         for timeout in ("before", "after"):
             with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as directory:

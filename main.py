@@ -1658,7 +1658,7 @@ class GridBot:
                 net_base -= filled
         return max(Decimal(0), net_base)
 
-    def _carry_inventory(self) -> Tuple[Decimal, Decimal]:
+    def _carry_inventory(self, *, require_available: bool = True) -> Tuple[Decimal, Decimal]:
         """Value remaining BTC by its tracked buy lots after all cancels settle."""
         rows = self.database.fetch_all_orders()
         sold_by_buy: Dict[str, Decimal] = {}
@@ -1698,7 +1698,7 @@ class GridBot:
             cost += spent * remaining / net
         if amount > 0 and cost <= 0:
             raise TradingHalt("Carried BTC has no verifiable cost basis.")
-        if amount > self._free_bot_base():
+        if require_available and amount > self._free_bot_base():
             raise TradingHalt("Tracked BTC is not fully available after cancellation.")
         return amount, cost
 
@@ -1893,7 +1893,7 @@ class GridBot:
             raise TradingHalt("Hard-stop order lookup returned no exchange order ID.")
         return order
 
-    def _submit_hard_stop_sell(self, state: Dict[str, Any]) -> None:
+    def _submit_hard_stop_sell(self, state: Dict[str, Any]) -> bool:
         """Resolve the previous client ID and balance before any repeat submission."""
         client_id = state["client_order_id"]
         if state["attempts"]:
@@ -1902,7 +1902,7 @@ class GridBot:
                 state["exchange_order_id"] = str(found["id"])
                 state["phase"] = "confirming"
                 self._save_liquidation(state)
-                return
+                return False
             if state.get("retry_allowed"):
                 time.sleep(0.3)
                 found = self._liquidation_order(client_id)
@@ -1910,14 +1910,24 @@ class GridBot:
                     state["exchange_order_id"] = str(found["id"])
                     state["phase"] = "confirming"
                     self._save_liquidation(state)
-                    return
+                    return False
             if (not state.get("retry_allowed") or
-                    self._free_balance(self.market["base"]) !=
+                    self._available_base_for_liquidation() !=
                     Decimal(state["pre_submit_base_free"])):
                 raise TradingHalt(
                     "Market-sell outcome is uncertain; inspect the client order ID "
                     "and BTC balance before any further sale."
                 )
+        remaining = Decimal(state["held_base"]) - Decimal(state.get("sold_base", "0"))
+        amount, available = self._liquidation_sell_amount(state, remaining)
+        if amount <= 0:
+            self._complete_hard_stop(
+                state, Decimal(state.get("sold_base", "0")),
+                Decimal(state.get("proceeds_quote", "0")),
+            )
+            return True
+        state["sell_amount"] = str(amount)
+        state["pre_submit_base_free"] = str(available)
         state["attempts"] += 1
         state["retry_allowed"] = True  # Recover an interrupted request after restart.
         self._save_liquidation(state)  # Durable intent before the network request.
@@ -1937,6 +1947,7 @@ class GridBot:
         state["exchange_order_id"] = str(response["id"])
         state["phase"] = "confirming"
         self._save_liquidation(state)
+        return False
 
     def _complete_hard_stop(self, state: Dict[str, Any], sold: Decimal,
                             proceeds: Decimal = Decimal(0)) -> None:
@@ -1946,8 +1957,10 @@ class GridBot:
         if residual > 0 and self._sellable_hard_stop_amount(
                 residual, self._ticker_price()) > 0:
             raise TradingHalt("Market SELL left tradable bot BTC; manual review required.")
+        # Keep the unsold dust in the audit record while closing active inventory.
         state.update(phase="complete", sold_base=str(sold),
-                     residual_base=str(residual), proceeds_quote=str(proceeds))
+                     residual_base="0", dust_base=str(residual),
+                     proceeds_quote=str(proceeds))
         self._save_liquidation(state)
         self.database.set_state(SAFETY_MODE_KEY, LIQUIDATED)
         self.database.set_state("halt_reason", "hard_stop_liquidated")
@@ -1958,24 +1971,83 @@ class GridBot:
         self.grid_needs_reset = False
         self.pending_grid_bounds = None
         self.is_paused = True
-        LOGGER.critical("Hard stop liquidated %s %s; bot is locked until admin reset.",
-                        sold, self.market["base"])
+        LOGGER.critical(
+            "Hard stop sold %s %s; unsold dust %s %s is recorded. "
+            "Bot is locked until admin reset.",
+            sold, self.market["base"], residual, self.market["base"],
+        )
 
     def _sellable_hard_stop_amount(self, held: Decimal, price: Decimal) -> Decimal:
-        """Return zero only for BTC below the exchange's known minimums."""
+        """Apply market-order lot and notional filters before submitting a SELL."""
+        def minimum(value: Any) -> Decimal:
+            try:
+                parsed = _order_decimal(value)
+            except (InvalidOperation, TypeError, ValueError) as error:
+                raise TradingHalt("Exchange market minimum is invalid.") from error
+            if not parsed.is_finite() or parsed < 0:
+                raise TradingHalt("Exchange market minimum is invalid.")
+            return parsed
+
         amount = self._amount(held)
         if amount <= 0:
             return Decimal(0)
-        try:
-            self._check_order_size(price, amount)
-        except ValueError as error:
-            if str(error) not in (
-                "Order amount is below the market minimum.",
-                "Order notional is below the market minimum.",
-            ):
-                raise
+        limits = self.market.get("limits") or {}
+        amount_min = minimum((limits.get("amount") or {}).get("min"))
+        cost_min = max(Decimal("10"), minimum((limits.get("cost") or {}).get("min")))
+        info = self.market.get("info") or {}
+        filters = (info.get("filters") or []) if isinstance(info, dict) else []
+        for rule in filters:
+            if not isinstance(rule, dict):
+                continue
+            kind = rule.get("filterType")
+            if kind == "MARKET_LOT_SIZE":
+                amount_min = max(amount_min, minimum(rule.get("minQty")))
+                step = minimum(rule.get("stepSize"))
+                if step > 0:
+                    amount = self._amount((amount // step) * step)
+            elif kind == "MIN_NOTIONAL" and rule.get("applyToMarket") in (True, "true"):
+                cost_min = max(cost_min, minimum(rule.get("minNotional")))
+            elif kind == "NOTIONAL" and rule.get("applyMinToMarket") in (True, "true"):
+                cost_min = max(cost_min, minimum(rule.get("minNotional")))
+        if amount < amount_min or price * amount < cost_min:
             return Decimal(0)
         return amount
+
+    def _available_base_for_liquidation(self) -> Decimal:
+        """Read an explicit, fresh Spot free balance; missing data is not zero."""
+        balances = self._call(self.exchange.fetch_balance, {"type": "spot"})
+        asset = balances.get(self.market["base"]) if isinstance(balances, dict) else None
+        free = asset.get("free") if isinstance(asset, dict) else None
+        try:
+            available = Decimal(str(free))
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise TradingHalt("Exchange BTC free balance is unavailable.") from error
+        if not available.is_finite() or available < 0:
+            raise TradingHalt("Exchange BTC free balance is invalid.")
+        return available
+
+    def _liquidation_sell_amount(
+        self, state: Dict[str, Any], tracked: Decimal,
+    ) -> Tuple[Decimal, Decimal]:
+        """Cap each sale at actual free BTC; never hide a material shortfall as dust."""
+        if tracked < 0:
+            raise TradingHalt("Liquidation ledger has negative remaining BTC.")
+        available = self._available_base_for_liquidation()
+        price = self._ticker_price()
+        safe_amount = min(tracked, available)
+        amount = self._sellable_hard_stop_amount(safe_amount, price)
+        if amount <= 0 and tracked > 0:
+            if self._sellable_hard_stop_amount(tracked, price) > 0:
+                state["unavailable_base"] = str(tracked - safe_amount)
+                self._save_liquidation(state)
+                raise TradingHalt(
+                    "Bot inventory exceeds sellable free BTC; liquidation needs review."
+                )
+            LOGGER.warning(
+                "Sellable inventory is below Binance dust/notional limits. "
+                "Bypassing execution."
+            )
+        return amount, available
 
     def _liquidation_step(self, state: Dict[str, Any]) -> bool:
         """Advance one durable phase; never submit a second sell before reconciliation."""
@@ -1983,55 +2055,65 @@ class GridBot:
             _, complete = self._cancel_bot_orders()
             if not complete or self.database.fetch_active_grids():
                 return False
-            held, cost = self._carry_inventory()
-            amount = self._sellable_hard_stop_amount(held, self._ticker_price())
+            held, cost = self._carry_inventory(require_available=False)
             state.update(held_base=str(held), cost_basis_quote=str(cost),
-                         sold_base="0", proceeds_quote="0", sell_amount=str(amount))
+                         sold_base="0", proceeds_quote="0")
+            amount, available = self._liquidation_sell_amount(state, held)
+            state["sell_amount"] = str(amount)
             if amount <= 0:
                 self._complete_hard_stop(state, Decimal(0))
                 return True
-            if amount > self._free_bot_base():
-                raise TradingHalt("Bot-tracked BTC is not free after targeted cancellation.")
             state.update(phase="submitting", client_order_id=self.order_client_prefix + uuid.uuid4().hex[:20],
-                         pre_submit_base_free=str(self._free_balance(self.market["base"])),
+                         pre_submit_base_free=str(available),
                          attempts=0, retry_allowed=False)
             self._save_liquidation(state)
         if state["phase"] == "submitting":
-            self._submit_hard_stop_sell(state)
+            if self._submit_hard_stop_sell(state):
+                return True
         if state["phase"] == "confirming":
-            order = self._liquidation_order(state["client_order_id"])
-            if order is None or order.get("status") == "open":
-                return False
-            if order.get("status") not in ("closed", "canceled", "expired"):
-                raise TradingHalt("Hard-stop SELL has an unknown exchange status.")
-            if order.get("filled") is None:
-                raise TradingHalt("Hard-stop SELL has no confirmed filled quantity.")
-            sold = _order_decimal(order.get("filled"))
-            total_sold = Decimal(state.get("sold_base", "0")) + sold
-            if total_sold > Decimal(state["held_base"]):
-                raise TradingHalt("Hard-stop SELL exceeded bot-tracked BTC.")
-            proceeds = _order_decimal(order.get("cost"),
-                                      str(sold * _order_decimal(order.get("average"))))
-            if sold > 0 and proceeds > 0:
-                basis = Decimal(state["cost_basis_quote"]) * sold / Decimal(state["held_base"])
-                profit = proceeds - _fees_in_asset(order, self.market["quote"]) - basis
-                self.database.record_trade(
-                    basis / sold, proceeds / sold, profit,
-                    sell_order_id=state["client_order_id"],
-                )
-            total_proceeds = Decimal(state.get("proceeds_quote", "0")) + proceeds
+            if state.get("confirmed_order_id") == state["client_order_id"]:
+                total_sold = Decimal(state["confirmed_sold_base"])
+                total_proceeds = Decimal(state["confirmed_proceeds_quote"])
+            else:
+                order = self._liquidation_order(state["client_order_id"])
+                if order is None or order.get("status") == "open":
+                    return False
+                if order.get("status") not in ("closed", "canceled", "expired"):
+                    raise TradingHalt("Hard-stop SELL has an unknown exchange status.")
+                if order.get("filled") is None:
+                    raise TradingHalt("Hard-stop SELL has no confirmed filled quantity.")
+                sold = _order_decimal(order.get("filled"))
+                total_sold = Decimal(state.get("sold_base", "0")) + sold
+                if total_sold > Decimal(state["held_base"]):
+                    raise TradingHalt("Hard-stop SELL exceeded bot-tracked BTC.")
+                proceeds = _order_decimal(order.get("cost"),
+                                          str(sold * _order_decimal(order.get("average"))))
+                if sold > 0 and proceeds > 0:
+                    basis = (Decimal(state["cost_basis_quote"]) * sold /
+                             Decimal(state["held_base"]))
+                    profit = proceeds - _fees_in_asset(order, self.market["quote"]) - basis
+                    self.database.record_trade(
+                        basis / sold, proceeds / sold, profit,
+                        sell_order_id=state["client_order_id"],
+                    )
+                total_proceeds = Decimal(state.get("proceeds_quote", "0")) + proceeds
+                state.update(confirmed_order_id=state["client_order_id"],
+                             confirmed_sold_base=str(total_sold),
+                             confirmed_proceeds_quote=str(total_proceeds))
+                self._save_liquidation(state)
             residual = Decimal(state["held_base"]) - total_sold
-            amount = self._sellable_hard_stop_amount(residual, self._ticker_price())
+            amount, available = self._liquidation_sell_amount(state, residual)
             if amount <= 0:
                 self._complete_hard_stop(state, total_sold, total_proceeds)
                 return True
-            if amount > self._free_bot_base():
-                raise TradingHalt("Remaining bot BTC is not free for liquidation.")
             state.update(phase="submitting", sold_base=str(total_sold),
                          proceeds_quote=str(total_proceeds), sell_amount=str(amount),
                          client_order_id=self.order_client_prefix + uuid.uuid4().hex[:20],
-                         pre_submit_base_free=str(self._free_balance(self.market["base"])),
+                         pre_submit_base_free=str(available),
                          attempts=0, retry_allowed=False)
+            for key in ("confirmed_order_id", "confirmed_sold_base",
+                        "confirmed_proceeds_quote"):
+                state.pop(key, None)
             self._save_liquidation(state)
             return False
         raise TradingHalt("Unknown hard-stop liquidation phase.")
@@ -2080,6 +2162,9 @@ class GridBot:
             time.sleep(retry_delay)
 
     def _fail_liquidation(self, state: Dict[str, Any], error: Exception) -> None:
+        if state.get("confirmed_order_id") == state.get("client_order_id"):
+            state["sold_base"] = state["confirmed_sold_base"]
+            state["proceeds_quote"] = state["confirmed_proceeds_quote"]
         state["phase"] = "failed"
         self._save_liquidation(state)
         self.database.set_state(SAFETY_MODE_KEY, LIQUIDATION_HALTED)
