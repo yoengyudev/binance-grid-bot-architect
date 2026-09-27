@@ -933,7 +933,10 @@ class TelegramBot:
 
     async def notify_safety_pause(self) -> None:
         if not await self._refresh_active_status():
-            await self._send("⚠️ SAFETY PAUSE ACTIVE: BUY limits canceled; SELL limits remain open.")
+            await self._send(
+                "⚠️ SAFETY PAUSE ACTIVE: BUY cancellations are being verified; "
+                "SELL limits remain open."
+            )
 
     async def notify_safety_recovery(self) -> None:
         await self._refresh_active_status()

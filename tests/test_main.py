@@ -312,6 +312,22 @@ class GridBotTests(unittest.TestCase):
             self.assertFalse(any(order["side"] == "buy" for order in
                                  exchange.fetch_open_orders("BTC/USDT")))
 
+    def test_safety_pause_alert_does_not_wait_for_cancellation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            notifier = SimpleNamespace(
+                notify_safety_pause=AsyncMock(),
+                notify_safety_recovery=AsyncMock(),
+                notify_safety_resume=AsyncMock(),
+            )
+            bot._enter_safety_pause(Decimal("69"))
+            self.assertTrue(any(order["side"] == "buy" for order in
+                                exchange.fetch_open_orders("BTC/USDT")))
+            asyncio.run(bot._notify_safety_state(notifier))
+            notifier.notify_safety_pause.assert_awaited_once()
+
     def test_uncertain_submission_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")

@@ -995,11 +995,7 @@ class GridBot:
         return events
 
     async def _notify_safety_state(self, telegram_bot: TelegramBot) -> None:
-        active_buys = any(
-            row["side"] == "BUY" and row["order_type"] == "LIMIT"
-            for row in self.database.fetch_active_grids()
-        )
-        if self.database.get_state(SAFETY_PAUSE_NOTICE_KEY) and not active_buys:
+        if self.database.get_state(SAFETY_PAUSE_NOTICE_KEY):
             try:
                 await telegram_bot.notify_safety_pause()
             except Exception as error:
