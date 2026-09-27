@@ -34,6 +34,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "trading_state": "ACTIVE", "grid_levels": 0,
                     "lower_bound": None, "upper_bound": None,
                     "atr_value": None, "atr_percentage": None,
+                    "bid_volume": None, "ask_volume": None,
+                    "imbalance_ratio": None,
                     "wallet": {
                         "btc_held": None, "average_cost": None,
                         "unrealized_pnl": None,
@@ -62,6 +64,10 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 grid_main.app.state.atr_snapshot = {
                     "atr_value": 850.5, "atr_percentage": 1.0,
                 }
+                grid_main.app.state.order_book_snapshot = {
+                    "bid_volume": 15.2, "ask_volume": 4.1,
+                    "imbalance_ratio": 15.2 / 4.1,
+                }
                 try:
                     response = await client.get(
                         "/api/bot/status",
@@ -76,6 +82,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     grid_main.app.state.grid_bot = None
                     grid_main.app.state.atr_snapshot = None
+                    grid_main.app.state.order_book_snapshot = None
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -89,6 +96,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "grid_levels": 2,
             "lower_bound": 81000.0, "upper_bound": 90000.0,
             "atr_value": 850.5, "atr_percentage": 1.0,
+            "bid_volume": 15.2, "ask_volume": 4.1,
+            "imbalance_ratio": 15.2 / 4.1,
             "wallet": {
                 "btc_held": 0.02, "average_cost": 81000.0,
                 "unrealized_pnl": 80.0,
@@ -110,6 +119,44 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(grid_main._calculate_atr_snapshot(candles[:14]))
         candles[-1][4] = None
         self.assertIsNone(grid_main._calculate_atr_snapshot(candles))
+
+    async def test_order_book_uses_top_50_levels_and_rejects_empty_asks(self) -> None:
+        book = {
+            "bids": [[100 - index, 0.1] for index in range(50)] + [[49, 100]],
+            "asks": [[101 + index, 0.2] for index in range(50)] + [[151, 100]],
+        }
+        snapshot = grid_main._calculate_order_book_snapshot(book)
+        self.assertIsNotNone(snapshot)
+        self.assertAlmostEqual(snapshot["bid_volume"], 5)
+        self.assertAlmostEqual(snapshot["ask_volume"], 10)
+        self.assertAlmostEqual(snapshot["imbalance_ratio"], 0.5)
+        self.assertIsNone(grid_main._calculate_order_book_snapshot({
+            "bids": book["bids"], "asks": [],
+        }))
+        self.assertIsNone(grid_main._calculate_order_book_snapshot({
+            "bids": [[100, float("nan")]], "asks": book["asks"],
+        }))
+
+    async def test_order_book_timeout_does_not_clear_atr(self) -> None:
+        grid_main.app.state.atr_snapshot = None
+        grid_main.app.state.order_book_snapshot = {"bid_volume": 1}
+        try:
+            with (
+                patch.object(grid_main, "_fetch_atr_snapshot", return_value={
+                    "atr_value": 20, "atr_percentage": 1,
+                }),
+                patch.object(grid_main, "_fetch_order_book_snapshot",
+                             side_effect=TimeoutError),
+                patch.object(grid_main.asyncio, "sleep",
+                             side_effect=asyncio.CancelledError),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await grid_main._refresh_market_data(object())
+            self.assertEqual(grid_main.app.state.atr_snapshot["atr_value"], 20)
+            self.assertIsNone(grid_main.app.state.order_book_snapshot)
+        finally:
+            grid_main.app.state.atr_snapshot = None
+            grid_main.app.state.order_book_snapshot = None
 
     async def test_admin_login_uses_strict_httponly_cookie(self) -> None:
         protected_app = FastAPI()

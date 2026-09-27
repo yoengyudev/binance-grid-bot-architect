@@ -59,6 +59,7 @@ BREAKOUT_WIDTH_KEY = "breakout_width_percent"
 BREAKOUT_NOTICE_KEY = "breakout_notification_pending"
 BREAKOUT_COOLDOWN_SECONDS = 4 * 60 * 60
 ATR_REFRESH_SECONDS = 60
+ORDER_BOOK_REFRESH_SECONDS = 10
 MOCK_ADMIN_PASSWORD = "admin123"
 JWT_ALGORITHM = "HS256"
 JWT_ISSUER = "grid-bot"
@@ -98,6 +99,7 @@ app.add_middleware(
 )
 app.state.grid_bot = None
 app.state.atr_snapshot = None
+app.state.order_book_snapshot = None
 app.state.preview_jwt_secret = secrets.token_urlsafe(48)
 
 
@@ -340,15 +342,63 @@ def _fetch_atr_snapshot(bot: "GridBot") -> Optional[Dict[str, float]]:
     return _calculate_atr_snapshot(candles)
 
 
-async def _refresh_atr(bot: "GridBot") -> None:
-    """Keep CCXT and Pandas work off the API and trading event loop."""
+def _calculate_order_book_snapshot(book: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """Sum BTC depth at the first 50 price levels on each side."""
+    def total_volume(levels: Any) -> float:
+        if not isinstance(levels, list) or not levels:
+            raise ValueError("Order book side is empty or invalid.")
+        amounts = []
+        for level in levels[:50]:
+            if not isinstance(level, (list, tuple)) or len(level) < 2:
+                raise ValueError("Order book level is invalid.")
+            amount = float(level[1])
+            if not math.isfinite(amount) or amount < 0:
+                raise ValueError("Order book amount is invalid.")
+            amounts.append(amount)
+        return math.fsum(amounts)
+
+    try:
+        bid_volume = total_volume(book["bids"])
+        ask_volume = total_volume(book["asks"])
+        if bid_volume <= 0 or ask_volume <= 0:
+            return None
+        ratio = bid_volume / ask_volume
+        if not math.isfinite(ratio):
+            return None
+        return {
+            "bid_volume": bid_volume,
+            "ask_volume": ask_volume,
+            "imbalance_ratio": ratio,
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _fetch_order_book_snapshot(bot: "GridBot") -> Optional[Dict[str, float]]:
+    with bot.exchange_lock:
+        book = bot.exchange.fetch_order_book(bot.config.symbol, limit=50)
+    return _calculate_order_book_snapshot(book)
+
+
+async def _refresh_market_data(bot: "GridBot") -> None:
+    """Cache read-only market data without blocking the API or trading loop."""
+    next_atr_refresh = 0.0
     while True:
+        if time.monotonic() >= next_atr_refresh:
+            try:
+                app.state.atr_snapshot = await asyncio.to_thread(_fetch_atr_snapshot, bot)
+            except Exception as error:
+                app.state.atr_snapshot = None
+                LOGGER.warning("Hourly ATR unavailable: %s", type(error).__name__)
+            next_atr_refresh = time.monotonic() + ATR_REFRESH_SECONDS
         try:
-            app.state.atr_snapshot = await asyncio.to_thread(_fetch_atr_snapshot, bot)
+            app.state.order_book_snapshot = await asyncio.to_thread(
+                _fetch_order_book_snapshot, bot
+            )
         except Exception as error:
-            app.state.atr_snapshot = None
-            LOGGER.warning("Hourly ATR unavailable: %s", type(error).__name__)
-        await asyncio.sleep(ATR_REFRESH_SECONDS)
+            app.state.order_book_snapshot = None
+            LOGGER.warning("Order book imbalance unavailable: %s", type(error).__name__)
+        await asyncio.sleep(ORDER_BOOK_REFRESH_SECONDS)
 
 
 @app.get("/api/bot/status")
@@ -363,6 +413,7 @@ def bot_status() -> Dict[str, Any]:
     prices = [Decimal(order["price"]) for order in orders]
     safety_mode = database.get_state(SAFETY_MODE_KEY)
     atr = app.state.atr_snapshot if bot is not None else None
+    order_book = app.state.order_book_snapshot if bot is not None else None
     return {
         "status": "Online" if bot is not None else "Offline",
         "pair": bot.config.symbol if bot is not None else "BTC/USDT",
@@ -380,6 +431,9 @@ def bot_status() -> Dict[str, Any]:
                   else _unavailable_wallet(),
         "atr_value": atr["atr_value"] if atr is not None else None,
         "atr_percentage": atr["atr_percentage"] if atr is not None else None,
+        "bid_volume": order_book["bid_volume"] if order_book is not None else None,
+        "ask_volume": order_book["ask_volume"] if order_book is not None else None,
+        "imbalance_ratio": order_book["imbalance_ratio"] if order_book is not None else None,
     }
 
 
@@ -2118,6 +2172,7 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
     """Run the local API and trading loop with outbound alerts only."""
     app.state.grid_bot = bot
     app.state.atr_snapshot = None
+    app.state.order_book_snapshot = None
     server = uvicorn.Server(uvicorn.Config(
         app, host=os.getenv("BOT_API_HOST", "127.0.0.1"),
         port=8000, log_level="warning",
@@ -2136,12 +2191,14 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
                 LOGGER.error("Status API stopped while the trading bot is running.")
 
     api_task = asyncio.create_task(serve_api(), name="status-api")
-    atr_task = asyncio.create_task(_refresh_atr(bot), name="hourly-atr")
+    market_data_task = asyncio.create_task(
+        _refresh_market_data(bot), name="market-intelligence"
+    )
     try:
         await bot.run(notifier)
     finally:
-        atr_task.cancel()
-        await asyncio.gather(atr_task, return_exceptions=True)
+        market_data_task.cancel()
+        await asyncio.gather(market_data_task, return_exceptions=True)
         server.should_exit = True
         try:
             await asyncio.wait_for(
@@ -2153,6 +2210,7 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
         finally:
             app.state.grid_bot = None
             app.state.atr_snapshot = None
+            app.state.order_book_snapshot = None
 
 
 def main() -> int:
