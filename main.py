@@ -17,7 +17,10 @@ from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 
 import ccxt
+import uvicorn
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from database import GridDatabase
 from exchange_handler import config_path, create_exchange, load_config
@@ -39,6 +42,39 @@ BREAKOUT_WIDTH_KEY = "breakout_width_percent"
 BREAKOUT_NOTICE_KEY = "breakout_notification_pending"
 BREAKOUT_COOLDOWN_SECONDS = 4 * 60 * 60
 OpenOrderEntry = Tuple[Optional[Decimal], Optional[Decimal]]
+
+app = FastAPI(title="Grid Bot Status API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+app.state.grid_bot = None
+
+
+@app.get("/api/bot/status")
+async def bot_status() -> Dict[str, Any]:
+    """Expose read-only bot state without exchange credentials or order actions."""
+    bot = app.state.grid_bot
+    if bot is None:
+        return {"status": "offline", "pair": None, "safety_pause": False}
+    lower, upper, levels, pause_trigger = bot.grid_configuration()
+    status = (
+        "stopping" if bot.stop_controller.stop_requested.is_set()
+        else "safety_pause" if bot.is_paused
+        else "rebuilding" if bot.grid_needs_reset
+        else "active"
+    )
+    return {
+        "status": status,
+        "pair": bot.config.symbol,
+        "safety_pause": bot.is_paused,
+        "lower_price": str(lower),
+        "upper_price": str(upper),
+        "grid_levels": levels,
+        "pause_trigger": str(pause_trigger),
+    }
 
 
 class TradingHalt(RuntimeError):
@@ -1267,6 +1303,42 @@ def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> Gri
     )
 
 
+async def _run_services(bot: GridBot, telegram_bot: TelegramBot) -> None:
+    """Run the local status API beside the bot's Telegram polling and grid loop."""
+    app.state.grid_bot = bot
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=os.getenv("BOT_API_HOST", "127.0.0.1"),
+        port=8000, log_level="warning",
+    ))
+
+    async def serve_api() -> None:
+        try:
+            await server.serve()
+        except SystemExit as error:
+            # Uvicorn exits this way when its listening port is unavailable.
+            LOGGER.error("Status API could not start (exit %s).", error.code)
+        except Exception as error:
+            LOGGER.error("Status API stopped: %s", type(error).__name__)
+        else:
+            if not server.should_exit:
+                LOGGER.error("Status API stopped while the trading bot is running.")
+
+    api_task = asyncio.create_task(serve_api(), name="status-api")
+    try:
+        await bot.run(telegram_bot)
+    finally:
+        server.should_exit = True
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(api_task, return_exceptions=True), timeout=10
+            )
+        except asyncio.TimeoutError:
+            api_task.cancel()
+            await asyncio.gather(api_task, return_exceptions=True)
+        finally:
+            app.state.grid_bot = None
+
+
 def main() -> int:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -1302,7 +1374,7 @@ def main() -> int:
             return 0
         token, owner_chat_id = load_telegram_credentials()
         telegram_bot = TelegramBot(token, owner_chat_id, bot.stop_controller, bot)
-        asyncio.run(bot.run(telegram_bot))
+        asyncio.run(_run_services(bot, telegram_bot))
         return 0
     except ccxt.NetworkError as error:
         print(f"Bot stopped: {error}", file=sys.stderr)

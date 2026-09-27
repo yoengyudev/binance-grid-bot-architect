@@ -8,6 +8,9 @@ services:
     environment:
       GRID_BOT_CONFIG_PATH: /data/config.json
       GRID_BOT_DB_PATH: /data/grid_bot.sqlite3
+      BOT_API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./docker-data:/data
       - ./.env:/app/.env:ro
