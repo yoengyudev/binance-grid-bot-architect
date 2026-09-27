@@ -102,7 +102,9 @@ class PauseRequest(BaseModel):
 
 class RecenterRequest(BaseModel):
     center_price: FiniteFloat = Field(gt=0)
-    half_width_percentage: FiniteFloat = Field(gt=0, lt=100)
+    width_percentage: Optional[FiniteFloat] = Field(default=None, gt=0, lt=100)
+    stop_loss_percentage: Optional[FiniteFloat] = Field(default=None, gt=0, lt=100)
+    half_width_percentage: Optional[FiniteFloat] = Field(default=None, gt=0, lt=100)
 
 
 def _require_dashboard_origin(request: Request) -> None:
@@ -335,13 +337,33 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
 def recenter_grid(payload: RecenterRequest,
                   _: None = Depends(_require_dashboard_origin),
                   __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    new_format = (payload.width_percentage is not None or
+                  payload.stop_loss_percentage is not None)
+    if new_format:
+        if (payload.width_percentage is None or
+                payload.stop_loss_percentage is None or
+                payload.half_width_percentage is not None):
+            raise HTTPException(
+                status_code=422,
+                detail="Provide width_percentage and stop_loss_percentage together.",
+            )
+        width = payload.width_percentage
+        stop_distance = payload.stop_loss_percentage
+    elif payload.half_width_percentage is not None:
+        width = payload.half_width_percentage
+        stop_distance = None
+    else:
+        raise HTTPException(status_code=422, detail="Grid width is required.")
     bot = app.state.grid_bot
     if bot is None:
         raise HTTPException(status_code=503, detail="The trading bot is offline.")
     try:
-        lower, upper = bot.request_manual_recenter(
-            str(payload.center_price), str(payload.half_width_percentage)
-        )
+        if stop_distance is None:
+            lower, upper = bot.request_manual_recenter(str(payload.center_price), str(width))
+        else:
+            lower, upper = bot.request_manual_recenter(
+                str(payload.center_price), str(width), str(stop_distance)
+            )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except TradingHalt as error:
@@ -701,15 +723,24 @@ class GridBot:
             self.pending_grid_bounds = (lower, upper)
             self.grid_needs_reset = True
 
-    def request_manual_recenter(self, center_text: str,
-                                width_text: str) -> Tuple[Decimal, Decimal]:
-        """Queue the normal persisted reset with an explicit center and width."""
+    def request_manual_recenter(self, center_text: str, width_text: str,
+                                stop_distance_text: Optional[str] = None
+                                ) -> Tuple[Decimal, Decimal]:
+        """Queue a persisted reset with explicit bounds and optional pause trigger."""
         center = _decimal(center_text, "center_price")
-        width_percent = _decimal(width_text, "half_width_percentage")
+        width_percent = _decimal(width_text, "width_percentage")
         if width_percent >= 100:
             raise ValueError("Width must be below 100%.")
         width = width_percent / 100
         lower, upper = center * (1 - width), center * (1 + width)
+        requested_stop = None
+        if stop_distance_text is not None:
+            stop_distance = _decimal(stop_distance_text, "stop_loss_percentage")
+            if stop_distance >= 100:
+                raise ValueError("Stop-loss distance must be below 100%.")
+            requested_stop = center * (1 - stop_distance / 100)
+            if requested_stop >= lower:
+                raise ValueError("Pause trigger must be below the projected lower bound.")
         with self._cycle_lock:
             with self._grid_lock:
                 if self.stop_controller.stop_requested.is_set():
@@ -720,7 +751,7 @@ class GridBot:
                     raise TradingHalt("A grid reset is already in progress.")
                 if self.database.get_state("grid_run") is None:
                     raise TradingHalt("No active grid run is available.")
-                if self.config.stop_loss_price >= lower:
+                if requested_stop is None and self.config.stop_loss_price >= lower:
                     raise ValueError("New lower bound must exceed the pause trigger.")
                 geometric_levels(center, lower, self.config.spacing_percent)
                 geometric_upper_levels(center, upper, self.config.spacing_percent)
@@ -737,6 +768,8 @@ class GridBot:
                     "lower": str(lower), "upper": str(upper),
                     "spacing": str(self.config.spacing_percent),
                 }
+                if requested_stop is not None:
+                    request["stop_loss_price"] = str(requested_stop)
                 self.database.set_state("grid_reset", json.dumps(request, sort_keys=True))
                 self.database.clear_state(BREAKOUT_TIMER_KEY)
                 self.pending_grid_bounds = (lower, upper)
@@ -1317,9 +1350,13 @@ class GridBot:
                     raise TradingHalt(
                         "Market left both grids during cancellation; inspect orders before restart."
                     )
+            stop_loss = self.config.stop_loss_price
+            if request.get("source") == "manual_recenter" and "stop_loss_price" in request:
+                stop_loss = Decimal(request["stop_loss_price"])
             new_config = replace(self.config, lower_price=Decimal(request["lower"]),
                                  upper_price=Decimal(request["upper"]),
-                                 spacing_percent=Decimal(request["spacing"]))
+                                 spacing_percent=Decimal(request["spacing"]),
+                                 stop_loss_price=stop_loss)
             if new_config.stop_loss_price >= new_config.lower_price:
                 raise TradingHalt("New grid lower bound is below the pause trigger.")
             if not new_config.lower_price < price < new_config.upper_price:

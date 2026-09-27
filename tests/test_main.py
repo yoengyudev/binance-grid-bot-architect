@@ -579,6 +579,49 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(sum(row["type"] == "market" and row["side"] == "sell"
                                  for row in exchange.orders.values()), 0)
 
+    def test_manual_recenter_updates_pause_trigger_after_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.run_cycle()
+            bot.run_cycle()
+            old_ids = {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")}
+
+            self.assertEqual(bot.request_manual_recenter("102", "20", "30"),
+                             (Decimal("81.6"), Decimal("122.4")))
+            self.assertEqual(bot.config.stop_loss_price, Decimal("70"))
+            self.assertEqual({row["id"] for row in exchange.fetch_open_orders("BTC/USDT")},
+                             old_ids)
+            with self.assertRaisesRegex(ValueError, "below the projected lower bound"):
+                bot.request_manual_recenter("102", "20", "10")
+
+            restarted = GridBot(bot.config, exchange, GridDatabase(path))
+            restarted.prepare(persist=False)
+            self.assertTrue(restarted.reset_grid())
+            self.assertEqual(restarted.config.stop_loss_price, Decimal("71.4"))
+            saved_config = _apply_active_grid_config(bot.config, GridDatabase(path))
+            self.assertEqual(saved_config.stop_loss_price, Decimal("71.4"))
+            self.assertEqual(saved_config.lower_price, Decimal("81.6"))
+            GridBot(saved_config, exchange, GridDatabase(path)).prepare(persist=False)
+
+    def test_stale_manual_recenter_keeps_original_pause_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.request_manual_recenter("102", "20", "30")
+            original_cancel = exchange.cancel_order
+
+            def cancel_and_drift(order_id, symbol, params=None):
+                response = original_cancel(order_id, symbol, params)
+                exchange.price = Decimal("90")
+                return response
+
+            exchange.cancel_order = cancel_and_drift
+            self.assertTrue(bot.reset_grid())
+            self.assertEqual(bot.config.lower_price, Decimal("80"))
+            self.assertEqual(bot.config.stop_loss_price, Decimal("70"))
+
     def test_manual_recenter_rejects_invalid_or_stale_request_without_canceling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")

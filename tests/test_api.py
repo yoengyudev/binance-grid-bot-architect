@@ -371,8 +371,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_recenter_endpoint_authenticates_and_queues_only(self) -> None:
         calls = []
-        bot = SimpleNamespace(request_manual_recenter=lambda center, width: (
-            calls.append((center, width)) or ("76000", "88000")
+        bot = SimpleNamespace(request_manual_recenter=lambda *values: (
+            calls.append(values) or ("76000", "88000")
         ))
         with patch.dict(os.environ, {
             "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
@@ -416,6 +416,22 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                         "upper_bound": 88000.0,
                     })
                     self.assertEqual(calls, [("82000.0", "15.0")])
+                    for bad in (
+                        {"center_price": 82000, "width_percentage": 15},
+                        {"center_price": 82000, "stop_loss_percentage": 25},
+                        {"center_price": 82000, "width_percentage": 15,
+                         "stop_loss_percentage": 25, "half_width_percentage": 15},
+                    ):
+                        self.assertEqual((await client.post(
+                            "/api/bot/grid/recenter", json=bad, headers=origin
+                        )).status_code, 422)
+                    accepted_new = await client.post(
+                        "/api/bot/grid/recenter",
+                        json={"center_price": 82000, "width_percentage": 15,
+                              "stop_loss_percentage": 25}, headers=origin,
+                    )
+                    self.assertEqual(accepted_new.status_code, 202)
+                    self.assertEqual(calls[-1], ("82000.0", "15.0", "25.0"))
             finally:
                 grid_main.app.state.grid_bot = None
 
