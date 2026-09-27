@@ -30,7 +30,8 @@ from pydantic import BaseModel, Field, FiniteFloat, StrictBool
 
 from database import GridDatabase
 from exchange_handler import config_path, create_exchange, load_config
-from telegram_bot import StopController, TelegramBot, load_telegram_credentials
+from stop_controller import StopController
+from telegram_bot import TelegramNotifier, load_telegram_credentials
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1576,10 +1577,10 @@ class GridBot:
                 raise TradingHalt("A grid lane ended unexpectedly; inspect local orders.")
         return events
 
-    async def _notify_safety_state(self, telegram_bot: TelegramBot) -> None:
+    async def _notify_safety_state(self, notifier: TelegramNotifier) -> None:
         if self.database.get_state(SAFETY_PAUSE_NOTICE_KEY):
             try:
-                await telegram_bot.notify_safety_pause()
+                await notifier.notify_safety_pause()
             except Exception as error:
                 LOGGER.warning("Safety pause Telegram update failed: %s",
                                type(error).__name__)
@@ -1589,7 +1590,7 @@ class GridBot:
         if (not self.is_paused and missing_buys and
                 self.database.get_state(SAFETY_RECOVERY_NOTICE_KEY)):
             try:
-                await telegram_bot.notify_safety_recovery()
+                await notifier.notify_safety_recovery()
             except Exception as error:
                 LOGGER.warning("Safety recovery Telegram update failed: %s",
                                type(error).__name__)
@@ -1599,7 +1600,7 @@ class GridBot:
                 self.database.get_state(SAFETY_RESUME_NOTICE_KEY) and
                 not missing_buys):
             try:
-                await telegram_bot.notify_safety_resume()
+                await notifier.notify_safety_resume()
             except Exception as error:
                 LOGGER.warning("Safety resume Telegram update failed: %s",
                                type(error).__name__)
@@ -1607,14 +1608,16 @@ class GridBot:
                 self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
                 self.database.clear_state(SAFETY_RESUME_NOTICE_KEY)
 
-    async def run(self, telegram_bot: TelegramBot) -> None:
+    async def run(self, notifier: TelegramNotifier) -> None:
         await asyncio.to_thread(self.prepare, persist=True)
         if self.database.get_state("halt_reason"):
             raise TradingHalt("Saved stop state requires manual review before a new run.")
         await asyncio.to_thread(self._backfill_portfolio_snapshots)
-        await telegram_bot.start()
         try:
-            await telegram_bot.notify_startup(self.config.symbol)
+            try:
+                await notifier.notify_startup(self.config.symbol)
+            except Exception as error:
+                LOGGER.warning("Startup alert failed: %s", type(error).__name__)
             backoff = 1
             while True:
                 if self.stop_controller.stop_requested.is_set():
@@ -1622,7 +1625,7 @@ class GridBot:
                 try:
                     if self.grid_needs_reset:
                         complete = await asyncio.to_thread(self.reset_grid)
-                        await self._notify_safety_state(telegram_bot)
+                        await self._notify_safety_state(notifier)
                         backoff = 1
                         if not complete:
                             await asyncio.to_thread(
@@ -1632,14 +1635,14 @@ class GridBot:
                         continue
                     if self.database.get_state("grid_reset_notification_pending"):
                         try:
-                            await telegram_bot.notify_grid_reset()
+                            await notifier.notify_grid_reset()
                         except Exception:
                             LOGGER.warning("Grid reset notification could not be delivered.")
                         else:
                             self.database.clear_state("grid_reset_notification_pending")
                     if self.database.get_state(BREAKOUT_NOTICE_KEY):
                         try:
-                            await telegram_bot.notify_breakout_shift()
+                            await notifier.notify_breakout_shift()
                         except Exception as error:
                             LOGGER.warning("Breakout Telegram update failed: %s",
                                            type(error).__name__)
@@ -1648,13 +1651,16 @@ class GridBot:
                     events = await asyncio.to_thread(self.run_cycle)
                     for kind, values in events:
                         if kind == "filled":
-                            await telegram_bot.notify_order_filled(*values)
-                    await self._notify_safety_state(telegram_bot)
+                            try:
+                                await notifier.notify_order_filled(*values)
+                            except Exception as error:
+                                LOGGER.warning("Order fill alert failed: %s", type(error).__name__)
+                    await self._notify_safety_state(notifier)
                     backoff = 1
                     delay = 0 if self.grid_needs_reset else self.config.poll_seconds
                 except (ccxt.RateLimitExceeded, ccxt.DDoSProtection, ccxt.NetworkError):
                     if self.is_paused:
-                        await self._notify_safety_state(telegram_bot)
+                        await self._notify_safety_state(notifier)
                     delay = min(backoff, 60)
                     backoff = min(backoff * 2, 60)
                 except Exception as error:
@@ -1662,9 +1668,9 @@ class GridBot:
                     if self.grid_needs_reset:
                         self.database.set_state("halt_reason", "grid_reset_failed")
                     if self.is_paused:
-                        await self._notify_safety_state(telegram_bot)
+                        await self._notify_safety_state(notifier)
                     try:
-                        await telegram_bot.notify_critical_error(error)
+                        await notifier.notify_critical_error(error)
                     except Exception:
                         pass
                     if not self.is_paused:
@@ -1674,7 +1680,6 @@ class GridBot:
         finally:
             if not self.stop_controller.stop_requested.is_set() and not self.is_paused:
                 await asyncio.to_thread(self.stop_controller.request_stop)
-            await telegram_bot.stop()
 
 
 def _credentials() -> Tuple[str, str]:
@@ -1735,8 +1740,8 @@ def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> Gri
     )
 
 
-async def _run_services(bot: GridBot, telegram_bot: TelegramBot) -> None:
-    """Run the local status API beside the bot's Telegram polling and grid loop."""
+async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
+    """Run the local API and trading loop with outbound alerts only."""
     app.state.grid_bot = bot
     server = uvicorn.Server(uvicorn.Config(
         app, host=os.getenv("BOT_API_HOST", "127.0.0.1"),
@@ -1757,7 +1762,7 @@ async def _run_services(bot: GridBot, telegram_bot: TelegramBot) -> None:
 
     api_task = asyncio.create_task(serve_api(), name="status-api")
     try:
-        await bot.run(telegram_bot)
+        await bot.run(notifier)
     finally:
         server.should_exit = True
         try:
@@ -1805,8 +1810,8 @@ def main() -> int:
             )
             return 0
         token, owner_chat_id = load_telegram_credentials()
-        telegram_bot = TelegramBot(token, owner_chat_id, bot.stop_controller, bot)
-        asyncio.run(_run_services(bot, telegram_bot))
+        notifier = TelegramNotifier(token, owner_chat_id)
+        asyncio.run(_run_services(bot, notifier))
         return 0
     except ccxt.NetworkError as error:
         print(f"Bot stopped: {error}", file=sys.stderr)

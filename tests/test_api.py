@@ -466,7 +466,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 grid_main._unavailable_wallet(),
             )
 
-    async def test_api_and_telegram_bot_run_concurrently(self) -> None:
+    async def test_api_and_trading_loop_run_concurrently(self) -> None:
         api_started = asyncio.Event()
         server_instances = []
 
@@ -481,7 +481,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.01)
 
         class FakeBot:
-            async def run(self, _telegram_bot):
+            async def run(self, _notifier):
                 await api_started.wait()
 
         with (
@@ -507,7 +507,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         class FakeBot:
             ran = False
 
-            async def run(self, _telegram_bot):
+            async def run(self, _notifier):
                 self.ran = True
 
         bot = FakeBot()

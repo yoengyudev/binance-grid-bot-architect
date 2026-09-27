@@ -12,7 +12,7 @@ You are a Senior Algorithmic Trading Engineer and Python Developer. Your objecti
 - **Language:** Python 3.9+
 - **Exchange API:** `ccxt` (Configured for Binance Spot Testnet by default)
 - **Database:** Built-in `sqlite3` (No external database servers)
-- **Notifications & UI:** `python-telegram-bot` (Strictly for Push Notifications and a `/stop` kill switch. No trading commands via Telegram).
+- **Notifications & UI:** Outbound Telegram Bot API alerts via `httpx`; dashboard API handles controls. Telegram commands and polling are disabled.
 - **Configuration:** `config.json` for grid parameters, `.env` for API keys.
 - **Grid Logic:** Use **Geometric Spacing** (percentage-based intervals, e.g., buy when price drops by 1.5%), NOT Arithmetic (fixed fiat amounts).
 - **OpSec:** Assume API keys have no withdrawal permissions and IP whitelisting is enforced. 
@@ -23,7 +23,8 @@ Do not generate all these files immediately. Keep this structure in mind as we p
 - `config.json` (Trading pair, investment amount, upper/lower bounds, grid % spacing, stop-loss)
 - `exchange_handler.py` (CCXT Binance Testnet connection and order execution)
 - `database.py` (SQLite schema setup and state recovery CRUD)
-- `telegram_bot.py` (Read-only alerts and `/stop` command)
+- `telegram_bot.py` (One-way text alerts)
+- `stop_controller.py` (Tracked-order cancellation for the trading loop)
 - `.env` (API Keys, Telegram Token - ignored in Git)
 - `.gitignore`
 
@@ -45,8 +46,8 @@ Do not generate all these files immediately. Keep this structure in mind as we p
 ## Phase 3: Telemetry & Security (Telegram Integration)
 - Create `telegram_bot.py`.
 - Implement push notifications for: Bot Startup, Order Filled, Stop-Loss Triggered, and Critical Errors.
-- Implement a strict User ID filter (only the owner's chat ID is accepted).
-- Implement the `/stop` kill switch (pauses trading, cancels open orders, exits loop).
+- Send alerts only to `TELEGRAM_OWNER_CHAT_ID`; do not poll for incoming messages.
+- Keep order cancellation in `stop_controller.py`; use authenticated dashboard controls.
 - *Wait for user to test and confirm before Phase 4.*
 
 ## Phase 4: Core Geometric Grid Logic
