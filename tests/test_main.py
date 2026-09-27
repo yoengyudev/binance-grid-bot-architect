@@ -30,8 +30,9 @@ class FakeSpotExchange:
         self.fail_create = False
         self.reject_post_only_once = False
         self.reject_post_only_side = None
-        self.cancel_all_calls = 0
-        self.cancel_all_timeout = None
+        self.cancel_calls = []
+        self.cancel_timeout = None
+        self.cancel_not_found_once = False
         self.market_sell_calls = 0
         self.market_sell_timeout = None
         self.market_sell_network_errors = 0
@@ -120,29 +121,29 @@ class FakeSpotExchange:
 
     def cancel_order(self, order_id: str, symbol: str, params: dict = None) -> dict:
         order = self.fetch_order(order_id, symbol, params)
+        self.cancel_calls.append(order["clientOrderId"])
+        if self.cancel_not_found_once and order["side"] == "buy":
+            self.cancel_not_found_once = False
+            self.fill(order["clientOrderId"])
+            raise ccxt.OrderNotFound("Order filled before cancel")
+        if self.cancel_timeout == "before":
+            self.cancel_timeout = None
+            raise ccxt.RequestTimeout("Simulated cancel request timeout")
         if order["status"] == "open":
             self.orders[order["clientOrderId"]]["status"] = "canceled"
             if order["side"] == "buy":
                 self.quote_free += Decimal(order["cost"])
             else:
                 self.base_free += Decimal(order["amount"]) - Decimal(order["filled"])
-        return dict(self.orders[order["clientOrderId"]])
+        result = dict(self.orders[order["clientOrderId"]])
+        if self.cancel_timeout == "after":
+            self.cancel_timeout = None
+            raise ccxt.RequestTimeout("Simulated cancel response timeout")
+        return result
 
     def fetch_open_orders(self, _symbol: str) -> list:
         return [dict(order) for order in self.orders.values()
                 if order["status"] == "open"]
-
-    def cancel_all_orders(self, symbol: str) -> list:
-        self.cancel_all_calls += 1
-        if self.cancel_all_timeout == "before":
-            self.cancel_all_timeout = None
-            raise ccxt.RequestTimeout("Simulated cancel request timeout")
-        results = [self.cancel_order(order["id"], symbol)
-                   for order in self.fetch_open_orders(symbol)]
-        if self.cancel_all_timeout == "after":
-            self.cancel_all_timeout = None
-            raise ccxt.RequestTimeout("Simulated cancel response timeout")
-        return results
 
     def create_market_sell_order(self, symbol: str, amount: float,
                                  params: dict = None) -> dict:
@@ -378,7 +379,7 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(next_sell["side"], "SELL")
             self.assertEqual(Decimal(next_sell["price"]), Decimal("110.00"))
 
-    def test_hard_stop_cancels_all_and_sells_only_bot_btc(self) -> None:
+    def test_hard_stop_cancels_only_bot_orders_and_sells_only_bot_btc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "grid.sqlite3"
             bot, exchange = self.make_bot(path)
@@ -388,6 +389,10 @@ class GridBotTests(unittest.TestCase):
                 Decimal(order["amount"]) for order in exchange.fetch_open_orders("BTC/USDT")
                 if order["side"] == "sell"
             ) - Decimal("1")
+            manual = exchange.create_order(
+                "BTC/USDT", "limit", "buy", 0.2, 50,
+                {"newClientOrderId": "manualtrade123"},
+            )
             exchange.price = Decimal("69")
 
             bot.run_cycle()
@@ -395,8 +400,11 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(bot.database.get_state("safety_mode"), grid_main.LIQUIDATED)
             self.assertEqual(bot.database.get_state("halt_reason"), "hard_stop_liquidated")
             self.assertFalse(bot.stop_controller.stop_requested.is_set())
-            self.assertEqual(exchange.cancel_all_calls, 1)
-            self.assertEqual(exchange.fetch_open_orders("BTC/USDT"), [])
+            self.assertNotIn(manual["clientOrderId"], exchange.cancel_calls)
+            self.assertEqual(
+                [order["id"] for order in exchange.fetch_open_orders("BTC/USDT")],
+                [manual["id"]],
+            )
             self.assertEqual(exchange.market_sell_calls, 1)
             sale = [row for row in exchange.orders.values()
                     if row["type"] == "market" and row["side"] == "sell"][0]
@@ -427,12 +435,19 @@ class GridBotTests(unittest.TestCase):
             bot.run_cycle()
             sell_ids = {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")
                         if order["side"] == "sell"}
+            manual = exchange.create_order(
+                "BTC/USDT", "limit", "buy", 0.2, 50,
+                {"newClientOrderId": "manualpause123"},
+            )
             self.assertTrue(any(order["side"] == "buy" for order in
                                 exchange.fetch_open_orders("BTC/USDT")))
 
             self.assertEqual(bot.set_manual_pause(True), grid_main.PAUSED_MANUAL)
-            self.assertFalse(any(order["side"] == "buy" for order in
-                                 exchange.fetch_open_orders("BTC/USDT")))
+            self.assertEqual(
+                [order["id"] for order in exchange.fetch_open_orders("BTC/USDT")
+                 if order["side"] == "buy"], [manual["id"]],
+            )
+            self.assertNotIn(manual["clientOrderId"], exchange.cancel_calls)
             self.assertEqual({order["id"] for order in
                               exchange.fetch_open_orders("BTC/USDT")
                               if order["side"] == "sell"}, sell_ids)
@@ -589,18 +604,103 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(bot._sellable_hard_stop_amount(
                 Decimal("0.2"), Decimal("69")), Decimal("0.200"))
 
-    def test_hard_stop_verifies_timed_out_cancel_all(self) -> None:
-        for timeout, expected_calls in (("before", 2), ("after", 1)):
+    def test_hard_stop_verifies_timed_out_targeted_cancel(self) -> None:
+        for timeout in ("before", "after"):
             with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as directory:
                 bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
                 bot.run_cycle()
                 bot.run_cycle()
-                exchange.cancel_all_timeout = timeout
+                exchange.cancel_timeout = timeout
                 exchange.price = Decimal("69")
-                bot.run_cycle()
-                self.assertEqual(exchange.cancel_all_calls, expected_calls)
+                with patch.object(grid_main.time, "sleep"):
+                    bot.run_cycle()
+                self.assertGreater(len(exchange.cancel_calls), 0)
                 self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
                                  grid_main.LIQUIDATED)
+
+    def test_hard_stop_reconciles_order_filled_during_targeted_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.cancel_not_found_once = True
+            exchange.price = Decimal("69")
+            bot.run_cycle()
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+            self.assertEqual(exchange.market_sell_calls, 1)
+
+    def test_grid_order_ids_are_tagged_and_fit_binance_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            ids = [order["clientOrderId"] for order in exchange.orders.values()]
+            self.assertEqual(len(ids), len(set(ids)))
+            self.assertTrue(all(value.startswith("gridbot") and
+                                value.isalnum() and len(value) <= 36 for value in ids))
+
+    def test_recenter_preserves_unrelated_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            manual = exchange.create_order(
+                "BTC/USDT", "limit", "buy", 0.2, 50,
+                {"newClientOrderId": "manualreset123"},
+            )
+            bot.request_grid_reset("75", "125")
+            self.assertTrue(bot.reset_grid())
+            self.assertEqual(exchange.orders[manual["clientOrderId"]]["status"], "open")
+            self.assertNotIn(manual["clientOrderId"], exchange.cancel_calls)
+
+    def test_targeted_cancel_preserves_another_gridbot_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            bot, exchange = self.make_bot(path / "primary.sqlite3")
+            other = GridBot(bot.config, exchange, GridDatabase(path / "other.sqlite3"))
+            self.assertNotEqual(bot.order_client_prefix, other.order_client_prefix)
+            bot.run_cycle()
+            bot.run_cycle()
+            foreign = exchange.create_order(
+                "BTC/USDT", "limit", "buy", 0.2, 50,
+                {"newClientOrderId": other.order_client_prefix + "a" * 20},
+            )
+            _, complete = bot._cancel_bot_orders()
+            self.assertTrue(complete)
+            self.assertEqual(exchange.orders[foreign["clientOrderId"]]["status"], "open")
+            self.assertNotIn(foreign["clientOrderId"], exchange.cancel_calls)
+
+    def test_targeted_cancel_recognizes_nested_client_id_and_legacy_tracked_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            legacy_row = next(row for row in bot.database.fetch_active_grids()
+                              if row["side"] == "BUY")
+            old_id = legacy_row["client_order_id"]
+            legacy_id = "gb" + "a" * 30
+            exchange.orders[legacy_id] = exchange.orders.pop(old_id)
+            exchange.orders[legacy_id]["clientOrderId"] = legacy_id
+            with closing(sqlite3.connect(bot.database.path)) as connection:
+                connection.execute(
+                    "UPDATE grid_orders SET client_order_id = ? WHERE order_id = ?",
+                    (legacy_id, legacy_row["order_id"]),
+                )
+                connection.commit()
+            original_fetch = exchange.fetch_open_orders
+
+            def nested_ids(symbol):
+                orders = original_fetch(symbol)
+                for order in orders:
+                    if order["clientOrderId"] == legacy_id:
+                        order["info"] = {"clientOrderId": order.pop("clientOrderId")}
+                return orders
+
+            exchange.fetch_open_orders = nested_ids
+            _, complete = bot._cancel_bot_orders(side="buy", limit_only=True)
+            self.assertTrue(complete)
+            self.assertIn(legacy_id, exchange.cancel_calls)
 
     def test_hard_stop_preempts_pending_grid_reset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -862,7 +962,7 @@ class GridBotTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Risk Override Denied"):
                 bot.request_manual_recenter("110", "20", "30")
             self.assertIsNone(bot.database.get_state("grid_reset"))
-            self.assertEqual(exchange.cancel_all_calls, 0)
+            self.assertEqual(exchange.cancel_calls, [])
 
     def test_queued_recenter_is_withdrawn_if_trailing_floor_rises(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -875,7 +975,7 @@ class GridBotTests(unittest.TestCase):
             self.assertGreater(bot.config.stop_loss_price, Decimal("71.4"))
             self.assertFalse(bot.reset_grid())
             self.assertIsNone(bot.database.get_state("grid_reset"))
-            self.assertEqual(exchange.cancel_all_calls, 0)
+            self.assertEqual(exchange.cancel_calls, [])
 
     def test_stale_manual_recenter_keeps_original_pause_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

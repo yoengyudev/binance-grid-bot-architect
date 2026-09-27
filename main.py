@@ -39,6 +39,8 @@ from telegram_bot import TelegramNotifier, load_telegram_credentials
 BASE_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger(__name__)
 MAX_LEVELS = 50
+ORDER_CLIENT_PREFIX = "gridbot"
+ORDER_CLIENT_PREFIX_KEY = "order_client_prefix"
 SELL_AMOUNT_BUFFER = Decimal("0.002")
 RESET_SPACING_PERCENT = Decimal("2.5")
 SAFETY_MODE_KEY = "safety_mode"
@@ -669,6 +671,15 @@ class GridBot:
         self.config = config
         self.exchange = exchange
         self.database = database
+        order_prefix = self.database.get_state(ORDER_CLIENT_PREFIX_KEY)
+        if order_prefix is None:
+            order_prefix = ORDER_CLIENT_PREFIX + uuid.uuid4().hex[:8]
+            self.database.set_state(ORDER_CLIENT_PREFIX_KEY, order_prefix)
+        if (not order_prefix.startswith(ORDER_CLIENT_PREFIX) or
+                len(order_prefix) != len(ORDER_CLIENT_PREFIX) + 8 or
+                not order_prefix.isalnum()):
+            raise TradingHalt("Saved order namespace is invalid; inspect SQLite state.")
+        self.order_client_prefix = order_prefix
         self.exchange_lock = RLock()
         self.stop_controller = StopController(
             exchange, database, config.symbol, self.exchange_lock
@@ -797,6 +808,113 @@ class GridBot:
         if not isinstance(orders, list):
             raise TradingHalt("Exchange returned an invalid open-order list.")
         return orders
+
+    @staticmethod
+    def _client_order_id(order: Dict[str, Any]) -> Optional[str]:
+        info = order.get("info")
+        client_id = order.get("clientOrderId") or (
+            info.get("clientOrderId") if isinstance(info, dict) else None
+        )
+        return str(client_id) if client_id is not None else None
+
+    def _is_bot_order(
+        self, order: Any, tracked: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Recognize new tagged orders and exact IDs saved by older bot versions."""
+        if not isinstance(order, dict):
+            return False
+        client_id = self._client_order_id(order)
+        if client_id and client_id.startswith(self.order_client_prefix):
+            return True
+        exchange_id = order.get("id")
+        for row in tracked if tracked is not None else self.database.fetch_active_grids():
+            if (client_id and client_id == row.get("client_order_id")) or (
+                exchange_id is not None and row.get("exchange_order_id") is not None
+                and str(exchange_id) == str(row["exchange_order_id"])
+            ):
+                return True
+        return False
+
+    def _cancel_bot_orders(
+        self, *, side: Optional[str] = None,
+        selected_ids: Optional[set[str]] = None,
+        marker_prefix: Optional[str] = None,
+        limit_only: bool = False,
+    ) -> Tuple[List[Tuple[str, Tuple[str, ...]]], bool]:
+        """Cancel only this bot's live orders and verify tracked SQLite rows."""
+        with self.stop_controller._lock:
+            tracked = self.database.fetch_active_grids()
+            selected = [
+                row for row in tracked
+                if (side is None or row["side"].lower() == side)
+                and (not limit_only or row["order_type"] == "LIMIT")
+                and (selected_ids is None or row["order_id"] in selected_ids)
+            ]
+
+            def matches(order: Any) -> bool:
+                if not self._is_bot_order(order, tracked):
+                    return False
+                if side is not None and str(order.get("side") or "").lower() != side:
+                    return False
+                if limit_only and str(order.get("type") or "").lower() not in (
+                    "limit", "limit_maker"
+                ):
+                    return False
+                if selected_ids is None:
+                    return True
+                return any(
+                    (order.get("id") is not None and row.get("exchange_order_id") is not None
+                     and str(order["id"]) == str(row["exchange_order_id"])) or
+                    (self._client_order_id(order) is not None and
+                     self._client_order_id(order) == row.get("client_order_id"))
+                    for row in selected
+                )
+
+            live = [order for order in self._live_open_orders() if matches(order)]
+            for order in live:
+                order_id = order.get("id")
+                if order_id is None:
+                    raise TradingHalt("Bot order has no exchange ID for targeted cancellation.")
+                if marker_prefix:
+                    for row in selected:
+                        if ((row.get("exchange_order_id") is not None and
+                             str(order_id) == str(row["exchange_order_id"])) or
+                                (self._client_order_id(order) is not None and
+                                 self._client_order_id(order) ==
+                                 row.get("client_order_id"))):
+                            self.database.set_state(
+                                f"{marker_prefix}:{row['order_id']}", "1"
+                            )
+                try:
+                    self._call(self.exchange.cancel_order, str(order_id), self.config.symbol)
+                except ccxt.OrderNotFound:
+                    # A fill can win the race with cancellation; reconcile below.
+                    LOGGER.info("Bot order %s disappeared before cancellation.", order_id)
+
+            remaining = any(matches(order) for order in self._live_open_orders())
+            events: List[Tuple[str, Tuple[str, ...]]] = []
+            for row in selected:
+                order = self._fetch_order(row)
+                status = str(order.get("status") or "").lower()
+                if status == "closed":
+                    changed = self.database.mark_order_filled(row["order_id"])
+                    if changed:
+                        events.append(("filled", (
+                            row["order_id"], row["side"],
+                            str(order.get("filled") or row["amount"]),
+                            str(order.get("average") or order.get("price") or row["price"]),
+                        )))
+                elif status in ("canceled", "expired", "rejected"):
+                    if marker_prefix and status == "canceled" and (
+                        self.database.get_state(f"{marker_prefix}:{row['order_id']}") != "1"
+                    ):
+                        raise TradingHalt("Tracked order canceled outside the expected pause.")
+                    self.database.update_order_status(row["order_id"], status.upper())
+                elif status == "open":
+                    remaining = True
+                else:
+                    raise TradingHalt("Bot order cancellation returned an unknown status.")
+            return events, not remaining
 
     def list_open_orders(
         self,
@@ -981,8 +1099,8 @@ class GridBot:
         state_text = self.database.get_state(LIQUIDATION_KEY)
         if not state_text or json.loads(state_text).get("phase") != "complete":
             raise TradingHalt("Liquidation is unresolved; inspect exchange orders first.")
-        if self._call(self.exchange.fetch_open_orders, self.config.symbol):
-            raise TradingHalt("Open orders remain; cannot reset a liquidated grid.")
+        if any(self._is_bot_order(order) for order in self._live_open_orders()):
+            raise TradingHalt("Bot orders remain; cannot reset a liquidated grid.")
         if self.database.fetch_active_grids():
             raise TradingHalt("Tracked orders remain active; cannot reset liquidation.")
         price = self._ticker_price()
@@ -1351,7 +1469,7 @@ class GridBot:
         *, parent_order_id: Optional[str] = None, order_type: str = "LIMIT",
         quote_cost: Optional[Decimal] = None,
     ) -> Optional[str]:
-        client_id = "gb" + uuid.uuid4().hex[:30]
+        client_id = self.order_client_prefix + uuid.uuid4().hex[:20]
         with self.exchange_lock:
             liquidation = order_type == "MARKET" and side == "SELL" and level == -1
             if self.stop_controller.stop_requested.is_set() and not liquidation:
@@ -1648,12 +1766,9 @@ class GridBot:
                     self.grid_needs_reset = False
                     LOGGER.info("Manual recenter withdrawn because market moved away.")
                     return False
-            canceled = self.stop_controller.cancel_tracked_orders()
-            if canceled.unresolved or self.database.fetch_active_grids():
+            _, complete = self._cancel_bot_orders()
+            if not complete or self.database.fetch_active_grids():
                 raise TradingHalt("Old grid cancellation could not be verified.")
-            open_orders = self._call(self.exchange.fetch_open_orders, self.config.symbol)
-            if open_orders:
-                raise TradingHalt("Exchange still has open orders; reset stopped.")
             carry_amount, carry_cost = self._carry_inventory()
             price = self._ticker_price()
             self.advance_trailing_stop(price)
@@ -1865,25 +1980,9 @@ class GridBot:
     def _liquidation_step(self, state: Dict[str, Any]) -> bool:
         """Advance one durable phase; never submit a second sell before reconciliation."""
         if state["phase"] == "canceling":
-            try:
-                self._call(self.exchange.cancel_all_orders, self.config.symbol)
-            except ccxt.RequestTimeout:
-                LOGGER.critical("Cancel-all timed out; verifying open orders.")
-            open_orders = self._call(self.exchange.fetch_open_orders,
-                                     self.config.symbol)
-            if not isinstance(open_orders, list):
-                raise TradingHalt("Exchange returned an invalid open-order list.")
-            if open_orders:
+            _, complete = self._cancel_bot_orders()
+            if not complete or self.database.fetch_active_grids():
                 return False
-            for row in self.database.fetch_active_grids():
-                order = self._fetch_order(row)
-                status = order.get("status")
-                if status == "closed":
-                    self.database.mark_order_filled(row["order_id"])
-                elif status in ("canceled", "expired", "rejected"):
-                    self.database.update_order_status(row["order_id"], status.upper())
-                else:
-                    return False
             held, cost = self._carry_inventory()
             amount = self._sellable_hard_stop_amount(held, self._ticker_price())
             state.update(held_base=str(held), cost_basis_quote=str(cost),
@@ -1892,8 +1991,8 @@ class GridBot:
                 self._complete_hard_stop(state, Decimal(0))
                 return True
             if amount > self._free_bot_base():
-                raise TradingHalt("Bot-tracked BTC is not free after cancel-all.")
-            state.update(phase="submitting", client_order_id="gb" + uuid.uuid4().hex[:30],
+                raise TradingHalt("Bot-tracked BTC is not free after targeted cancellation.")
+            state.update(phase="submitting", client_order_id=self.order_client_prefix + uuid.uuid4().hex[:20],
                          pre_submit_base_free=str(self._free_balance(self.market["base"])),
                          attempts=0, retry_allowed=False)
             self._save_liquidation(state)
@@ -1930,7 +2029,7 @@ class GridBot:
                 raise TradingHalt("Remaining bot BTC is not free for liquidation.")
             state.update(phase="submitting", sold_base=str(total_sold),
                          proceeds_quote=str(total_proceeds), sell_amount=str(amount),
-                         client_order_id="gb" + uuid.uuid4().hex[:30],
+                         client_order_id=self.order_client_prefix + uuid.uuid4().hex[:20],
                          pre_submit_base_free=str(self._free_balance(self.market["base"])),
                          attempts=0, retry_allowed=False)
             self._save_liquidation(state)
@@ -2032,74 +2131,10 @@ class GridBot:
     def _cancel_buy_orders_for_pause(
         self,
     ) -> Tuple[List[Tuple[str, Tuple[str, ...]]], bool]:
-        """Verify each tracked BUY cancellation while leaving SELL orders untouched."""
-        events: List[Tuple[str, Tuple[str, ...]]] = []
-        all_canceled = True
-        with self.stop_controller._lock:
-            open_orders = self._call(self.exchange.fetch_open_orders, self.config.symbol)
-            if not isinstance(open_orders, list):
-                raise TradingHalt("Exchange returned an invalid open-order list.")
-            live_ids = {str(order["id"]) for order in open_orders
-                        if isinstance(order, dict) and order.get("id") is not None}
-            live_clients = {
-                str(order.get("clientOrderId") or (order.get("info") or {}).get("clientOrderId"))
-                for order in open_orders if isinstance(order, dict)
-                and (order.get("clientOrderId") or (order.get("info") or {}).get("clientOrderId"))
-            }
-            for row in self.database.fetch_active_grids():
-                if row["side"] != "BUY" or row["order_type"] != "LIMIT":
-                    continue
-                if self.stop_controller.stop_requested.is_set():
-                    return events, False
-                marker = f"safety_pause_buy:{row['order_id']}"
-                reference = row.get("exchange_order_id") or row["order_id"]
-                if (str(reference) not in live_ids and
-                        str(row.get("client_order_id")) not in live_clients):
-                    current = self._fetch_order(row)
-                    if current.get("status") == "closed":
-                        event = self._reconcile_order(row)
-                        if event:
-                            events.append(event)
-                        continue
-                    if current.get("status") == "canceled":
-                        if self.database.get_state(marker) != "1":
-                            raise TradingHalt("BUY order canceled outside Safety Pause.")
-                        self.database.update_order_status(row["order_id"], "CANCELED")
-                        continue
-                    if current.get("status") != "open":
-                        raise TradingHalt("BUY order has an unknown exchange status.")
-                self.database.set_state(marker, "1")
-                params = ({"origClientOrderId": row["client_order_id"]}
-                          if row.get("client_order_id") else None)
-                try:
-                    if params is None:
-                        response = self._call(
-                            self.exchange.cancel_order, reference, self.config.symbol
-                        )
-                    else:
-                        response = self._call(
-                            self.exchange.cancel_order, reference, self.config.symbol, params
-                        )
-                except ccxt.BaseError as error:
-                    LOGGER.warning("BUY cancellation needs reconciliation: %s",
-                                   type(error).__name__)
-                    response = None
-                status = response.get("status") if isinstance(response, dict) else None
-                if status not in ("canceled", "closed"):
-                    status = self._fetch_order(row).get("status")
-                if status == "canceled":
-                    self.database.update_order_status(row["order_id"], "CANCELED")
-                elif status == "closed":
-                    event = self._reconcile_order(row)
-                    if event:
-                        events.append(event)
-                elif status == "open":
-                    all_canceled = False
-                    LOGGER.warning("BUY %s remains open during Safety Pause.",
-                                   row["order_id"])
-                else:
-                    raise TradingHalt("BUY cancellation returned an unknown status.")
-        return events, all_canceled
+        """Cancel only bot-owned BUY orders while leaving every SELL active."""
+        return self._cancel_bot_orders(
+            side="buy", marker_prefix="safety_pause_buy", limit_only=True
+        )
 
     def _missing_paused_buys(self) -> bool:
         return any(
@@ -2120,10 +2155,11 @@ class GridBot:
         ids = {row["order_id"] for row in affected}
         for row in affected:
             self.database.set_state(f"trailing_stop_buy:{row['order_id']}", "1")
-        result = self.stop_controller.cancel_tracked_orders(
-            lambda row: row["order_id"] in ids
+        _, complete = self._cancel_bot_orders(
+            side="buy", selected_ids=ids, marker_prefix="trailing_stop_buy"
         )
-        if result.unresolved:
+        if not complete or any(row["order_id"] in ids
+                               for row in self.database.fetch_active_grids()):
             raise TradingHalt("BUY orders below the trailing stop need reconciliation.")
 
     def run_cycle(self) -> List[Tuple[str, Tuple[str, ...]]]:
