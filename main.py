@@ -449,6 +449,7 @@ def bot_status() -> Dict[str, Any]:
         "trading_state": safety_mode if safety_mode in (
             LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED) else "ACTIVE",
         "grid_levels": len(orders),
+        "exact_grid_recenter_supported": True,
         "lower_bound": float(min(prices)) if prices else None,
         "upper_bound": float(max(prices)) if prices else None,
         "wallet": _portfolio_wallet(database) if bot is not None
