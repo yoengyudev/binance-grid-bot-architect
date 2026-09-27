@@ -339,6 +339,52 @@ class GridBotTests(unittest.TestCase):
             asyncio.run(reopened._notify_safety_state(notifier))
             notifier.notify_safety_resume.assert_awaited_once()
 
+    def test_manual_pause_cancels_buys_keeps_sells_and_survives_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.run_cycle()
+            bot.run_cycle()
+            sell_ids = {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")
+                        if order["side"] == "sell"}
+            self.assertTrue(any(order["side"] == "buy" for order in
+                                exchange.fetch_open_orders("BTC/USDT")))
+
+            self.assertEqual(bot.set_manual_pause(True), grid_main.PAUSED_MANUAL)
+            self.assertFalse(any(order["side"] == "buy" for order in
+                                 exchange.fetch_open_orders("BTC/USDT")))
+            self.assertEqual({order["id"] for order in
+                              exchange.fetch_open_orders("BTC/USDT")
+                              if order["side"] == "sell"}, sell_ids)
+            exchange.price = Decimal("91")
+            bot.run_cycle()
+            self.assertTrue(bot.is_paused)
+
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            self.assertTrue(reopened.is_paused)
+            reopened.run_cycle()
+            self.assertEqual(reopened.database.get_state("safety_mode"),
+                             grid_main.PAUSED_MANUAL)
+            self.assertIsNone(reopened.set_manual_pause(False))
+            reopened.run_cycle()
+            self.assertFalse(reopened.is_paused)
+            self.assertTrue(any(order["side"] == "buy" for order in
+                                exchange.fetch_open_orders("BTC/USDT")))
+
+    def test_manual_unpause_respects_downside_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.set_manual_pause(True)
+            exchange.price = Decimal("69")
+            self.assertEqual(bot.set_manual_pause(False), grid_main.PAUSED_DOWNSIDE)
+            self.assertTrue(bot.is_paused)
+            bot.run_cycle()
+            self.assertFalse(any(order["side"] == "buy" for order in
+                                 exchange.fetch_open_orders("BTC/USDT")))
+
     def test_safety_pause_keeps_partially_filled_buy_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")

@@ -23,10 +23,9 @@ import ccxt
 import jwt
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from database import GridDatabase
 from exchange_handler import config_path, create_exchange, load_config
@@ -40,6 +39,7 @@ SELL_AMOUNT_BUFFER = Decimal("0.002")
 RESET_SPACING_PERCENT = Decimal("2.5")
 SAFETY_MODE_KEY = "safety_mode"
 PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
+PAUSED_MANUAL = "PAUSED_MANUAL"
 SAFETY_PAUSE_NOTICE_KEY = "safety_pause_notice_pending"
 SAFETY_RECOVERY_NOTICE_KEY = "safety_recovery_notice_pending"
 SAFETY_RESUME_NOTICE_KEY = "safety_resume_notice_pending"
@@ -54,22 +54,34 @@ JWT_ALGORITHM = "HS256"
 JWT_ISSUER = "grid-bot"
 JWT_AUDIENCE = "grid-dashboard"
 JWT_LIFETIME_SECONDS = 15 * 60
+AUTH_COOKIE_NAME = "__Host-grid_admin_session"
+DASHBOARD_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
 OpenOrderEntry = Tuple[Optional[Decimal], Optional[Decimal]]
 
 app = FastAPI(title="Grid Bot Status API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=list(DASHBOARD_ORIGINS),
+    allow_credentials=True,
     allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Content-Type"],
 )
 app.state.grid_bot = None
 app.state.preview_jwt_secret = secrets.token_urlsafe(48)
-bearer_scheme = HTTPBearer(auto_error=False)
 
 
 class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=128)
+
+
+class PauseRequest(BaseModel):
+    active: StrictBool
+
+
+def _require_dashboard_origin(request: Request) -> None:
+    """Cookie-authenticated writes must come from the trusted dashboard origin."""
+    if request.headers.get("origin") not in DASHBOARD_ORIGINS:
+        raise HTTPException(status_code=403, detail="Untrusted dashboard origin.")
 
 
 def _auth_configuration() -> Tuple[str, str]:
@@ -87,13 +99,13 @@ def _auth_configuration() -> Tuple[str, str]:
 
 
 @app.post("/api/auth/login")
-def login(request: LoginRequest) -> Dict[str, Any]:
+def login(request: LoginRequest, response: Response,
+          _: None = Depends(_require_dashboard_origin)) -> Dict[str, Any]:
     password, secret = _auth_configuration()
     if not hmac.compare_digest(request.password, password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials.",
-            headers={"WWW-Authenticate": "Bearer"},
         )
     now = datetime.now(timezone.utc)
     token = jwt.encode(
@@ -108,28 +120,26 @@ def login(request: LoginRequest) -> Dict[str, Any]:
         secret,
         algorithm=JWT_ALGORITHM,
     )
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "expires_in": JWT_LIFETIME_SECONDS,
-    }
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME, value=token, max_age=JWT_LIFETIME_SECONDS,
+        path="/", secure=True, httponly=True, samesite="strict",
+    )
+    return {"authenticated": True, "expires_in": JWT_LIFETIME_SECONDS}
 
 
-def get_current_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
-) -> str:
-    """Validate a bearer token for future admin-only API endpoints."""
+def get_current_user(request: Request) -> str:
+    """Validate the admin JWT from its HttpOnly host cookie."""
     unauthorized = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired token.",
-        headers={"WWW-Authenticate": "Bearer"},
     )
-    if credentials is None:
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    if not token:
         raise unauthorized
     try:
         _, secret = _auth_configuration()
         claims = jwt.decode(
-            credentials.credentials,
+            token,
             secret,
             algorithms=[JWT_ALGORITHM],
             audience=JWT_AUDIENCE,
@@ -141,6 +151,20 @@ def get_current_user(
     if claims.get("sub") != "admin":
         raise unauthorized
     return "admin"
+
+
+@app.get("/api/auth/me")
+def auth_me(_: str = Depends(get_current_user)) -> Dict[str, bool]:
+    return {"authenticated": True}
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response, _: None = Depends(_require_dashboard_origin)) -> Dict[str, bool]:
+    response.delete_cookie(
+        key=AUTH_COOKIE_NAME, path="/", secure=True,
+        httponly=True, samesite="strict",
+    )
+    return {"authenticated": False}
 
 
 def _unavailable_wallet() -> Dict[str, Optional[float]]:
@@ -233,15 +257,32 @@ def bot_status() -> Dict[str, Any]:
         "status": "Online" if bot is not None else "Offline",
         "pair": bot.config.symbol if bot is not None else "BTC/USDT",
         "safety_pause": (
-            "Active" if database.get_state(SAFETY_MODE_KEY) == PAUSED_DOWNSIDE
+            "Active" if database.get_state(SAFETY_MODE_KEY) in (PAUSED_DOWNSIDE, PAUSED_MANUAL)
             else "Normal"
         ),
+        "pause_mode": database.get_state(SAFETY_MODE_KEY),
         "grid_levels": len(orders),
         "lower_bound": float(min(prices)) if prices else None,
         "upper_bound": float(max(prices)) if prices else None,
         "wallet": _portfolio_wallet(database) if bot is not None
                   else _unavailable_wallet(),
     }
+
+
+@app.post("/api/bot/pause")
+def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_origin),
+                  __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    bot = app.state.grid_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="The trading bot is offline.")
+    try:
+        mode = bot.set_manual_pause(payload.active)
+    except TradingHalt as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (ccxt.BaseError, OSError, RuntimeError) as error:
+        LOGGER.exception("Manual safety pause could not finish.")
+        raise HTTPException(status_code=502, detail="Exchange pause update failed; state remains paused.") from error
+    return {"safety_pause": "Active" if mode else "Normal", "mode": mode}
 
 
 class TradingHalt(RuntimeError):
@@ -384,9 +425,10 @@ class GridBot:
         self.baseline_base: Optional[Decimal] = None
         self._post_only_rejected_in_cycle = False
         safety_mode = self.database.get_state(SAFETY_MODE_KEY)
-        if safety_mode not in (None, PAUSED_DOWNSIDE):
+        if safety_mode not in (None, PAUSED_DOWNSIDE, PAUSED_MANUAL):
             raise TradingHalt("Unknown saved safety mode; inspect local state.")
-        self.is_paused = safety_mode == PAUSED_DOWNSIDE
+        self.is_paused = safety_mode is not None
+        self._cycle_lock = RLock()
         saved_width = self.database.get_state(BREAKOUT_WIDTH_KEY)
         self.breakout_width_percent = (
             _decimal(saved_width, BREAKOUT_WIDTH_KEY) if saved_width is not None
@@ -1097,6 +1139,10 @@ class GridBot:
         return lowers, uppers
 
     def reset_grid(self) -> bool:
+        with self._cycle_lock:
+            return self._reset_grid_locked()
+
+    def _reset_grid_locked(self) -> bool:
         """Process the persisted reset before an ordinary trading cycle."""
         request_text = self.database.get_state("grid_reset")
         if request_text is None:
@@ -1198,6 +1244,39 @@ class GridBot:
         LOGGER.warning("Safety pause activated at %s %s; canceling tracked BUY limits.",
                        price, self.config.symbol)
 
+    def set_manual_pause(self, active: bool) -> Optional[str]:
+        """Persist a manual pause and use the existing targeted BUY cancellation."""
+        with self._cycle_lock:
+            if self.stop_controller.stop_requested.is_set() or self.grid_needs_reset:
+                raise TradingHalt("Bot is stopping or resetting its grid.")
+            mode = self.database.get_state(SAFETY_MODE_KEY)
+            if active:
+                if mode != PAUSED_MANUAL:
+                    self.database.set_state(SAFETY_MODE_KEY, PAUSED_MANUAL)
+                    self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
+                    self.database.clear_state(SAFETY_RESUME_NOTICE_KEY)
+                    if mode is None:
+                        self.database.set_state(SAFETY_PAUSE_NOTICE_KEY, "1")
+                self.is_paused = True
+                self.database.clear_state(BREAKOUT_TIMER_KEY)
+                _, complete = self._cancel_buy_orders_for_pause()
+                if not complete:
+                    raise TradingHalt("Some BUY orders remain open; cancellation will retry.")
+                return PAUSED_MANUAL
+
+            if mode != PAUSED_MANUAL:
+                return mode
+            price = self._ticker_price()
+            if price <= self.config.lower_price:
+                # The automatic downside guard still owns the pause.
+                self.database.set_state(SAFETY_MODE_KEY, PAUSED_DOWNSIDE)
+                self.is_paused = True
+                return PAUSED_DOWNSIDE
+            self.database.clear_state(SAFETY_MODE_KEY)
+            self.database.clear_state(SAFETY_PAUSE_NOTICE_KEY)
+            self.is_paused = False
+            return None
+
     def _cancel_buy_orders_for_pause(
         self,
     ) -> Tuple[List[Tuple[str, Tuple[str, ...]]], bool]:
@@ -1278,6 +1357,10 @@ class GridBot:
         )
 
     def run_cycle(self) -> List[Tuple[str, Tuple[str, ...]]]:
+        with self._cycle_lock:
+            return self._run_cycle_locked()
+
+    def _run_cycle_locked(self) -> List[Tuple[str, Tuple[str, ...]]]:
         if not self.levels:
             raise RuntimeError("Call prepare() before run_cycle().")
         self._post_only_rejected_in_cycle = False
@@ -1291,7 +1374,8 @@ class GridBot:
         if self.is_paused:
             pause_events, cancellations_complete = self._cancel_buy_orders_for_pause()
             events.extend(pause_events)
-            if cancellations_complete and current_price > self.config.lower_price:
+            if (cancellations_complete and current_price > self.config.lower_price
+                    and self.database.get_state(SAFETY_MODE_KEY) == PAUSED_DOWNSIDE):
                 self.database.clear_state(SAFETY_MODE_KEY)
                 self.database.clear_state(SAFETY_PAUSE_NOTICE_KEY)
                 self.database.set_state(SAFETY_RECOVERY_NOTICE_KEY, "1")

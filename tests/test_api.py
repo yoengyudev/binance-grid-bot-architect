@@ -28,7 +28,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     offline = await client.get("/api/bot/status")
                 self.assertEqual(offline.json(), {
                     "status": "Offline", "pair": "BTC/USDT",
-                    "safety_pause": "Normal", "grid_levels": 0,
+                    "safety_pause": "Normal", "pause_mode": None, "grid_levels": 0,
                     "lower_bound": None, "upper_bound": None,
                     "wallet": {
                         "btc_held": None, "average_cost": None,
@@ -72,7 +72,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.json(), {
             "status": "Online", "pair": "BTC/USDT",
-            "safety_pause": "Active", "grid_levels": 2,
+            "safety_pause": "Active", "pause_mode": grid_main.PAUSED_DOWNSIDE,
+            "grid_levels": 2,
             "lower_bound": 81000.0, "upper_bound": 90000.0,
             "wallet": {
                 "btc_held": 0.02, "average_cost": 81000.0,
@@ -81,7 +82,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(resumed.json()["safety_pause"], "Normal")
 
-    async def test_admin_login_and_bearer_dependency(self) -> None:
+    async def test_admin_login_uses_strict_httponly_cookie(self) -> None:
         protected_app = FastAPI()
 
         @protected_app.get("/protected")
@@ -97,32 +98,40 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             async with (
                 httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=grid_main.app),
-                    base_url="http://testserver",
+                    base_url="https://testserver",
                 ) as auth_client,
                 httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=protected_app),
-                    base_url="http://testserver",
+                    base_url="https://testserver",
                 ) as protected_client,
             ):
                 wrong = await auth_client.post(
-                    "/api/auth/login", json={"password": "wrong"}
+                    "/api/auth/login", json={"password": "wrong"},
+                    headers={"Origin": "http://localhost:5173"},
                 )
                 self.assertEqual(wrong.status_code, 401)
                 login = await auth_client.post(
-                    "/api/auth/login", json={"password": "admin123"}
+                    "/api/auth/login", json={"password": "admin123"},
+                    headers={"Origin": "http://localhost:5173"},
                 )
                 self.assertEqual(login.status_code, 200)
-                token = login.json()["access_token"]
+                self.assertNotIn("access_token", login.json())
+                self.assertEqual(login.json()["authenticated"], True)
                 self.assertEqual(login.json()["expires_in"], 900)
-                self.assertEqual(login.json()["token_type"], "bearer")
+                cookie = login.headers["set-cookie"]
+                self.assertIn("httponly", cookie.lower())
+                self.assertIn("secure", cookie.lower())
+                self.assertIn("samesite=strict", cookie.lower())
+                self.assertIn("path=/", cookie.lower())
+                token = auth_client.cookies[grid_main.AUTH_COOKIE_NAME]
                 self.assertEqual((await protected_client.get("/protected")).status_code, 401)
                 self.assertEqual(
                     (await protected_client.get(
-                        "/protected", headers={"Authorization": "Bearer invalid"}
+                        "/protected", cookies={grid_main.AUTH_COOKIE_NAME: "invalid"}
                     )).status_code, 401,
                 )
                 authorized = await protected_client.get(
-                    "/protected", headers={"Authorization": f"Bearer {token}"}
+                    "/protected", cookies={grid_main.AUTH_COOKIE_NAME: token}
                 )
                 self.assertEqual(authorized.json(), {"user": "admin"})
                 expired = jwt.encode({
@@ -134,7 +143,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 }, grid_main.app.state.preview_jwt_secret, algorithm="HS256")
                 self.assertEqual(
                     (await protected_client.get(
-                        "/protected", headers={"Authorization": f"Bearer {expired}"}
+                        "/protected", cookies={grid_main.AUTH_COOKIE_NAME: expired}
                     )).status_code, 401,
                 )
                 forged = jwt.encode({
@@ -147,7 +156,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     algorithm="HS256")
                 self.assertEqual(
                     (await protected_client.get(
-                        "/protected", headers={"Authorization": f"Bearer {forged}"}
+                        "/protected", cookies={grid_main.AUTH_COOKIE_NAME: forged}
                     )).status_code, 401,
                 )
                 preflight = await auth_client.options(
@@ -163,6 +172,15 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     preflight.headers["access-control-allow-origin"],
                     "http://127.0.0.1:5173",
                 )
+                self.assertEqual(
+                    preflight.headers["access-control-allow-credentials"], "true"
+                )
+                self.assertEqual((await auth_client.get("/api/auth/me")).status_code, 200)
+                signed_out = await auth_client.post(
+                    "/api/auth/logout", headers={"Origin": "http://localhost:5173"}
+                )
+                self.assertEqual(signed_out.status_code, 200)
+                self.assertEqual((await auth_client.get("/api/auth/me")).status_code, 401)
                 blocked_origin = await auth_client.options(
                     "/api/auth/login",
                     headers={
@@ -184,10 +202,11 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             try:
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=grid_main.app),
-                    base_url="http://testserver",
+                    base_url="https://testserver",
                 ) as client:
                     response = await client.post(
-                        "/api/auth/login", json={"password": "admin123"}
+                        "/api/auth/login", json={"password": "admin123"},
+                        headers={"Origin": "http://localhost:5173"},
                     )
                 self.assertEqual(response.status_code, 503)
             finally:
@@ -206,14 +225,66 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     base_url="http://testserver",
                 ) as client:
                     mock = await client.post(
-                        "/api/auth/login", json={"password": "admin123"}
+                        "/api/auth/login", json={"password": "admin123"},
+                        headers={"Origin": "http://localhost:5173"},
                     )
                     private = await client.post(
                         "/api/auth/login",
                         json={"password": "unique-private-admin-password"},
+                        headers={"Origin": "http://localhost:5173"},
                     )
                 self.assertEqual(mock.status_code, 401)
                 self.assertEqual(private.status_code, 200)
+            finally:
+                grid_main.app.state.grid_bot = None
+
+    async def test_pause_endpoint_requires_cookie_and_trusted_origin(self) -> None:
+        calls = []
+        bot = SimpleNamespace(set_manual_pause=lambda active: (
+            calls.append(active) or (grid_main.PAUSED_MANUAL if active else None)
+        ))
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+            "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+        }):
+            grid_main.app.state.grid_bot = bot
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    origin = {"Origin": "http://localhost:5173"}
+                    unauthenticated = await client.post(
+                        "/api/bot/pause", json={"active": True}, headers=origin
+                    )
+                    self.assertEqual(unauthenticated.status_code, 401)
+                    self.assertEqual(calls, [])
+                    await client.post(
+                        "/api/auth/login", json={"password": "unique-private-admin-password"},
+                        headers=origin,
+                    )
+                    bad_origin = await client.post(
+                        "/api/bot/pause", json={"active": True},
+                        headers={"Origin": "https://example.invalid"},
+                    )
+                    self.assertEqual(bad_origin.status_code, 403)
+                    invalid = await client.post(
+                        "/api/bot/pause", json={"active": "true"}, headers=origin
+                    )
+                    self.assertEqual(invalid.status_code, 422)
+                    paused = await client.post(
+                        "/api/bot/pause", json={"active": True}, headers=origin
+                    )
+                    self.assertEqual(paused.json(), {
+                        "safety_pause": "Active", "mode": grid_main.PAUSED_MANUAL,
+                    })
+                    resumed = await client.post(
+                        "/api/bot/pause", json={"active": False}, headers=origin
+                    )
+                    self.assertEqual(resumed.json(), {
+                        "safety_pause": "Normal", "mode": None,
+                    })
+                    self.assertEqual(calls, [True, False])
             finally:
                 grid_main.app.state.grid_bot = None
 
