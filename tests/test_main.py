@@ -25,6 +25,8 @@ class FakeSpotExchange:
         self.orders = {}
         self.next_id = 1
         self.fail_create = False
+        self.reject_post_only_once = False
+        self.reject_post_only_side = None
 
     def load_markets(self) -> None:
         pass
@@ -54,6 +56,12 @@ class FakeSpotExchange:
     ) -> dict:
         if self.fail_create:
             raise RuntimeError("Simulated uncertain response")
+        if (self.reject_post_only_once and order_type == "limit" and
+                (self.reject_post_only_side is None or side == self.reject_post_only_side)):
+            self.reject_post_only_once = False
+            raise ccxt.OrderImmediatelyFillable(
+                'binance {"code":-2010,"msg":"Order would immediately match and take."}'
+            )
         order_id = str(self.next_id)
         self.next_id += 1
         client_id = params["newClientOrderId"]
@@ -160,6 +168,12 @@ class GridBotTests(unittest.TestCase):
                 exchange.orders[seed["client_order_id"]]["params"]["quoteOrderQty"],
                 "500",
             )
+            self.assertNotIn(
+                "timeInForce", exchange.orders[seed["client_order_id"]]["params"]
+            )
+            for order in exchange.orders.values():
+                if order["type"] == "limit":
+                    self.assertEqual(order["params"]["timeInForce"], "PO")
             self.assertEqual(bot.database.fetch_latest_orders_by_level()[-1]["side"], "SELL")
             exchange.fill(first_buy["client_order_id"])
 
@@ -229,6 +243,42 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertIsNone(rows[0]["exchange_order_id"])
 
+    def test_post_only_rejection_skips_one_order_and_retries_next_cycle(self) -> None:
+        for side, skipped_level in (("sell", -1), ("buy", 1)):
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as directory:
+                bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+                bot.run_cycle()  # The seed market buy is deliberately not post-only.
+                exchange.reject_post_only_once = True
+                exchange.reject_post_only_side = side
+                with self.assertLogs(grid_main.LOGGER, level="WARNING") as logs:
+                    bot.run_cycle()
+                self.assertIn("skipping this order", logs.output[0])
+                self.assertTrue(bot._post_only_rejected_in_cycle)
+                self.assertNotIn(skipped_level, bot.database.fetch_latest_orders_by_level())
+                self.assertEqual(
+                    len(bot.database.fetch_active_grids()),
+                    len(exchange.fetch_open_orders("BTC/USDT")),
+                )
+
+                bot.run_cycle()
+                self.assertFalse(bot._post_only_rejected_in_cycle)
+                self.assertIn(skipped_level, bot.database.fetch_latest_orders_by_level())
+                self.assertEqual(
+                    len(bot.database.fetch_active_grids()),
+                    len(exchange.fetch_open_orders("BTC/USDT")),
+                )
+
+    def test_other_immediate_order_error_remains_uncertain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            with patch.object(
+                exchange, "create_order",
+                side_effect=ccxt.OrderImmediatelyFillable("Order would trigger immediately."),
+            ), self.assertRaises(UncertainOrderError):
+                bot.run_cycle()
+            self.assertEqual(len(bot.database.fetch_active_grids()), 1)
+
     def test_setgrid_carries_btc_and_rebuilds_without_market_sale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "grid.sqlite3"
@@ -272,6 +322,22 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(Decimal(carried_again["amount"]), first_seed_amount)
             self.assertEqual(Decimal(carried_again["price"]),
                              Decimal(first_seed["price"]))
+
+    def test_grid_reset_waits_after_post_only_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.request_grid_reset("75", "125")
+            exchange.reject_post_only_once = True
+            with self.assertLogs(grid_main.LOGGER, level="WARNING"):
+                self.assertFalse(bot.reset_grid())
+            self.assertTrue(bot.grid_needs_reset)
+            self.assertIsNotNone(bot.database.get_state("grid_reset"))
+
+            self.assertTrue(bot.reset_grid())
+            self.assertFalse(bot.grid_needs_reset)
+            self.assertIsNone(bot.database.get_state("grid_reset"))
 
     def test_setgrid_rejects_bad_bounds_without_canceling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

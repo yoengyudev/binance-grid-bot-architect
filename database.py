@@ -193,6 +193,20 @@ class GridDatabase:
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown order ID: {order_id}")
 
+    def discard_rejected_post_only_order(self, order_id: Union[str, int]) -> None:
+        """Remove an intent only after Binance definitively rejects a maker order."""
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM grid_orders
+                WHERE order_id = ? AND order_type = 'LIMIT'
+                  AND status = 'OPEN' AND exchange_order_id IS NULL
+                """,
+                (str(order_id),),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Post-only rejection does not match a pending limit order.")
+
     def get_order(self, order_id: Union[str, int]) -> Optional[Dict[str, Any]]:
         with self._connection() as connection:
             row = connection.execute(

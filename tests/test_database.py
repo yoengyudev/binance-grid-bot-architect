@@ -40,6 +40,17 @@ class GridDatabaseTests(unittest.TestCase):
             with self.assertRaises(KeyError):
                 database.mark_order_filled("missing")
 
+    def test_post_only_cleanup_cannot_remove_an_accepted_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            database.insert_order(
+                "maker-1", 1, "BUY", "85000", "0.01", client_order_id="maker-1"
+            )
+            database.set_exchange_order_id("maker-1", "exchange-1")
+            with self.assertRaises(ValueError):
+                database.discard_rejected_post_only_order("maker-1")
+            self.assertEqual(database.get_order("maker-1")["exchange_order_id"], "exchange-1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -160,6 +160,7 @@ class GridBot:
         self.upper_levels: List[Decimal] = []
         self.baseline_base: Optional[Decimal] = None
         self.stop_loss_triggered: Optional[Decimal] = None
+        self._post_only_rejected_in_cycle = False
         self._grid_lock = RLock()
         pending_text = self.database.get_state("grid_reset")
         pending = json.loads(pending_text) if pending_text else None
@@ -502,7 +503,7 @@ class GridBot:
         self, level: int, side: str, price: Decimal, amount: Decimal,
         *, parent_order_id: Optional[str] = None, order_type: str = "LIMIT",
         quote_cost: Optional[Decimal] = None,
-    ) -> str:
+    ) -> Optional[str]:
         client_id = "gb" + uuid.uuid4().hex[:30]
         with self.exchange_lock:
             liquidation = order_type == "MARKET" and side == "SELL" and level == -1
@@ -515,6 +516,8 @@ class GridBot:
             )
             try:
                 params = {"newClientOrderId": client_id}
+                if order_type == "LIMIT":
+                    params["timeInForce"] = "PO"
                 if quote_cost is not None:
                     params["quoteOrderQty"] = str(quote_cost)
                 response = self.exchange.create_order(
@@ -522,6 +525,20 @@ class GridBot:
                     float(price) if order_type == "LIMIT" else None,
                     params,
                 )
+            except ccxt.OrderImmediatelyFillable as error:
+                if (order_type != "LIMIT" or
+                        "Order would immediately match and take." not in str(error)):
+                    raise UncertainOrderError(
+                        f"Order {client_id} may have been accepted; inspect it before restarting."
+                    ) from error
+                self.database.discard_rejected_post_only_order(client_id)
+                self._post_only_rejected_in_cycle = True
+                LOGGER.warning(
+                    "Spot Testnet rejected post-only %s %s at %s (grid level %s); "
+                    "skipping this order until the next cycle.",
+                    side, amount, price, level,
+                )
+                return None
             except Exception as error:
                 raise UncertainOrderError(
                     f"Order {client_id} may have been accepted; inspect it before restarting."
@@ -790,6 +807,8 @@ class GridBot:
             raise TradingHalt("Unknown grid reset phase.")
         for _ in range(3):
             self.run_cycle()
+            if self._post_only_rejected_in_cycle:
+                return False
             latest = self.database.fetch_latest_orders_by_level()
             expected = set(range(1, len(self.levels) + 1)) | set(
                 range(-1, -len(self.upper_levels) - 1, -1)) | {0}
@@ -815,6 +834,8 @@ class GridBot:
         amount = self._amount(exposure)
         self._check_order_size(price, amount)
         client_id = self._submit_order(-1, "SELL", price, amount, order_type="MARKET")
+        if client_id is None:
+            raise TradingHalt("Stop-loss market sale was not submitted.")
         self._reconcile_order(self.database.get_order(client_id))
         if self.database.get_order(client_id)["status"] != "FILLED":
             raise TradingHalt("Stop-loss market sale could not be verified as filled.")
@@ -822,6 +843,7 @@ class GridBot:
     def run_cycle(self) -> List[Tuple[str, Tuple[str, ...]]]:
         if not self.levels:
             raise RuntimeError("Call prepare() before run_cycle().")
+        self._post_only_rejected_in_cycle = False
         current_price = self._ticker_price()
         if current_price <= self.config.stop_loss_price:
             self._handle_stop_loss(current_price)
@@ -886,8 +908,13 @@ class GridBot:
                     break
                 try:
                     if self.grid_needs_reset:
-                        await asyncio.to_thread(self.reset_grid)
+                        complete = await asyncio.to_thread(self.reset_grid)
                         backoff = 1
+                        if not complete:
+                            await asyncio.to_thread(
+                                self.stop_controller.stop_requested.wait,
+                                self.config.poll_seconds,
+                            )
                         continue
                     if self.database.get_state("grid_reset_notification_pending"):
                         try:
