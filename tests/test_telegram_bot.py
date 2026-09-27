@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from telegram import Chat, Message, MessageEntity, Update, User
 from telegram.constants import ParseMode
@@ -36,6 +36,33 @@ class FakeExchange:
 
 
 class TelegramBotTests(unittest.TestCase):
+    def test_safety_pause_status_header_and_recovery_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            controller = StopController(FakeExchange(), database, "BTC/USDT")
+            grid = SimpleNamespace(
+                is_paused=True,
+                grid_status=lambda: (Decimal("69"), Decimal("80"), Decimal("120"),
+                                     4, Decimal("70")),
+                wallet_balances=lambda: {},
+                open_order_summary=lambda _price: (0, 2, None, Decimal("110")),
+            )
+            bot = TelegramBot("123456:ABCDEF", 12345, controller, grid,
+                              action_pin="1234")
+            status = asyncio.run(bot._status_text())
+            self.assertIn("⚠️ <b>SAFETY PAUSE ACTIVE</b>", status)
+            self.assertIn("<b>Pause Trigger:</b> 70 USDT", status)
+            self.assertIn("<b>BUY Limits:</b> 0", status)
+            with (patch.object(bot, "_refresh_active_status", new_callable=AsyncMock),
+                  patch.object(bot, "_send", new_callable=AsyncMock) as send):
+                asyncio.run(bot.notify_safety_recovery())
+                self.assertIn("Remaining BUY levels will restore", send.await_args.args[0])
+                asyncio.run(bot.notify_safety_resume())
+                self.assertEqual(
+                    send.await_args.args[0],
+                    "✅ SAFETY PAUSE LIFTED: Market recovered. BUY orders automatically restored.",
+                )
+
     def test_unexpected_messages_use_last_handler_and_delete_silently(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
@@ -242,7 +269,7 @@ class TelegramBotTests(unittest.TestCase):
             self.assertEqual(
                 [button.text for row in edits[-1][1]["reply_markup"].inline_keyboard
                  for button in row],
-                ["⚙️ Set Grid Bounds", "🛡️ Set Stop-Loss", "🛑 Stop Bot",
+                ["⚙️ Set Grid Bounds", "🛡️ Set Pause Trigger", "🛑 Stop Bot",
                  "🔒 Lock Session Now", "🔙 Back"],
             )
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setgrid"), None))
@@ -251,7 +278,7 @@ class TelegramBotTests(unittest.TestCase):
             self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
                              "menu:actions")
             asyncio.run(bot._handle_menu_callback(update(12345, 12345, "menu:setstop"), None))
-            self.assertIn("Send the new stop-loss price", edits[-1][0])
+            self.assertIn("Send the new pause trigger price", edits[-1][0])
             self.assertEqual(bot._pending_menu_input.action, "stop")
             self.assertEqual(edits[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data,
                              "menu:actions")
@@ -430,7 +457,7 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("Enter a valid stop-loss price", edits[-1][1])
             asyncio.run(bot._handle_menu_input(message("70"), context))
             self.assertEqual(events[-3:], ["delete", ("stop", "70"), "edit"])
-            self.assertIn("STOP-LOSS UPDATED", edits[-1][1])
+            self.assertIn("PAUSE TRIGGER UPDATED", edits[-1][1])
             self.assertIsNone(bot._pending_menu_input)
 
             asyncio.run(bot._handle_menu_callback(callback("menu:setgrid"), None))
@@ -601,7 +628,7 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("<b>Free USDT:</b> 250.00 | <b>Locked:</b> 150.00", replies[-1])
             self.assertIn("<b>Free BTC:</b> 0.01000000 | <b>Locked:</b> 0.00200000", replies[-1])
             self.assertIn("• <b>Levels:</b> 20", replies[-1])
-            self.assertIn("• <b>Stop-Loss:</b> 70 USDT", replies[-1])
+            self.assertIn("• <b>Pause Trigger:</b> 70 USDT", replies[-1])
             self.assertIn("🟢 <b>BUY Limits:</b> 3 (Closest: 99 USDT)", replies[-1])
             self.assertIn("🔴 <b>SELL Limits:</b> 2 (Closest: 101 USDT)", replies[-1])
             self.assertEqual(reply_options[-1]["parse_mode"], ParseMode.HTML)
@@ -652,7 +679,7 @@ class TelegramBotTests(unittest.TestCase):
                 "❌ Rejected: Stop-loss must be lower than the current lower bound.",
             )
             asyncio.run(bot._handle_setstop(owner, SimpleNamespace(args=["70"])))
-            self.assertEqual(replies[-1], "✅ Stop-loss successfully updated to: $70")
+            self.assertEqual(replies[-1], "✅ Pause trigger successfully updated to: $70")
             self.assertEqual(grid.stop_requests, ["75", "70"])
 
     def test_large_order_list_is_split_without_losing_orders(self) -> None:

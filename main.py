@@ -27,6 +27,11 @@ LOGGER = logging.getLogger(__name__)
 MAX_LEVELS = 50
 SELL_AMOUNT_BUFFER = Decimal("0.002")
 RESET_SPACING_PERCENT = Decimal("2.5")
+SAFETY_MODE_KEY = "safety_mode"
+PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
+SAFETY_PAUSE_NOTICE_KEY = "safety_pause_notice_pending"
+SAFETY_RECOVERY_NOTICE_KEY = "safety_recovery_notice_pending"
+SAFETY_RESUME_NOTICE_KEY = "safety_resume_notice_pending"
 OpenOrderEntry = Tuple[Optional[Decimal], Optional[Decimal]]
 
 
@@ -159,8 +164,11 @@ class GridBot:
         self.levels: List[Decimal] = []
         self.upper_levels: List[Decimal] = []
         self.baseline_base: Optional[Decimal] = None
-        self.stop_loss_triggered: Optional[Decimal] = None
         self._post_only_rejected_in_cycle = False
+        safety_mode = self.database.get_state(SAFETY_MODE_KEY)
+        if safety_mode not in (None, PAUSED_DOWNSIDE):
+            raise TradingHalt("Unknown saved safety mode; inspect local state.")
+        self.is_paused = safety_mode == PAUSED_DOWNSIDE
         self._grid_lock = RLock()
         pending_text = self.database.get_state("grid_reset")
         pending = json.loads(pending_text) if pending_text else None
@@ -496,6 +504,9 @@ class GridBot:
             return None
         if status in ("canceled", "expired", "rejected"):
             self.database.update_order_status(row["order_id"], status.upper())
+            if (status == "canceled" and row["side"] == "BUY" and
+                    self.database.get_state(f"safety_pause_buy:{row['order_id']}") == "1"):
+                return None
             raise TradingHalt(f"Tracked order {row['order_id']} ended as {status}.")
         raise TradingHalt("Exchange returned an unknown order status.")
 
@@ -819,37 +830,115 @@ class GridBot:
                 return True
         raise TradingHalt("Replacement grid did not finish placing orders.")
 
-    def _handle_stop_loss(self, price: Decimal) -> None:
-        self.stop_loss_triggered = price
-        self.database.set_state("halt_reason", "stop_loss")
-        result = self.stop_controller.request_stop()
-        if result.unresolved:
-            raise TradingHalt("Stop-loss cancellation has unresolved orders.")
-        exposure = self._bot_base_exposure()
-        if exposure <= 0:
+    def _enter_safety_pause(self, price: Decimal) -> None:
+        if self.is_paused:
             return
-        free_base = self._free_bot_base()
-        if free_base < exposure:
-            raise TradingHalt("Bot inventory is not fully available for stop-loss sale.")
-        amount = self._amount(exposure)
-        self._check_order_size(price, amount)
-        client_id = self._submit_order(-1, "SELL", price, amount, order_type="MARKET")
-        if client_id is None:
-            raise TradingHalt("Stop-loss market sale was not submitted.")
-        self._reconcile_order(self.database.get_order(client_id))
-        if self.database.get_order(client_id)["status"] != "FILLED":
-            raise TradingHalt("Stop-loss market sale could not be verified as filled.")
+        self.database.set_state(SAFETY_MODE_KEY, PAUSED_DOWNSIDE)
+        self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
+        self.database.clear_state(SAFETY_RESUME_NOTICE_KEY)
+        self.database.set_state(SAFETY_PAUSE_NOTICE_KEY, "1")
+        self.is_paused = True
+        LOGGER.warning("Safety pause activated at %s %s; canceling tracked BUY limits.",
+                       price, self.config.symbol)
+
+    def _cancel_buy_orders_for_pause(
+        self,
+    ) -> Tuple[List[Tuple[str, Tuple[str, ...]]], bool]:
+        """Verify each tracked BUY cancellation while leaving SELL orders untouched."""
+        events: List[Tuple[str, Tuple[str, ...]]] = []
+        all_canceled = True
+        with self.stop_controller._lock:
+            open_orders = self._call(self.exchange.fetch_open_orders, self.config.symbol)
+            if not isinstance(open_orders, list):
+                raise TradingHalt("Exchange returned an invalid open-order list.")
+            live_ids = {str(order["id"]) for order in open_orders
+                        if isinstance(order, dict) and order.get("id") is not None}
+            live_clients = {
+                str(order.get("clientOrderId") or (order.get("info") or {}).get("clientOrderId"))
+                for order in open_orders if isinstance(order, dict)
+                and (order.get("clientOrderId") or (order.get("info") or {}).get("clientOrderId"))
+            }
+            for row in self.database.fetch_active_grids():
+                if row["side"] != "BUY" or row["order_type"] != "LIMIT":
+                    continue
+                if self.stop_controller.stop_requested.is_set():
+                    return events, False
+                marker = f"safety_pause_buy:{row['order_id']}"
+                reference = row.get("exchange_order_id") or row["order_id"]
+                if (str(reference) not in live_ids and
+                        str(row.get("client_order_id")) not in live_clients):
+                    current = self._fetch_order(row)
+                    if current.get("status") == "closed":
+                        event = self._reconcile_order(row)
+                        if event:
+                            events.append(event)
+                        continue
+                    if current.get("status") == "canceled":
+                        if self.database.get_state(marker) != "1":
+                            raise TradingHalt("BUY order canceled outside Safety Pause.")
+                        self.database.update_order_status(row["order_id"], "CANCELED")
+                        continue
+                    if current.get("status") != "open":
+                        raise TradingHalt("BUY order has an unknown exchange status.")
+                self.database.set_state(marker, "1")
+                params = ({"origClientOrderId": row["client_order_id"]}
+                          if row.get("client_order_id") else None)
+                try:
+                    if params is None:
+                        response = self._call(
+                            self.exchange.cancel_order, reference, self.config.symbol
+                        )
+                    else:
+                        response = self._call(
+                            self.exchange.cancel_order, reference, self.config.symbol, params
+                        )
+                except ccxt.BaseError as error:
+                    LOGGER.warning("BUY cancellation needs reconciliation: %s",
+                                   type(error).__name__)
+                    response = None
+                status = response.get("status") if isinstance(response, dict) else None
+                if status not in ("canceled", "closed"):
+                    status = self._fetch_order(row).get("status")
+                if status == "canceled":
+                    self.database.update_order_status(row["order_id"], "CANCELED")
+                elif status == "closed":
+                    event = self._reconcile_order(row)
+                    if event:
+                        events.append(event)
+                elif status == "open":
+                    all_canceled = False
+                    LOGGER.warning("BUY %s remains open during Safety Pause.",
+                                   row["order_id"])
+                else:
+                    raise TradingHalt("BUY cancellation returned an unknown status.")
+        return events, all_canceled
+
+    def _missing_paused_buys(self) -> bool:
+        return any(
+            row["side"] == "BUY" and row["status"] == "CANCELED" and
+            self.database.get_state(f"safety_pause_buy:{row['order_id']}") == "1"
+            for row in self.database.fetch_latest_orders_by_level().values()
+        )
 
     def run_cycle(self) -> List[Tuple[str, Tuple[str, ...]]]:
         if not self.levels:
             raise RuntimeError("Call prepare() before run_cycle().")
         self._post_only_rejected_in_cycle = False
         current_price = self._ticker_price()
-        if current_price <= self.config.stop_loss_price:
-            self._handle_stop_loss(current_price)
-            return [("stop_loss", (self.config.symbol, str(current_price)))]
-
         events: List[Tuple[str, Tuple[str, ...]]] = []
+        if current_price <= self.config.stop_loss_price:
+            self._enter_safety_pause(current_price)
+        if self.is_paused:
+            pause_events, cancellations_complete = self._cancel_buy_orders_for_pause()
+            events.extend(pause_events)
+            if cancellations_complete and current_price > self.config.lower_price:
+                self.database.clear_state(SAFETY_MODE_KEY)
+                self.database.clear_state(SAFETY_PAUSE_NOTICE_KEY)
+                self.database.set_state(SAFETY_RECOVERY_NOTICE_KEY, "1")
+                self.database.set_state(SAFETY_RESUME_NOTICE_KEY, "1")
+                self.is_paused = False
+                LOGGER.info("Safety pause lifted after recovery to %s %s.",
+                            current_price, self.config.symbol)
         for row in self.database.fetch_active_grids():
             if self.stop_controller.stop_requested.is_set():
                 return events
@@ -860,7 +949,8 @@ class GridBot:
         latest = self.database.fetch_latest_orders_by_level()
         seed_row = latest.get(0)
         if seed_row is None:
-            self._place_seed_buy(current_price)
+            if not self.is_paused:
+                self._place_seed_buy(current_price)
             return events
         if seed_row["status"] not in ("FILLED",):
             seed_row = self.database.get_order(seed_row["order_id"])
@@ -868,7 +958,10 @@ class GridBot:
             return events
 
         latest = self.database.fetch_latest_orders_by_level()
-        in_bounds = self.config.lower_price <= current_price <= self.config.upper_price
+        in_bounds = (
+            not self.is_paused and
+            self.config.lower_price <= current_price <= self.config.upper_price
+        )
         lane_levels = (
             list(range(-1, -len(self.upper_levels) - 1, -1))
             + list(range(1, len(self.levels) + 1))
@@ -890,16 +983,57 @@ class GridBot:
                 self._record_filled_sell(row)
                 if in_bounds:
                     self._place_buy(level, row["order_id"])
+            elif (row["status"] == "CANCELED" and row["side"] == "BUY" and
+                  self.database.get_state(f"safety_pause_buy:{row['order_id']}") == "1"):
+                canceled_buy = self._fetch_order(row)
+                if _order_decimal(canceled_buy.get("filled")) > 0:
+                    self._place_sell(row)
+                elif in_bounds and Decimal(row["price"]) < current_price:
+                    self._place_buy(level, row.get("parent_order_id"))
             else:
                 raise TradingHalt("A grid lane ended unexpectedly; inspect local orders.")
         return events
+
+    async def _notify_safety_state(self, telegram_bot: TelegramBot) -> None:
+        active_buys = any(
+            row["side"] == "BUY" and row["order_type"] == "LIMIT"
+            for row in self.database.fetch_active_grids()
+        )
+        if self.database.get_state(SAFETY_PAUSE_NOTICE_KEY) and not active_buys:
+            try:
+                await telegram_bot.notify_safety_pause()
+            except Exception as error:
+                LOGGER.warning("Safety pause Telegram update failed: %s",
+                               type(error).__name__)
+            else:
+                self.database.clear_state(SAFETY_PAUSE_NOTICE_KEY)
+        missing_buys = self._missing_paused_buys() if not self.is_paused else False
+        if (not self.is_paused and missing_buys and
+                self.database.get_state(SAFETY_RECOVERY_NOTICE_KEY)):
+            try:
+                await telegram_bot.notify_safety_recovery()
+            except Exception as error:
+                LOGGER.warning("Safety recovery Telegram update failed: %s",
+                               type(error).__name__)
+            else:
+                self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
+        if (not self.is_paused and
+                self.database.get_state(SAFETY_RESUME_NOTICE_KEY) and
+                not missing_buys):
+            try:
+                await telegram_bot.notify_safety_resume()
+            except Exception as error:
+                LOGGER.warning("Safety resume Telegram update failed: %s",
+                               type(error).__name__)
+            else:
+                self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
+                self.database.clear_state(SAFETY_RESUME_NOTICE_KEY)
 
     async def run(self, telegram_bot: TelegramBot) -> None:
         await asyncio.to_thread(self.prepare, persist=True)
         if self.database.get_state("halt_reason"):
             raise TradingHalt("Saved stop state requires manual review before a new run.")
         await telegram_bot.start()
-        stop_loss_notified = False
         try:
             await telegram_bot.notify_startup(self.config.symbol)
             backoff = 1
@@ -909,6 +1043,7 @@ class GridBot:
                 try:
                     if self.grid_needs_reset:
                         complete = await asyncio.to_thread(self.reset_grid)
+                        await self._notify_safety_state(telegram_bot)
                         backoff = 1
                         if not complete:
                             await asyncio.to_thread(
@@ -927,39 +1062,30 @@ class GridBot:
                     for kind, values in events:
                         if kind == "filled":
                             await telegram_bot.notify_order_filled(*values)
-                        elif kind == "stop_loss":
-                            await telegram_bot.notify_stop_loss(*values)
-                            stop_loss_notified = True
+                    await self._notify_safety_state(telegram_bot)
                     backoff = 1
                     delay = self.config.poll_seconds
                 except (ccxt.RateLimitExceeded, ccxt.DDoSProtection, ccxt.NetworkError):
-                    if self.stop_loss_triggered is not None:
-                        await telegram_bot.notify_stop_loss(
-                            self.config.symbol, str(self.stop_loss_triggered)
-                        )
-                        raise TradingHalt("Stop-loss liquidation could not be verified.")
+                    if self.is_paused:
+                        await self._notify_safety_state(telegram_bot)
                     delay = min(backoff, 60)
                     backoff = min(backoff * 2, 60)
                 except Exception as error:
                     self.stop_controller.stop_requested.set()
                     if self.grid_needs_reset:
                         self.database.set_state("halt_reason", "grid_reset_failed")
-                    if self.stop_loss_triggered is not None and not stop_loss_notified:
-                        try:
-                            await telegram_bot.notify_stop_loss(
-                                self.config.symbol, str(self.stop_loss_triggered)
-                            )
-                        except Exception:
-                            pass
+                    if self.is_paused:
+                        await self._notify_safety_state(telegram_bot)
                     try:
                         await telegram_bot.notify_critical_error(error)
                     except Exception:
                         pass
-                    await asyncio.to_thread(self.stop_controller.request_stop)
+                    if not self.is_paused:
+                        await asyncio.to_thread(self.stop_controller.request_stop)
                     raise
                 await asyncio.to_thread(self.stop_controller.stop_requested.wait, delay)
         finally:
-            if not self.stop_controller.stop_requested.is_set():
+            if not self.stop_controller.stop_requested.is_set() and not self.is_paused:
                 await asyncio.to_thread(self.stop_controller.request_stop)
             await telegram_bot.stop()
 

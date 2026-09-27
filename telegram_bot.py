@@ -205,6 +205,7 @@ class TelegramBot:
         self.stop_controller = stop_controller
         self.grid_bot = grid_bot
         self._pending_menu_input: Optional[PendingMenuInput] = None
+        self._active_status_message_id: Optional[int] = None
         self._action_pin = (
             action_pin if action_pin is not None
             else os.getenv("TELEGRAM_ACTION_PIN", "").strip()
@@ -321,7 +322,7 @@ class TelegramBot:
             "Choose an action below.",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Set Grid Bounds", callback_data="menu:setgrid"),
-                 InlineKeyboardButton("🛡️ Set Stop-Loss", callback_data="menu:setstop")],
+                 InlineKeyboardButton("🛡️ Set Pause Trigger", callback_data="menu:setstop")],
                 [InlineKeyboardButton("🛑 Stop Bot", callback_data="menu:stop")],
                 [InlineKeyboardButton("🔒 Lock Session Now", callback_data="menu:lock")],
                 [InlineKeyboardButton("🔙 Back", callback_data="menu:root")],
@@ -375,10 +376,10 @@ class TelegramBot:
             title = "⚙️ <b>SET GRID BOUNDS</b>"
             instruction = "👇 Send the new bounds as <code>lower upper</code>."
             example = "<i>Example: 72000 95000</i>"
-            rule = "🛡️ Stop-loss must be below the new lower bound."
+            rule = "🛡️ Pause trigger must be below the new lower bound."
         else:
-            title = "🛡️ <b>SET STOP-LOSS</b>"
-            instruction = "👇 Send the new stop-loss price as a number."
+            title = "🛡️ <b>SET PAUSE TRIGGER</b>"
+            instruction = "👇 Send the new pause trigger price as a number."
             example = "<i>Example: 64000</i>"
             rule = "⚠️ The price must be below the current lower grid bound."
         warning = f"\n\n❌ <b>Update rejected:</b> {escape(error)}" if error else ""
@@ -403,6 +404,7 @@ class TelegramBot:
         if not self._is_owner(update, self.owner_chat_id):
             return
         self._pending_menu_input = None
+        self._active_status_message_id = None
         self._reset_pin_entry()
         text, keyboard = self._main_menu_view()
         await update.effective_message.reply_text(
@@ -488,6 +490,9 @@ class TelegramBot:
                 answer_options = {"text": "Not authorized.", "show_alert": True}
                 return
             action = query.data
+            if (action != "menu:status" and query.message is not None and
+                    self._active_status_message_id == query.message.message_id):
+                self._active_status_message_id = None
             if action.startswith("pin:"):
                 answer_options = await self._handle_pin_callback(update)
                 return
@@ -565,6 +570,8 @@ class TelegramBot:
             await self._edit_menu_message(
                 query, text, self._back_keyboard(back_target), ParseMode.HTML,
             )
+            if action == "menu:status" and query.message is not None:
+                self._active_status_message_id = query.message.message_id
         finally:
             await query.answer(**answer_options)
 
@@ -657,20 +664,20 @@ class TelegramBot:
                     return
         else:
             if len(values) != 1:
-                error_text = "Enter exactly one numeric stop-loss price."
+                error_text = "Enter exactly one numeric pause trigger price."
             else:
                 try:
                     price = await asyncio.to_thread(self.grid_bot.set_stop_loss, values[0])
                 except (ValueError, RuntimeError) as error:
                     error_text = str(error)
                 except Exception as error:
-                    LOGGER.warning("Stop-loss input failed: %s", type(error).__name__)
-                    error_text = "Stop-loss update failed. Please try again."
+                    LOGGER.warning("Pause trigger input failed: %s", type(error).__name__)
+                    error_text = "Pause trigger update failed. Please try again."
                 else:
                     self._pending_menu_input = None
                     await self._edit_pending_menu(
                         context, pending,
-                        "✅ <b>STOP-LOSS UPDATED</b>\n"
+                        "✅ <b>PAUSE TRIGGER UPDATED</b>\n"
                         "━━━━━━━━━━━━━━━━━━\n"
                         f"• <b>New price:</b> {escape(format(price, 'f'))} USDT\n\n"
                         "Existing grid orders were left in place.",
@@ -721,9 +728,11 @@ class TelegramBot:
     async def _handle_status(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._is_owner(update, self.owner_chat_id) or self.grid_bot is None:
             return
-        await update.effective_message.reply_text(
+        message = await update.effective_message.reply_text(
             await self._status_text(), parse_mode=ParseMode.HTML,
         )
+        if message is not None:
+            self._active_status_message_id = getattr(message, "message_id", None)
 
     async def _status_text(self) -> str:
         if self.grid_bot is None:
@@ -768,8 +777,10 @@ class TelegramBot:
         btc_free = _format_balance_amount(btc.get("free"), 8)
         btc_used = _format_balance_amount(btc.get("used"), 8)
         current_price = f"{price} USDT" if price is not None else "Unavailable"
+        header = ("⚠️ <b>SAFETY PAUSE ACTIVE</b>" if getattr(self.grid_bot, "is_paused", False)
+                  else "📊 <b>BOT STATUS &amp; ANALYTICS</b>")
         return (
-            "📊 <b>BOT STATUS &amp; ANALYTICS</b>\n"
+            f"{header}\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "💰 <b>Market:</b> BTC/USDT\n"
             f"📈 <b>Current Price:</b> {escape(current_price)}\n\n"
@@ -779,7 +790,7 @@ class TelegramBot:
             "⚙️ <b>Grid Configuration</b>\n"
             f"• <b>Bounds:</b> {escape(str(lower))} - {escape(str(upper))} USDT\n"
             f"• <b>Levels:</b> {escape(str(levels))}\n"
-            f"• <b>Stop-Loss:</b> {escape(str(stop_loss))} USDT\n\n"
+            f"• <b>Pause Trigger:</b> {escape(str(stop_loss))} USDT\n\n"
             "📋 <b>Live Order Summary</b>\n"
             f"• 🟢 <b>BUY Limits:</b> {escape(str(buy_count))} "
             f"(Closest: {escape(buy_price)})\n"
@@ -864,10 +875,10 @@ class TelegramBot:
             await update.effective_message.reply_text(f"❌ Rejected: {error}")
             return
         except Exception:
-            await update.effective_message.reply_text("Stop-loss update failed. Check bot logs.")
+            await update.effective_message.reply_text("Pause trigger update failed. Check bot logs.")
             return
         await update.effective_message.reply_text(
-            f"✅ Stop-loss successfully updated to: ${format(price, 'f')}"
+            f"✅ Pause trigger successfully updated to: ${format(price, 'f')}"
         )
 
     async def start(self) -> None:
@@ -897,8 +908,45 @@ class TelegramBot:
     async def notify_order_filled(self, order_id: str, side: str, amount: str, price: str) -> None:
         await self._send(f"Order filled: {side} {amount} at {price} (ID {order_id}).")
 
-    async def notify_stop_loss(self, symbol: str, price: str) -> None:
-        await self._send(f"Stop-loss triggered for {symbol} at {price}.")
+    async def _refresh_active_status(self) -> bool:
+        if self._active_status_message_id is None:
+            return False
+        try:
+            await self.application.bot.edit_message_text(
+                chat_id=self.owner_chat_id,
+                message_id=self._active_status_message_id,
+                text=await self._status_text(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._back_keyboard("menu:views"),
+            )
+        except BadRequest as error:
+            if "message is not modified" in str(error).lower():
+                return True
+            LOGGER.warning("Could not refresh status message: %s", type(error).__name__)
+            self._active_status_message_id = None
+            return False
+        except Exception as error:
+            LOGGER.warning("Could not refresh status message: %s", type(error).__name__)
+            self._active_status_message_id = None
+            return False
+        return True
+
+    async def notify_safety_pause(self) -> None:
+        if not await self._refresh_active_status():
+            await self._send("⚠️ SAFETY PAUSE ACTIVE: BUY limits canceled; SELL limits remain open.")
+
+    async def notify_safety_recovery(self) -> None:
+        await self._refresh_active_status()
+        await self._send(
+            "✅ SAFETY PAUSE LIFTED: Market recovered. Remaining BUY levels will "
+            "restore as price rises above each limit."
+        )
+
+    async def notify_safety_resume(self) -> None:
+        await self._refresh_active_status()
+        await self._send(
+            "✅ SAFETY PAUSE LIFTED: Market recovered. BUY orders automatically restored."
+        )
 
     async def notify_critical_error(self, error: Exception) -> None:
         # Do not send raw exception text: exchange errors may contain request details.

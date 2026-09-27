@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import tempfile
 import unittest
@@ -5,7 +6,8 @@ from contextlib import closing, redirect_stderr
 from decimal import Decimal, ROUND_DOWN
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import ccxt
 
@@ -209,29 +211,106 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(next_sell["side"], "SELL")
             self.assertEqual(Decimal(next_sell["price"]), Decimal("110.00"))
 
-    def test_stop_loss_sells_only_tracked_base(self) -> None:
+    def test_safety_pause_cancels_only_buy_limits_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.run_cycle()
+            bot.run_cycle()
+            held_btc = exchange.base_free + sum(
+                Decimal(order["amount"]) for order in exchange.fetch_open_orders("BTC/USDT")
+                if order["side"] == "sell"
+            )
+            sell_ids = {
+                order["id"] for order in exchange.fetch_open_orders("BTC/USDT")
+                if order["side"] == "sell"
+            }
+            exchange.price = Decimal("69")
+
+            bot.run_cycle()
+            self.assertTrue(bot.is_paused)
+            self.assertEqual(bot.database.get_state("safety_mode"), "PAUSED_DOWNSIDE")
+            self.assertFalse(bot.stop_controller.stop_requested.is_set())
+            self.assertFalse(any(order["side"] == "buy" for order in
+                                 exchange.fetch_open_orders("BTC/USDT")))
+            self.assertEqual(
+                {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")
+                 if order["side"] == "sell"}, sell_ids,
+            )
+            self.assertEqual(
+                exchange.base_free + sum(
+                    Decimal(order["amount"])
+                    for order in exchange.fetch_open_orders("BTC/USDT")
+                    if order["side"] == "sell"
+                ), held_btc,
+            )
+            self.assertEqual(sum(order["type"] == "market" and order["side"] == "sell"
+                                 for order in exchange.orders.values()), 0)
+            notifier = SimpleNamespace(
+                notify_safety_pause=AsyncMock(),
+                notify_safety_recovery=AsyncMock(),
+                notify_safety_resume=AsyncMock(),
+            )
+            asyncio.run(bot._notify_safety_state(notifier))
+            notifier.notify_safety_pause.assert_awaited_once()
+            before = len(exchange.orders)
+            bot.run_cycle()
+            self.assertEqual(len(exchange.orders), before)
+
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            self.assertTrue(reopened.is_paused)
+            exchange.price = Decimal("80")
+            reopened.run_cycle()
+            self.assertTrue(reopened.is_paused)
+            exchange.price = Decimal("80.01")
+            reopened.run_cycle()
+            self.assertFalse(reopened.is_paused)
+            self.assertIsNone(reopened.database.get_state("safety_mode"))
+            self.assertEqual(reopened.database.get_state("safety_resume_notice_pending"), "1")
+            self.assertFalse(any(order["side"] == "buy" for order in
+                                 exchange.fetch_open_orders("BTC/USDT")))
+            asyncio.run(reopened._notify_safety_state(notifier))
+            notifier.notify_safety_recovery.assert_awaited_once()
+            notifier.notify_safety_resume.assert_not_awaited()
+            exchange.price = Decimal("82")
+            reopened.run_cycle()
+            self.assertEqual(
+                len([order for order in exchange.fetch_open_orders("BTC/USDT")
+                     if order["side"] == "buy"]), 1,
+            )
+            self.assertTrue(reopened._missing_paused_buys())
+            exchange.price = Decimal("91")
+            reopened.run_cycle()
+            self.assertFalse(reopened._missing_paused_buys())
+            self.assertEqual(
+                len([order for order in exchange.fetch_open_orders("BTC/USDT")
+                     if order["side"] == "buy"]), len(reopened.levels),
+            )
+            asyncio.run(reopened._notify_safety_state(notifier))
+            notifier.notify_safety_resume.assert_awaited_once()
+
+    def test_safety_pause_keeps_partially_filled_buy_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
             bot.run_cycle()
             bot.run_cycle()
             buy = bot.database.fetch_latest_orders_by_level()[1]
-            exchange.fill(buy["client_order_id"])
-            bot.run_cycle()  # Places the paired limit sell.
-            purchased = Decimal(exchange.orders[buy["client_order_id"]]["filled"])
-            seed = bot.database.fetch_latest_orders_by_level()[0]
-            seed_filled = Decimal(exchange.orders[seed["client_order_id"]]["filled"])
+            partial = Decimal(buy["amount"]) / 2
+            exchange.orders[buy["client_order_id"]]["filled"] = str(partial)
+            exchange.base_free += partial
             exchange.price = Decimal("69")
 
-            events = bot.run_cycle()
+            bot.run_cycle()
 
-            self.assertEqual(events[0][0], "stop_loss")
-            self.assertTrue(bot.stop_controller.stop_requested.is_set())
-            liquidation = bot.database.fetch_latest_orders_by_level()[-1]
-            self.assertEqual(liquidation["order_type"], "MARKET")
-            self.assertEqual(liquidation["status"], "FILLED")
-            self.assertLessEqual(Decimal(liquidation["amount"]), purchased + seed_filled)
-            self.assertGreater(Decimal(liquidation["amount"]), purchased)
-            self.assertEqual(bot.database.get_state("halt_reason"), "stop_loss")
+            latest = bot.database.fetch_latest_orders_by_level()[1]
+            self.assertEqual(latest["side"], "SELL")
+            self.assertEqual(latest["status"], "OPEN")
+            self.assertEqual(latest["parent_order_id"], buy["order_id"])
+            self.assertLessEqual(Decimal(latest["amount"]), partial)
+            self.assertTrue(bot.is_paused)
+            self.assertFalse(any(order["side"] == "buy" for order in
+                                 exchange.fetch_open_orders("BTC/USDT")))
 
     def test_uncertain_submission_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
