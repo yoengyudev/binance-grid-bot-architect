@@ -37,6 +37,8 @@ PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
 SAFETY_PAUSE_NOTICE_KEY = "safety_pause_notice_pending"
 SAFETY_RECOVERY_NOTICE_KEY = "safety_recovery_notice_pending"
 SAFETY_RESUME_NOTICE_KEY = "safety_resume_notice_pending"
+LAST_MARKET_PRICE_KEY = "last_market_price"
+FILL_SNAPSHOT_PREFIX = "fill_snapshot:"
 BREAKOUT_TIMER_KEY = "upper_breakout_timer"
 BREAKOUT_WIDTH_KEY = "breakout_width_percent"
 BREAKOUT_NOTICE_KEY = "breakout_notification_pending"
@@ -51,6 +53,82 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.state.grid_bot = None
+
+
+def _unavailable_wallet() -> Dict[str, Optional[float]]:
+    return {"btc_held": None, "average_cost": None, "unrealized_pnl": None}
+
+
+def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
+    """Value the current run's remaining BTC lots from persisted fill snapshots."""
+    try:
+        carry_text = database.get_state("carry_inventory")
+        carry = json.loads(carry_text) if carry_text else {}
+        rows = database.fetch_all_orders()
+        buys: Dict[str, Tuple[Decimal, Decimal]] = {}
+        sold_by_buy: Dict[str, Decimal] = {}
+        for row in rows:
+            order_id = row["order_id"]
+            if order_id == carry.get("order_id"):
+                filled = Decimal(row["amount"])
+                quote_cost = Decimal(carry["cost"])
+                base_fee = quote_fee = Decimal(0)
+            else:
+                snapshot_text = database.get_state(FILL_SNAPSHOT_PREFIX + order_id)
+                if snapshot_text:
+                    snapshot = json.loads(snapshot_text)
+                    filled = Decimal(snapshot["filled_base"])
+                    quote_cost = Decimal(snapshot["filled_quote"])
+                    base_fee = Decimal(snapshot["base_fee"])
+                    quote_fee = Decimal(snapshot["quote_fee"])
+                elif row["status"] == "OPEN":
+                    filled = quote_cost = base_fee = quote_fee = Decimal(0)
+                else:
+                    # A historical fill cannot be valued from its limit price.
+                    return _unavailable_wallet()
+            if any(not value.is_finite() or value < 0 for value in
+                   (filled, quote_cost, base_fee, quote_fee)):
+                return _unavailable_wallet()
+            if row["side"] == "BUY":
+                acquired = filled - base_fee
+                spent = quote_cost + quote_fee
+                if acquired < 0 or (acquired > 0 and spent <= 0):
+                    return _unavailable_wallet()
+                buys[order_id] = (acquired, spent)
+            elif filled > 0:
+                parent_id = row["parent_order_id"]
+                if not parent_id:
+                    return _unavailable_wallet()
+                sold_by_buy[parent_id] = (
+                    sold_by_buy.get(parent_id, Decimal(0)) + filled + base_fee
+                )
+
+        held = remaining_cost = Decimal(0)
+        for order_id, (acquired, spent) in buys.items():
+            sold = sold_by_buy.pop(order_id, Decimal(0))
+            if sold > acquired:
+                return _unavailable_wallet()
+            remaining = acquired - sold
+            if remaining > 0:
+                held += remaining
+                remaining_cost += spent * remaining / acquired
+        if sold_by_buy:
+            return _unavailable_wallet()
+        if held == 0:
+            return {"btc_held": 0.0, "average_cost": None, "unrealized_pnl": 0.0}
+
+        price_text = database.get_state(LAST_MARKET_PRICE_KEY)
+        price = Decimal(price_text) if price_text else None
+        if price is not None and (not price.is_finite() or price <= 0):
+            price = None
+        return {
+            "btc_held": float(held),
+            "average_cost": float(remaining_cost / held),
+            "unrealized_pnl": float(held * price - remaining_cost) if price else None,
+        }
+    except (KeyError, TypeError, ValueError, InvalidOperation, ZeroDivisionError):
+        LOGGER.warning("Portfolio exposure is unavailable from saved fill data.")
+        return _unavailable_wallet()
 
 
 @app.get("/api/bot/status")
@@ -73,6 +151,8 @@ def bot_status() -> Dict[str, Any]:
         "grid_levels": len(orders),
         "lower_bound": float(min(prices)) if prices else None,
         "upper_bound": float(max(prices)) if prices else None,
+        "wallet": _portfolio_wallet(database) if bot is not None
+                  else _unavailable_wallet(),
     }
 
 
@@ -500,6 +580,8 @@ class GridBot:
         if not self.market.get("spot") or self.market.get("active") is False:
             raise TradingHalt("Configured symbol is not an active Spot market.")
         current_price = self._ticker_price()
+        if persist:
+            self.database.set_state(LAST_MARKET_PRICE_KEY, str(current_price))
 
         saved = self.database.get_state("grid_run")
         if saved:
@@ -606,7 +688,46 @@ class GridBot:
             raise TradingHalt("Exchange returned an invalid order response.")
         if order.get("id") and not row.get("exchange_order_id"):
             self.database.set_exchange_order_id(row["order_id"], str(order["id"]))
+        self._save_fill_snapshot(row["order_id"], order)
         return order
+
+    def _save_fill_snapshot(self, order_id: str, order: Dict[str, Any]) -> None:
+        """Cache exchange-confirmed fills for read-only portfolio calculations."""
+        try:
+            if order.get("filled") is None:
+                return
+            filled = Decimal(str(order["filled"]))
+            if not filled.is_finite() or filled < 0:
+                return
+            quote_cost = Decimal(str(order.get("cost") or 0))
+            if filled > 0 and quote_cost <= 0:
+                execution_price = order.get("average") or order.get("price")
+                if execution_price is None:
+                    return
+                quote_cost = filled * Decimal(str(execution_price))
+            snapshot = json.dumps({
+                "filled_base": str(filled),
+                "filled_quote": str(quote_cost),
+                "base_fee": str(_fees_in_asset(order, self.market["base"])),
+                "quote_fee": str(_fees_in_asset(order, self.market["quote"])),
+            }, sort_keys=True)
+            key = FILL_SNAPSHOT_PREFIX + order_id
+            if self.database.get_state(key) != snapshot:
+                self.database.set_state(key, snapshot)
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            LOGGER.warning("Fill snapshot unavailable for order %s.", order_id)
+
+    def _backfill_portfolio_snapshots(self) -> None:
+        """Read old completed orders once so existing runs have a cost basis."""
+        for row in self.database.fetch_all_orders():
+            if (not row.get("client_order_id") or row["status"] == "OPEN" or
+                    self.database.get_state(FILL_SNAPSHOT_PREFIX + row["order_id"])):
+                continue
+            try:
+                self._fetch_order(row)
+            except Exception as error:
+                LOGGER.warning("Could not backfill fill for %s: %s",
+                               row["order_id"], type(error).__name__)
 
     def _reconcile_order(self, row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[str, ...]]]:
         order = self._fetch_order(row)
@@ -1073,6 +1194,7 @@ class GridBot:
             raise RuntimeError("Call prepare() before run_cycle().")
         self._post_only_rejected_in_cycle = False
         current_price = self._ticker_price()
+        self.database.set_state(LAST_MARKET_PRICE_KEY, str(current_price))
         if self._observe_upper_breakout(current_price):
             return []
         events: List[Tuple[str, Tuple[str, ...]]] = []
@@ -1179,6 +1301,7 @@ class GridBot:
         await asyncio.to_thread(self.prepare, persist=True)
         if self.database.get_state("halt_reason"):
             raise TradingHalt("Saved stop state requires manual review before a new run.")
+        await asyncio.to_thread(self._backfill_portfolio_snapshots)
         await telegram_bot.start()
         try:
             await telegram_bot.notify_startup(self.config.symbol)

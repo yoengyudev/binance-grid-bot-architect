@@ -26,6 +26,10 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "status": "Offline", "pair": "BTC/USDT",
                     "safety_pause": "Normal", "grid_levels": 0,
                     "lower_bound": None, "upper_bound": None,
+                    "wallet": {
+                        "btc_held": None, "average_cost": None,
+                        "unrealized_pnl": None,
+                    },
                 })
 
                 database.insert_order("buy", 1, "BUY", "81000", "0.01")
@@ -33,8 +37,16 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 database.insert_order(
                     "seed", 0, "BUY", "84000", "0.01", order_type="MARKET"
                 )
+                database.mark_order_filled("seed")
+                database.set_state(grid_main.FILL_SNAPSHOT_PREFIX + "seed",
+                                   '{"filled_base":"0.01","filled_quote":"840",'
+                                   '"base_fee":"0","quote_fee":"0"}')
                 database.insert_order("filled", 2, "BUY", "78000", "0.01")
                 database.mark_order_filled("filled")
+                database.set_state(grid_main.FILL_SNAPSHOT_PREFIX + "filled",
+                                   '{"filled_base":"0.01","filled_quote":"780",'
+                                   '"base_fee":"0","quote_fee":"0"}')
+                database.set_state(grid_main.LAST_MARKET_PRICE_KEY, "85000")
                 database.set_state(grid_main.SAFETY_MODE_KEY, grid_main.PAUSED_DOWNSIDE)
                 grid_main.app.state.grid_bot = SimpleNamespace(
                     config=SimpleNamespace(symbol="BTC/USDT"), database=database
@@ -55,8 +67,59 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "grid_levels": 2,
             "lower_bound": 81000.0, "upper_bound": 90000.0,
+            "wallet": {
+                "btc_held": 0.02, "average_cost": 81000.0,
+                "unrealized_pnl": 80.0,
+            },
         })
         self.assertEqual(resumed.json()["safety_pause"], "Normal")
+
+    async def test_wallet_values_carry_and_partial_sell_without_guessing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database.insert_order(
+                "carry-1", 0, "BUY", "84473.58", "0.00591",
+                order_type="MARKET",
+            )
+            database.mark_order_filled("carry-1")
+            database.set_state(
+                "carry_inventory", '{"order_id":"carry-1","cost":"499.2388578"}'
+            )
+            database.set_state(grid_main.LAST_MARKET_PRICE_KEY, "85000")
+            wallet = grid_main._portfolio_wallet(database)
+            self.assertEqual(wallet["btc_held"], 0.00591)
+            self.assertAlmostEqual(wallet["average_cost"], 84473.58)
+            self.assertAlmostEqual(
+                wallet["unrealized_pnl"], 0.00591 * 85000 - 499.2388578
+            )
+
+            database.insert_order(
+                "sell-1", -1, "SELL", "90000", "0.002",
+                parent_order_id="carry-1",
+            )
+            database.update_order_status("sell-1", "PARTIALLY_FILLED")
+            database.set_state(
+                grid_main.FILL_SNAPSHOT_PREFIX + "sell-1",
+                '{"filled_base":"0.001","filled_quote":"90",'
+                '"base_fee":"0.0001","quote_fee":"0"}',
+            )
+            database.set_state(grid_main.LAST_MARKET_PRICE_KEY, "80000")
+            wallet = grid_main._portfolio_wallet(database)
+            expected_held = 0.00481
+            expected_cost = 499.2388578 * expected_held / 0.00591
+            self.assertAlmostEqual(wallet["btc_held"], expected_held)
+            self.assertAlmostEqual(wallet["average_cost"],
+                                   expected_cost / expected_held)
+            self.assertAlmostEqual(wallet["unrealized_pnl"],
+                                   expected_held * 80000 - expected_cost)
+            self.assertLess(wallet["unrealized_pnl"], 0)
+
+            database.insert_order("unknown", 1, "BUY", "79000", "0.001")
+            database.mark_order_filled("unknown")
+            self.assertEqual(
+                grid_main._portfolio_wallet(database),
+                grid_main._unavailable_wallet(),
+            )
 
     async def test_api_and_telegram_bot_run_concurrently(self) -> None:
         api_started = asyncio.Event()

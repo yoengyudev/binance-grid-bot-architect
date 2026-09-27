@@ -178,6 +178,30 @@ class GridBotTests(unittest.TestCase):
         bot.prepare(persist=True)
         return bot, exchange
 
+    def test_market_price_and_confirmed_fills_support_portfolio_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            self.assertEqual(
+                bot.database.get_state(grid_main.LAST_MARKET_PRICE_KEY), "100"
+            )
+            bot.run_cycle()
+            bot.run_cycle()
+            seed = bot.database.fetch_latest_orders_by_level()[0]
+            snapshot = json.loads(bot.database.get_state(
+                grid_main.FILL_SNAPSHOT_PREFIX + seed["order_id"]
+            ))
+            self.assertEqual(Decimal(snapshot["filled_base"]), Decimal("5"))
+            self.assertEqual(Decimal(snapshot["filled_quote"]), Decimal("500"))
+            self.assertEqual(grid_main._portfolio_wallet(bot.database)["btc_held"], 5.0)
+            exchange.price = Decimal("105")
+            bot.run_cycle()
+            self.assertEqual(
+                bot.database.get_state(grid_main.LAST_MARKET_PRICE_KEY), "105"
+            )
+            self.assertEqual(
+                grid_main._portfolio_wallet(bot.database)["unrealized_pnl"], 25.0
+            )
+
     def test_geometric_levels_and_buy_sell_cycle(self) -> None:
         self.assertEqual(
             geometric_levels(Decimal("100"), Decimal("80"), Decimal("10")),
