@@ -28,7 +28,7 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, FiniteFloat, StrictBool
+from pydantic import BaseModel, Field, FiniteFloat, StrictBool, StrictInt
 
 from database import GridDatabase
 from exchange_handler import config_path, create_exchange, load_config
@@ -123,6 +123,8 @@ class RecenterRequest(BaseModel):
     width_percentage: Optional[FiniteFloat] = Field(default=None, gt=0, lt=100)
     stop_loss_percentage: Optional[FiniteFloat] = Field(default=None, gt=0, lt=100)
     half_width_percentage: Optional[FiniteFloat] = Field(default=None, gt=0, lt=100)
+    allocated_capital: Optional[FiniteFloat] = Field(default=None, gt=0)
+    grid_levels: Optional[StrictInt] = Field(default=None, ge=2, le=2 * MAX_LEVELS)
 
 
 def _require_dashboard_origin(request: Request) -> None:
@@ -482,6 +484,14 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
 def recenter_grid(payload: RecenterRequest,
                   _: None = Depends(_require_dashboard_origin),
                   __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    if (payload.allocated_capital is None) != (payload.grid_levels is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide allocated_capital and grid_levels together.",
+        )
+    if (payload.allocated_capital is not None and
+            Decimal(str(payload.allocated_capital)) / payload.grid_levels < Decimal("7")):
+        raise HTTPException(status_code=422, detail="Order size must be at least 7 USDT.")
     new_format = (payload.width_percentage is not None or
                   payload.stop_loss_percentage is not None)
     if new_format:
@@ -511,7 +521,13 @@ def recenter_grid(payload: RecenterRequest,
         if requested_stop < bot.grid_configuration()[3]:
             raise HTTPException(status_code=400, detail=RISK_OVERRIDE_DENIED)
     try:
-        if stop_distance is None:
+        if payload.allocated_capital is not None:
+            lower, upper = bot.request_manual_recenter(
+                str(payload.center_price), str(width),
+                str(stop_distance) if stop_distance is not None else None,
+                str(payload.allocated_capital), payload.grid_levels,
+            )
+        elif stop_distance is None:
             lower, upper = bot.request_manual_recenter(str(payload.center_price), str(width))
         else:
             lower, upper = bot.request_manual_recenter(
@@ -564,6 +580,8 @@ class GridConfig:
     stop_loss_price: Decimal
     poll_seconds: int
     auto_center_percent: Optional[Decimal] = None
+    buy_grid_levels: Optional[int] = None
+    sell_grid_levels: Optional[int] = None
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "GridConfig":
@@ -609,6 +627,9 @@ class GridConfig:
             "initial_inventory_percent": str(self.initial_inventory_percent),
             "stop_loss_price": str(self.stop_loss_price),
         }
+        if self.buy_grid_levels is not None and self.sell_grid_levels is not None:
+            parameters["buy_grid_levels"] = self.buy_grid_levels
+            parameters["sell_grid_levels"] = self.sell_grid_levels
         encoded = json.dumps(parameters, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
@@ -622,6 +643,9 @@ class GridConfig:
             "spacing_percent": str(self.spacing_percent),
             "initial_inventory_percent": str(self.initial_inventory_percent),
         }
+        if self.buy_grid_levels is not None and self.sell_grid_levels is not None:
+            parameters["buy_grid_levels"] = self.buy_grid_levels
+            parameters["sell_grid_levels"] = self.sell_grid_levels
         encoded = json.dumps(parameters, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
@@ -656,6 +680,33 @@ def geometric_upper_levels(
     if not prices:
         raise ValueError("Bounds contain no upper sell level at this spacing.")
     return prices
+
+
+def exact_geometric_levels(
+    anchor: Decimal, bound: Decimal, count: int,
+) -> List[Decimal]:
+    """Fit an exact number of geometric levels from center to one bound."""
+    if not 1 <= count <= MAX_LEVELS or anchor <= 0 or bound <= 0 or anchor == bound:
+        raise ValueError("Exact grid geometry is invalid.")
+    ratio = (bound / anchor) ** (Decimal(1) / Decimal(count))
+    return [anchor * ratio ** index if index < count else bound
+            for index in range(1, count + 1)]
+
+
+def configured_grid_levels(
+    anchor: Decimal, config: GridConfig,
+) -> Tuple[List[Decimal], List[Decimal]]:
+    if config.buy_grid_levels is None and config.sell_grid_levels is None:
+        return (
+            geometric_levels(anchor, config.lower_price, config.spacing_percent),
+            geometric_upper_levels(anchor, config.upper_price, config.spacing_percent),
+        )
+    if config.buy_grid_levels is None or config.sell_grid_levels is None:
+        raise TradingHalt("Saved exact grid level counts are incomplete.")
+    return (
+        exact_geometric_levels(anchor, config.lower_price, config.buy_grid_levels),
+        exact_geometric_levels(anchor, config.upper_price, config.sell_grid_levels),
+    )
 
 
 def _fees_in_asset(order: Dict[str, Any], asset: str) -> Decimal:
@@ -984,8 +1035,12 @@ class GridBot:
                 "lower": str(new_config.lower_price),
                 "upper": str(new_config.upper_price),
                 "spacing": str(new_config.spacing_percent),
+                "investment_quote": str(new_config.investment_quote),
                 "stop_loss_price": str(stop_loss),
             }
+            if new_config.buy_grid_levels is not None:
+                active["buy_levels"] = new_config.buy_grid_levels
+                active["sell_levels"] = new_config.sell_grid_levels
             if self.high_water_mark is None:
                 raise TradingHalt("Trailing stop was not initialized.")
             distance = self.high_water_mark - stop_loss
@@ -1010,8 +1065,9 @@ class GridBot:
         price = self._ticker_price()
         if not lower < price < upper:
             raise ValueError("Current price must be inside the new bounds.")
-        geometric_levels(price, lower, RESET_SPACING_PERCENT)
-        geometric_upper_levels(price, upper, RESET_SPACING_PERCENT)
+        candidate = replace(self.config, lower_price=lower, upper_price=upper,
+                            spacing_percent=RESET_SPACING_PERCENT)
+        configured_grid_levels(price, candidate)
         with self._grid_lock:
             if self.stop_controller.stop_requested.is_set():
                 raise RuntimeError("Bot is stopping; grid was not changed.")
@@ -1025,7 +1081,9 @@ class GridBot:
             self.grid_needs_reset = True
 
     def request_manual_recenter(self, center_text: str, width_text: str,
-                                stop_distance_text: Optional[str] = None
+                                stop_distance_text: Optional[str] = None,
+                                allocated_capital_text: Optional[str] = None,
+                                grid_levels: Optional[int] = None,
                                 ) -> Tuple[Decimal, Decimal]:
         """Queue a persisted reset with explicit bounds and optional pause trigger."""
         center = _decimal(center_text, "center_price")
@@ -1034,6 +1092,21 @@ class GridBot:
             raise ValueError("Width must be below 100%.")
         width = width_percent / 100
         lower, upper = center * (1 - width), center * (1 + width)
+        if (allocated_capital_text is None) != (grid_levels is None):
+            raise ValueError("Allocated capital and grid levels must be supplied together.")
+        candidate = replace(self.config, lower_price=lower, upper_price=upper)
+        if allocated_capital_text is not None:
+            capital = _decimal(allocated_capital_text, "allocated_capital")
+            if (isinstance(grid_levels, bool) or not isinstance(grid_levels, int) or
+                    not 2 <= grid_levels <= 2 * MAX_LEVELS):
+                raise ValueError("Grid levels must be a whole number from 2 to 100.")
+            if capital / grid_levels < Decimal("7"):
+                raise ValueError("Order size must be at least 7 USDT.")
+            candidate = replace(
+                candidate, investment_quote=capital,
+                buy_grid_levels=(grid_levels + 1) // 2,
+                sell_grid_levels=grid_levels // 2,
+            )
         requested_stop = None
         if stop_distance_text is not None:
             stop_distance = _decimal(stop_distance_text, "stop_loss_percentage")
@@ -1050,7 +1123,7 @@ class GridBot:
                     if requested_stop is None:
                         raise ValueError("A new hard-stop price is required to reset liquidation.")
                     return self._restart_liquidated_run(
-                        center, width_percent, lower, upper, requested_stop
+                        center, width_percent, lower, upper, requested_stop, candidate
                     )
                 if self.is_paused:
                     raise TradingHalt("Release Safety Pause before re-anchoring the grid.")
@@ -1060,10 +1133,12 @@ class GridBot:
                     raise TradingHalt("No active grid run is available.")
                 if requested_stop is None and self.config.stop_loss_price >= lower:
                     raise ValueError("New lower bound must exceed the pause trigger.")
-                candidate_buys = geometric_levels(
-                    center, lower, self.config.spacing_percent
-                )
-                geometric_upper_levels(center, upper, self.config.spacing_percent)
+                candidate_buys, candidate_sells = configured_grid_levels(center, candidate)
+                self._validate_level_prices(center, candidate_buys, candidate_sells)
+                if allocated_capital_text is not None:
+                    self._validate_nominal_grid_sizes(
+                        candidate, center, candidate_buys, candidate_sells
+                    )
                 price = self._ticker_price()
                 self.advance_trailing_stop(price)
                 if (requested_stop is not None and
@@ -1074,7 +1149,7 @@ class GridBot:
                 planned_stop = requested_stop or self.config.stop_loss_price
                 if not any(self._price(raw) > planned_stop for raw in candidate_buys):
                     raise ValueError("Hard stop leaves no safe BUY grid level.")
-                ratio = 1 + self.config.spacing_percent / 100
+                ratio = max(center / candidate_buys[0], candidate_sells[0] / center)
                 if not center / ratio < price < center * ratio:
                     raise ValueError("Center must be close to the live market price.")
                 request = {
@@ -1083,7 +1158,11 @@ class GridBot:
                     "width_percent": str(width_percent),
                     "lower": str(lower), "upper": str(upper),
                     "spacing": str(self.config.spacing_percent),
+                    "investment_quote": str(candidate.investment_quote),
                 }
+                if candidate.buy_grid_levels is not None:
+                    request["buy_levels"] = candidate.buy_grid_levels
+                    request["sell_levels"] = candidate.sell_grid_levels
                 if requested_stop is not None:
                     request["stop_loss_price"] = str(requested_stop)
                 self.database.set_state("grid_reset", json.dumps(request, sort_keys=True))
@@ -1094,7 +1173,8 @@ class GridBot:
 
     def _restart_liquidated_run(self, center: Decimal, width_percent: Decimal,
                                 lower: Decimal, upper: Decimal,
-                                stop_loss: Decimal) -> Tuple[Decimal, Decimal]:
+                                stop_loss: Decimal, candidate: GridConfig,
+                                ) -> Tuple[Decimal, Decimal]:
         """Only an authenticated recenter may release a completed hard stop."""
         state_text = self.database.get_state(LIQUIDATION_KEY)
         if not state_text or json.loads(state_text).get("phase") != "complete":
@@ -1104,25 +1184,35 @@ class GridBot:
         if self.database.fetch_active_grids():
             raise TradingHalt("Tracked orders remain active; cannot reset liquidation.")
         price = self._ticker_price()
-        ratio = 1 + self.config.spacing_percent / 100
+        candidate_buys, candidate_sells = configured_grid_levels(center, candidate)
+        if candidate.buy_grid_levels is not None:
+            self._validate_level_prices(center, candidate_buys, candidate_sells)
+        ratio = max(center / candidate_buys[0], candidate_sells[0] / center)
         if not center / ratio < price < center * ratio:
             raise ValueError("Center must be close to the live market price.")
         if not stop_loss < lower < price < upper:
             raise ValueError("New hard stop and bounds must contain the live price.")
-        new_config = replace(self.config, lower_price=lower, upper_price=upper,
-                             stop_loss_price=stop_loss)
+        new_config = replace(candidate, stop_loss_price=stop_loss)
         lowers, uppers = self._validate_reset_grid(new_config, center, Decimal(0))
         baseline = self._free_balance(self.market["base"])
         run = {"anchor": str(center), "baseline_base": str(baseline),
                "fingerprint": new_config.fingerprint()}
         active = {"lower": str(lower), "upper": str(upper),
                   "spacing": str(new_config.spacing_percent),
+                  "investment_quote": str(new_config.investment_quote),
                   "stop_loss_price": str(stop_loss)}
+        if new_config.buy_grid_levels is not None:
+            active["buy_levels"] = new_config.buy_grid_levels
+            active["sell_levels"] = new_config.sell_grid_levels
         trailing = {"high_water_mark": str(center),
                     "stop_loss_distance": str(center - stop_loss)}
         request = {"phase": "placing", "source": "manual_liquidation_reset",
                    "lower": str(lower), "upper": str(upper),
-                   "spacing": str(new_config.spacing_percent)}
+                   "spacing": str(new_config.spacing_percent),
+                   "investment_quote": str(new_config.investment_quote)}
+        if new_config.buy_grid_levels is not None:
+            request["buy_levels"] = new_config.buy_grid_levels
+            request["sell_levels"] = new_config.sell_grid_levels
         self.database.complete_grid_reset(
             json.dumps(run, sort_keys=True), json.dumps(active, sort_keys=True),
             json.dumps(request, sort_keys=True),
@@ -1151,8 +1241,13 @@ class GridBot:
         upper = price * (1 + width)
         if not lower < price < upper or self.config.stop_loss_price >= price:
             raise TradingHalt("Breakout bounds would violate the hard stop.")
-        lowers = geometric_levels(price, lower, self.config.spacing_percent)
-        geometric_upper_levels(price, upper, self.config.spacing_percent)
+        candidate = replace(self.config, lower_price=lower, upper_price=upper)
+        lowers, _ = configured_grid_levels(price, candidate)
+        if candidate.buy_grid_levels is not None and any(
+                self._price(raw) <= candidate.stop_loss_price for raw in lowers):
+            raise TradingHalt(
+                "Trailing stop would remove requested BUY levels from the exact grid."
+            )
         if not any(self._price(raw) > self.config.stop_loss_price for raw in lowers):
             raise TradingHalt("Trailing stop leaves no safe BUY grid level.")
         with self._grid_lock:
@@ -1239,8 +1334,12 @@ class GridBot:
                 "lower": str(new_config.lower_price),
                 "upper": str(new_config.upper_price),
                 "spacing": str(new_config.spacing_percent),
+                "investment_quote": str(new_config.investment_quote),
                 "stop_loss_price": str(new_stop),
             }
+            if new_config.buy_grid_levels is not None:
+                active["buy_levels"] = new_config.buy_grid_levels
+                active["sell_levels"] = new_config.sell_grid_levels
             trailing = {
                 "high_water_mark": str(price),
                 "stop_loss_distance": str(self.stop_loss_distance),
@@ -1316,12 +1415,9 @@ class GridBot:
                     "high_water_mark": str(self.high_water_mark),
                     "stop_loss_distance": str(self.stop_loss_distance),
                 }, sort_keys=True))
-        self.levels = geometric_levels(
-            self.anchor, self.config.lower_price, self.config.spacing_percent
-        )
-        self.upper_levels = geometric_upper_levels(
-            self.anchor, self.config.upper_price, self.config.spacing_percent
-        )
+        self.levels, self.upper_levels = configured_grid_levels(self.anchor, self.config)
+        if self.config.buy_grid_levels is not None:
+            self._validate_level_prices(self.anchor, self.levels, self.upper_levels)
         seed_quote = self._seed_quote()
         quote_per_level = self._lower_quote_per_level()
         seed_amount = self._amount(seed_quote / current_price)
@@ -1380,6 +1476,34 @@ class GridBot:
             raise ValueError("Order amount is below the market minimum.")
         if cost_min is not None and price * amount < _order_decimal(cost_min):
             raise ValueError("Order notional is below the market minimum.")
+
+    def _validate_level_prices(
+        self, center: Decimal, buys: List[Decimal], sells: List[Decimal],
+    ) -> None:
+        """Reject exact levels that collapse onto one exchange price tick."""
+        buy_prices = [self._price(price) for price in buys]
+        sell_prices = [self._price(price) for price in sells]
+        if (len(set(buy_prices)) != len(buy_prices) or
+                len(set(sell_prices)) != len(sell_prices) or
+                any(price >= center for price in buy_prices) or
+                any(price <= center for price in sell_prices)):
+            raise ValueError("Requested grid levels collapse at exchange price precision.")
+
+    def _validate_nominal_grid_sizes(
+        self, config: GridConfig, center: Decimal,
+        buys: List[Decimal], sells: List[Decimal],
+    ) -> None:
+        """Check new allocation against actual per-side exchange minimums before canceling."""
+        seed_quote = config.investment_quote * config.initial_inventory_percent / 100
+        self._check_order_size(center, self._amount(seed_quote / center))
+        lower_quote = (config.investment_quote - seed_quote) / len(buys)
+        for raw in buys:
+            price = self._price(raw)
+            self._check_order_size(price, self._amount(lower_quote / price))
+        upper_total = self._amount(seed_quote / center)
+        upper_amount = self._amount(upper_total * (1 - SELL_AMOUNT_BUFFER) / len(sells))
+        for raw in sells:
+            self._check_order_size(self._price(raw), upper_amount)
 
     def _fetch_order(self, row: Dict[str, Any]) -> Dict[str, Any]:
         carry_text = self.database.get_state("carry_inventory")
@@ -1704,10 +1828,13 @@ class GridBot:
 
     def _validate_reset_grid(self, new_config: GridConfig, price: Decimal,
                              carry_amount: Decimal) -> Tuple[List[Decimal], List[Decimal]]:
-        lowers = geometric_levels(price, new_config.lower_price,
-                                  new_config.spacing_percent)
-        uppers = geometric_upper_levels(price, new_config.upper_price,
-                                        new_config.spacing_percent)
+        lowers, uppers = configured_grid_levels(price, new_config)
+        if new_config.buy_grid_levels is not None:
+            self._validate_level_prices(price, lowers, uppers)
+            if any(self._price(raw) <= new_config.stop_loss_price for raw in lowers):
+                raise TradingHalt(
+                    "Trailing stop would remove requested BUY levels from the exact grid."
+                )
         if not any(self._price(raw) > new_config.stop_loss_price for raw in lowers):
             raise TradingHalt("Trailing stop leaves no safe BUY grid level.")
         seed_quote = new_config.investment_quote * new_config.initial_inventory_percent / 100
@@ -1759,7 +1886,15 @@ class GridBot:
                     return False
             if request.get("source") == "manual_recenter":
                 center = Decimal(request["center_price"])
-                ratio = 1 + Decimal(request["spacing"]) / 100
+                candidate = replace(
+                    self.config,
+                    lower_price=Decimal(request["lower"]),
+                    upper_price=Decimal(request["upper"]),
+                    buy_grid_levels=request.get("buy_levels", self.config.buy_grid_levels),
+                    sell_grid_levels=request.get("sell_levels", self.config.sell_grid_levels),
+                )
+                buys, sells = configured_grid_levels(center, candidate)
+                ratio = max(center / buys[0], sells[0] / center)
                 if not center / ratio < self._ticker_price() < center * ratio:
                     self.database.clear_state("grid_reset")
                     self.pending_grid_bounds = None
@@ -1793,13 +1928,28 @@ class GridBot:
             anchor = price
             if request.get("source") == "manual_recenter":
                 center = Decimal(request["center_price"])
-                ratio = 1 + Decimal(request["spacing"]) / 100
+                candidate = replace(
+                    self.config,
+                    lower_price=Decimal(request["lower"]),
+                    upper_price=Decimal(request["upper"]),
+                    buy_grid_levels=request.get("buy_levels", self.config.buy_grid_levels),
+                    sell_grid_levels=request.get("sell_levels", self.config.sell_grid_levels),
+                )
+                buys, sells = configured_grid_levels(center, candidate)
+                ratio = max(center / buys[0], sells[0] / center)
                 if center / ratio < price < center * ratio:
                     anchor = center
                 elif self.config.lower_price < price < self.config.upper_price:
                     request["source"] = "manual_stale"
                     request["lower"] = str(self.config.lower_price)
                     request["upper"] = str(self.config.upper_price)
+                    request["investment_quote"] = str(self.config.investment_quote)
+                    if self.config.buy_grid_levels is None:
+                        request.pop("buy_levels", None)
+                        request.pop("sell_levels", None)
+                    else:
+                        request["buy_levels"] = self.config.buy_grid_levels
+                        request["sell_levels"] = self.config.sell_grid_levels
                     LOGGER.warning("Manual recenter drifted during cancellation; rebuilding old bounds.")
                 else:
                     raise TradingHalt(
@@ -1813,6 +1963,12 @@ class GridBot:
             new_config = replace(self.config, lower_price=Decimal(request["lower"]),
                                  upper_price=Decimal(request["upper"]),
                                  spacing_percent=Decimal(request["spacing"]),
+                                 investment_quote=Decimal(request.get(
+                                     "investment_quote", str(self.config.investment_quote))),
+                                 buy_grid_levels=request.get(
+                                     "buy_levels", self.config.buy_grid_levels),
+                                 sell_grid_levels=request.get(
+                                     "sell_levels", self.config.sell_grid_levels),
                                  stop_loss_price=stop_loss)
             if new_config.stop_loss_price >= anchor:
                 raise TradingHalt("New grid anchor is at or below the hard stop.")
@@ -1826,7 +1982,11 @@ class GridBot:
                      "fingerprint": new_config.fingerprint()}
             active = {"lower": request["lower"], "upper": request["upper"],
                       "spacing": request["spacing"],
+                      "investment_quote": str(new_config.investment_quote),
                       "stop_loss_price": str(new_config.stop_loss_price)}
+            if new_config.buy_grid_levels is not None:
+                active["buy_levels"] = new_config.buy_grid_levels
+                active["sell_levels"] = new_config.sell_grid_levels
             trailing = None
             if request.get("source") == "manual_recenter":
                 trailing = {
@@ -2531,6 +2691,9 @@ def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> Gri
         lower_price=Decimal(active["lower"]),
         upper_price=Decimal(active["upper"]),
         spacing_percent=Decimal(active["spacing"]),
+        investment_quote=Decimal(active.get("investment_quote", str(config.investment_quote))),
+        buy_grid_levels=active.get("buy_levels", config.buy_grid_levels),
+        sell_grid_levels=active.get("sell_levels", config.sell_grid_levels),
         stop_loss_price=Decimal(
             active.get("stop_loss_price", str(config.stop_loss_price))
         ),

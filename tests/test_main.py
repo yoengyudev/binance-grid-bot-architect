@@ -1043,6 +1043,82 @@ class GridBotTests(unittest.TestCase):
             reopened.prepare(persist=False)
             self.assertEqual(reopened.high_water_mark, Decimal("102"))
 
+    def test_manual_recenter_places_exact_requested_levels_and_restores_allocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            original_config = bot.config
+            bot.run_cycle()
+            bot.run_cycle()
+
+            bot.request_manual_recenter("102", "20", "30", "1500", 15)
+            queued = json.loads(bot.database.get_state("grid_reset"))
+            self.assertEqual((queued["buy_levels"], queued["sell_levels"]), (8, 7))
+            self.assertEqual(queued["investment_quote"], "1500")
+            self.assertTrue(bot.reset_grid())
+            self.assertEqual((len(bot.levels), len(bot.upper_levels)), (8, 7))
+            self.assertEqual(bot.levels[-1], Decimal("81.6"))
+            self.assertEqual(bot.upper_levels[-1], Decimal("122.4"))
+            for levels in (bot.levels, bot.upper_levels):
+                ratios = [levels[index] / (Decimal("102") if index == 0 else levels[index - 1])
+                          for index in range(len(levels))]
+                self.assertLess(max(ratios) - min(ratios), Decimal("0.000000001"))
+            self.assertEqual(bot.config.investment_quote, Decimal("1500"))
+            self.assertEqual(
+                len([row for row in exchange.fetch_open_orders("BTC/USDT")
+                     if row["side"] == "buy"]), 8,
+            )
+            self.assertEqual(
+                len([row for row in exchange.fetch_open_orders("BTC/USDT")
+                     if row["side"] == "sell"]), 7,
+            )
+
+            restored = _apply_active_grid_config(original_config, GridDatabase(path))
+            self.assertEqual(restored.investment_quote, Decimal("1500"))
+            self.assertEqual((restored.buy_grid_levels, restored.sell_grid_levels), (8, 7))
+            reopened = GridBot(restored, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            self.assertEqual((len(reopened.levels), len(reopened.upper_levels)), (8, 7))
+
+    def test_exact_grid_rejects_exchange_minimum_before_canceling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            with self.assertRaisesRegex(ValueError, "market minimum"):
+                bot.request_manual_recenter("102", "20", "30", "100", 14)
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            self.assertEqual(exchange.cancel_calls, [])
+
+    def test_exact_grid_rejects_duplicate_exchange_price_ticks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            with self.assertRaisesRegex(ValueError, "price precision"):
+                bot.request_manual_recenter("100", "0.001", "30", "1500", 14)
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            self.assertEqual(exchange.cancel_calls, [])
+
+    def test_stale_exact_recenter_restores_old_capital_and_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.request_manual_recenter("102", "20", "30", "1500", 15)
+            original_cancel = exchange.cancel_order
+
+            def cancel_and_drift(order_id, symbol, params=None):
+                response = original_cancel(order_id, symbol, params)
+                exchange.price = Decimal("90")
+                return response
+
+            exchange.cancel_order = cancel_and_drift
+            self.assertTrue(bot.reset_grid())
+            self.assertEqual(bot.config.investment_quote, Decimal("1000"))
+            self.assertIsNone(bot.config.buy_grid_levels)
+            self.assertIsNone(bot.config.sell_grid_levels)
+
     def test_manual_recenter_cannot_lower_active_trailing_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")

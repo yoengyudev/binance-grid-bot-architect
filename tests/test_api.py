@@ -504,6 +504,16 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                         {"center_price": 82000, "stop_loss_percentage": 25},
                         {"center_price": 82000, "width_percentage": 15,
                          "stop_loss_percentage": 25, "half_width_percentage": 15},
+                        {"center_price": 82000, "width_percentage": 15,
+                         "stop_loss_percentage": 25, "allocated_capital": 100},
+                        {"center_price": 82000, "width_percentage": 15,
+                         "stop_loss_percentage": 25, "grid_levels": 14},
+                        {"center_price": 82000, "width_percentage": 15,
+                         "stop_loss_percentage": 25, "allocated_capital": 90,
+                         "grid_levels": 14},
+                        {"center_price": 82000, "width_percentage": 15,
+                         "stop_loss_percentage": 25, "allocated_capital": 1000,
+                         "grid_levels": 14.5},
                     ):
                         self.assertEqual((await client.post(
                             "/api/bot/grid/recenter", json=bad, headers=origin
@@ -515,6 +525,17 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(accepted_new.status_code, 202)
                     self.assertEqual(calls[-1], ("82000.0", "15.0", "25.0"))
+                    accepted_exact = await client.post(
+                        "/api/bot/grid/recenter",
+                        json={"center_price": 82000, "width_percentage": 15,
+                              "stop_loss_percentage": 25,
+                              "allocated_capital": 1000, "grid_levels": 14},
+                        headers=origin,
+                    )
+                    self.assertEqual(accepted_exact.status_code, 202)
+                    self.assertEqual(calls[-1], (
+                        "82000.0", "15.0", "25.0", "1000.0", 14,
+                    ))
             finally:
                 grid_main.app.state.grid_bot = None
 
