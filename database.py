@@ -318,7 +318,8 @@ class GridDatabase:
                             placing_request: str, *, carry_order_id: Optional[str] = None,
                             carry_price: Optional[str] = None,
                             carry_amount: Optional[str] = None,
-                            carry_cost: Optional[str] = None) -> None:
+                            carry_cost: Optional[str] = None,
+                            breakout_width_percent: Optional[str] = None) -> None:
         """Archive old lanes and switch runs in one SQLite transaction."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -343,14 +344,17 @@ class GridDatabase:
                     "VALUES (?, 'MARKET', 0, 'BUY', ?, ?, 'FILLED')",
                     (carry_order_id, carry_price, carry_amount),
                 )
-            for key, value in (
+            states = [
                 ("grid_run", grid_run),
                 ("active_grid_config", active_config),
                 ("grid_reset", placing_request),
                 ("carry_inventory", json.dumps({
                     "order_id": carry_order_id, "cost": carry_cost,
                 })),
-            ):
+            ]
+            if breakout_width_percent is not None:
+                states.append(("breakout_width_percent", breakout_width_percent))
+            for key, value in states:
                 connection.execute(
                     "INSERT INTO bot_state (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",

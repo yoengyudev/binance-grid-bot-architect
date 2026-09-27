@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import ccxt
 import jwt
@@ -25,7 +26,7 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, StrictBool
+from pydantic import BaseModel, Field, FiniteFloat, StrictBool
 
 from database import GridDatabase
 from exchange_handler import config_path, create_exchange, load_config
@@ -54,14 +55,34 @@ JWT_ALGORITHM = "HS256"
 JWT_ISSUER = "grid-bot"
 JWT_AUDIENCE = "grid-dashboard"
 JWT_LIFETIME_SECONDS = 15 * 60
+JWT_REFRESH_GRACE_SECONDS = 60
 AUTH_COOKIE_NAME = "__Host-grid_admin_session"
-DASHBOARD_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
+load_dotenv(dotenv_path=BASE_DIR / ".env")
+
+
+def _configured_frontend_origin() -> str:
+    value = os.getenv("FRONTEND_URL", "http://localhost:5173").strip()
+    parsed = urlsplit(value)
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname or
+            parsed.username or parsed.password or parsed.path not in ("", "/") or
+            parsed.query or parsed.fragment or "*" in value):
+        raise ValueError("FRONTEND_URL must be one exact HTTP(S) origin.")
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError("FRONTEND_URL has an invalid port.") from error
+    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1"):
+        raise ValueError("A non-local FRONTEND_URL must use HTTPS.")
+    return value.rstrip("/")
+
+
+FRONTEND_ORIGIN = _configured_frontend_origin()
 OpenOrderEntry = Tuple[Optional[Decimal], Optional[Decimal]]
 
 app = FastAPI(title="Grid Bot Status API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(DASHBOARD_ORIGINS),
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
@@ -78,9 +99,14 @@ class PauseRequest(BaseModel):
     active: StrictBool
 
 
+class RecenterRequest(BaseModel):
+    center_price: FiniteFloat = Field(gt=0)
+    half_width_percentage: FiniteFloat = Field(gt=0, lt=100)
+
+
 def _require_dashboard_origin(request: Request) -> None:
     """Cookie-authenticated writes must come from the trusted dashboard origin."""
-    if request.headers.get("origin") not in DASHBOARD_ORIGINS:
+    if request.headers.get("origin") != FRONTEND_ORIGIN:
         raise HTTPException(status_code=403, detail="Untrusted dashboard origin.")
 
 
@@ -98,15 +124,7 @@ def _auth_configuration() -> Tuple[str, str]:
     )
 
 
-@app.post("/api/auth/login")
-def login(request: LoginRequest, response: Response,
-          _: None = Depends(_require_dashboard_origin)) -> Dict[str, Any]:
-    password, secret = _auth_configuration()
-    if not hmac.compare_digest(request.password, password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials.",
-        )
+def _issue_admin_cookie(response: Response, secret: str) -> None:
     now = datetime.now(timezone.utc)
     token = jwt.encode(
         {
@@ -121,14 +139,26 @@ def login(request: LoginRequest, response: Response,
         algorithm=JWT_ALGORITHM,
     )
     response.set_cookie(
-        key=AUTH_COOKIE_NAME, value=token, max_age=JWT_LIFETIME_SECONDS,
+        key=AUTH_COOKIE_NAME, value=token,
+        max_age=JWT_LIFETIME_SECONDS + JWT_REFRESH_GRACE_SECONDS,
         path="/", secure=True, httponly=True, samesite="strict",
     )
+
+
+@app.post("/api/auth/login")
+def login(request: LoginRequest, response: Response,
+          _: None = Depends(_require_dashboard_origin)) -> Dict[str, Any]:
+    password, secret = _auth_configuration()
+    if not hmac.compare_digest(request.password, password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials.",
+        )
+    _issue_admin_cookie(response, secret)
     return {"authenticated": True, "expires_in": JWT_LIFETIME_SECONDS}
 
 
-def get_current_user(request: Request) -> str:
-    """Validate the admin JWT from its HttpOnly host cookie."""
+def _decode_admin_cookie(request: Request, *, refresh: bool = False) -> str:
     unauthorized = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired token.",
@@ -144,6 +174,7 @@ def get_current_user(request: Request) -> str:
             algorithms=[JWT_ALGORITHM],
             audience=JWT_AUDIENCE,
             issuer=JWT_ISSUER,
+            leeway=JWT_REFRESH_GRACE_SECONDS if refresh else 0,
             options={"require": ["sub", "iss", "aud", "iat", "nbf", "exp"]},
         )
     except (jwt.InvalidTokenError, HTTPException):
@@ -151,6 +182,20 @@ def get_current_user(request: Request) -> str:
     if claims.get("sub") != "admin":
         raise unauthorized
     return "admin"
+
+
+def get_current_user(request: Request) -> str:
+    """Require a currently valid admin JWT for control endpoints."""
+    return _decode_admin_cookie(request)
+
+
+@app.post("/api/auth/refresh")
+def refresh_session(request: Request, response: Response,
+                    _: None = Depends(_require_dashboard_origin)) -> Dict[str, Any]:
+    _decode_admin_cookie(request, refresh=True)
+    _, secret = _auth_configuration()
+    _issue_admin_cookie(response, secret)
+    return {"authenticated": True, "expires_in": JWT_LIFETIME_SECONDS}
 
 
 @app.get("/api/auth/me")
@@ -283,6 +328,28 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
         LOGGER.exception("Manual safety pause could not finish.")
         raise HTTPException(status_code=502, detail="Exchange pause update failed; state remains paused.") from error
     return {"safety_pause": "Active" if mode else "Normal", "mode": mode}
+
+
+@app.post("/api/bot/grid/recenter", status_code=202)
+def recenter_grid(payload: RecenterRequest,
+                  _: None = Depends(_require_dashboard_origin),
+                  __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    bot = app.state.grid_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="The trading bot is offline.")
+    try:
+        lower, upper = bot.request_manual_recenter(
+            str(payload.center_price), str(payload.half_width_percentage)
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except TradingHalt as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (ccxt.BaseError, OSError, RuntimeError) as error:
+        LOGGER.exception("Manual grid recenter request failed.")
+        raise HTTPException(status_code=502, detail="Could not queue the grid reset.") from error
+    return {"status": "queued", "lower_bound": float(lower),
+            "upper_bound": float(upper)}
 
 
 class TradingHalt(RuntimeError):
@@ -632,6 +699,48 @@ class GridBot:
             self.database.set_state("grid_reset", json.dumps(request))
             self.pending_grid_bounds = (lower, upper)
             self.grid_needs_reset = True
+
+    def request_manual_recenter(self, center_text: str,
+                                width_text: str) -> Tuple[Decimal, Decimal]:
+        """Queue the normal persisted reset with an explicit center and width."""
+        center = _decimal(center_text, "center_price")
+        width_percent = _decimal(width_text, "half_width_percentage")
+        if width_percent >= 100:
+            raise ValueError("Width must be below 100%.")
+        width = width_percent / 100
+        lower, upper = center * (1 - width), center * (1 + width)
+        with self._cycle_lock:
+            with self._grid_lock:
+                if self.stop_controller.stop_requested.is_set():
+                    raise TradingHalt("Bot is stopping; grid was not changed.")
+                if self.is_paused:
+                    raise TradingHalt("Release Safety Pause before re-anchoring the grid.")
+                if self.grid_needs_reset or self.database.get_state("grid_reset"):
+                    raise TradingHalt("A grid reset is already in progress.")
+                if self.database.get_state("grid_run") is None:
+                    raise TradingHalt("No active grid run is available.")
+                if self.config.stop_loss_price >= lower:
+                    raise ValueError("New lower bound must exceed the pause trigger.")
+                geometric_levels(center, lower, self.config.spacing_percent)
+                geometric_upper_levels(center, upper, self.config.spacing_percent)
+                price = self._ticker_price()
+                if price <= self.config.stop_loss_price:
+                    raise TradingHalt("Market is at the pause trigger; recentering is unavailable.")
+                ratio = 1 + self.config.spacing_percent / 100
+                if not center / ratio < price < center * ratio:
+                    raise ValueError("Center must be close to the live market price.")
+                request = {
+                    "phase": "canceling", "source": "manual_recenter",
+                    "center_price": str(center),
+                    "width_percent": str(width_percent),
+                    "lower": str(lower), "upper": str(upper),
+                    "spacing": str(self.config.spacing_percent),
+                }
+                self.database.set_state("grid_reset", json.dumps(request, sort_keys=True))
+                self.database.clear_state(BREAKOUT_TIMER_KEY)
+                self.pending_grid_bounds = (lower, upper)
+                self.grid_needs_reset = True
+                return lower, upper
 
     def _request_breakout_reset(self, price: Decimal) -> None:
         """Persist a reset intent before any order cancellation can begin."""
@@ -1160,6 +1269,15 @@ class GridBot:
                     self.grid_needs_reset = False
                     LOGGER.info("Breakout faded before cancellation; grid reset withdrawn.")
                     return False
+            if request.get("source") == "manual_recenter":
+                center = Decimal(request["center_price"])
+                ratio = 1 + Decimal(request["spacing"]) / 100
+                if not center / ratio < self._ticker_price() < center * ratio:
+                    self.database.clear_state("grid_reset")
+                    self.pending_grid_bounds = None
+                    self.grid_needs_reset = False
+                    LOGGER.info("Manual recenter withdrawn because market moved away.")
+                    return False
             canceled = self.stop_controller.cancel_tracked_orders()
             if canceled.unresolved or self.database.fetch_active_grids():
                 raise TradingHalt("Old grid cancellation could not be verified.")
@@ -1183,6 +1301,21 @@ class GridBot:
                     width = Decimal(request["width_percent"]) / 100
                     request["lower"] = str(price * (1 - width))
                     request["upper"] = str(price * (1 + width))
+            anchor = price
+            if request.get("source") == "manual_recenter":
+                center = Decimal(request["center_price"])
+                ratio = 1 + Decimal(request["spacing"]) / 100
+                if center / ratio < price < center * ratio:
+                    anchor = center
+                elif self.config.lower_price < price < self.config.upper_price:
+                    request["source"] = "manual_stale"
+                    request["lower"] = str(self.config.lower_price)
+                    request["upper"] = str(self.config.upper_price)
+                    LOGGER.warning("Manual recenter drifted during cancellation; rebuilding old bounds.")
+                else:
+                    raise TradingHalt(
+                        "Market left both grids during cancellation; inspect orders before restart."
+                    )
             new_config = replace(self.config, lower_price=Decimal(request["lower"]),
                                  upper_price=Decimal(request["upper"]),
                                  spacing_percent=Decimal(request["spacing"]))
@@ -1190,11 +1323,11 @@ class GridBot:
                 raise TradingHalt("New grid lower bound is below the pause trigger.")
             if not new_config.lower_price < price < new_config.upper_price:
                 raise TradingHalt("Price left the requested bounds during reset.")
-            lowers, uppers = self._validate_reset_grid(new_config, price, carry_amount)
+            lowers, uppers = self._validate_reset_grid(new_config, anchor, carry_amount)
             baseline = self._free_balance(self.market["base"]) - carry_amount
             if baseline < 0:
                 raise TradingHalt("Carried BTC exceeds the account balance.")
-            state = {"anchor": str(price), "baseline_base": str(baseline),
+            state = {"anchor": str(anchor), "baseline_base": str(baseline),
                      "fingerprint": new_config.fingerprint()}
             active = {"lower": request["lower"], "upper": request["upper"],
                       "spacing": request["spacing"],
@@ -1207,12 +1340,17 @@ class GridBot:
                 carry_price=str(carry_cost / carry_amount) if carry_id else None,
                 carry_amount=str(carry_amount) if carry_id else None,
                 carry_cost=str(carry_cost) if carry_id else None,
+                breakout_width_percent=(request["width_percent"]
+                                        if request.get("source") == "manual_recenter"
+                                        else None),
             )
             with self._grid_lock:
                 self.config = new_config
-                self.anchor = price
+                self.anchor = anchor
                 self.baseline_base = baseline
                 self.levels, self.upper_levels = lowers, uppers
+                if request.get("source") == "manual_recenter":
+                    self.breakout_width_percent = Decimal(request["width_percent"])
         elif request["phase"] != "placing":
             raise TradingHalt("Unknown grid reset phase.")
         for _ in range(3):

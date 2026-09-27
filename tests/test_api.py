@@ -1,5 +1,7 @@
 import asyncio
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -162,7 +164,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 preflight = await auth_client.options(
                     "/api/auth/login",
                     headers={
-                        "Origin": "http://127.0.0.1:5173",
+                        "Origin": "http://localhost:5173",
                         "Access-Control-Request-Method": "POST",
                         "Access-Control-Request-Headers": "content-type",
                     },
@@ -170,7 +172,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(preflight.status_code, 200)
                 self.assertEqual(
                     preflight.headers["access-control-allow-origin"],
-                    "http://127.0.0.1:5173",
+                    "http://localhost:5173",
                 )
                 self.assertEqual(
                     preflight.headers["access-control-allow-credentials"], "true"
@@ -181,6 +183,16 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(signed_out.status_code, 200)
                 self.assertEqual((await auth_client.get("/api/auth/me")).status_code, 401)
+                other_local_origin = await auth_client.options(
+                    "/api/auth/login",
+                    headers={
+                        "Origin": "http://127.0.0.1:5173",
+                        "Access-Control-Request-Method": "POST",
+                    },
+                )
+                self.assertNotIn(
+                    "access-control-allow-origin", other_local_origin.headers
+                )
                 blocked_origin = await auth_client.options(
                     "/api/auth/login",
                     headers={
@@ -191,6 +203,75 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(
                     "access-control-allow-origin", blocked_origin.headers
                 )
+
+    async def test_frontend_origin_is_one_valid_environment_origin(self) -> None:
+        with patch.dict(os.environ, {"FRONTEND_URL": "https://dashboard.example.test"}):
+            self.assertEqual(
+                grid_main._configured_frontend_origin(),
+                "https://dashboard.example.test",
+            )
+        for invalid in ("*", "https://*.example.test", "https://example.test/path",
+                        "https://example.test,https://other.test", "ftp://example.test",
+                        "http://example.test"):
+            with patch.dict(os.environ, {"FRONTEND_URL": invalid}):
+                with self.assertRaises(ValueError):
+                    grid_main._configured_frontend_origin()
+        environment = dict(os.environ, FRONTEND_URL="https://dashboard.example.test")
+        loaded = subprocess.run(
+            [sys.executable, "-c", "import main; print(main.FRONTEND_ORIGIN); "
+             "print(main.app.user_middleware[0].kwargs['allow_origins'])"],
+            cwd=Path(grid_main.__file__).parent,
+            env=environment, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(loaded.stdout.splitlines(), [
+            "https://dashboard.example.test",
+            "['https://dashboard.example.test']",
+        ])
+
+    async def test_refresh_rotates_cookie_and_limits_expired_grace(self) -> None:
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "",
+            "BOT_JWT_SECRET": "",
+            "BOT_AUTH_MOCK_ENABLED": "1",
+        }):
+            grid_main.app.state.grid_bot = None
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=grid_main.app),
+                base_url="https://testserver",
+            ) as client:
+                origin = {"Origin": "http://localhost:5173"}
+                self.assertEqual((await client.post(
+                    "/api/auth/refresh", headers=origin
+                )).status_code, 401)
+                await client.post(
+                    "/api/auth/login", json={"password": "admin123"}, headers=origin
+                )
+                refreshed = await client.post("/api/auth/refresh", headers=origin)
+                self.assertEqual(refreshed.status_code, 200)
+                self.assertEqual(refreshed.json()["expires_in"], 900)
+                self.assertIn("max-age=960", refreshed.headers["set-cookie"].lower())
+                self.assertEqual((await client.get("/api/auth/me")).status_code, 200)
+                now = datetime.now(timezone.utc)
+                def signed_cookie(age_seconds: int) -> str:
+                    return jwt.encode({
+                        "sub": "admin", "iss": grid_main.JWT_ISSUER,
+                        "aud": grid_main.JWT_AUDIENCE,
+                        "iat": now - timedelta(minutes=15),
+                        "nbf": now - timedelta(minutes=15),
+                        "exp": now - timedelta(seconds=age_seconds),
+                    }, grid_main.app.state.preview_jwt_secret, algorithm="HS256")
+                client.cookies.set(grid_main.AUTH_COOKIE_NAME, signed_cookie(30))
+                self.assertEqual((await client.get("/api/auth/me")).status_code, 401)
+                self.assertEqual((await client.post(
+                    "/api/auth/refresh", headers=origin
+                )).status_code, 200)
+                client.cookies.set(grid_main.AUTH_COOKIE_NAME, signed_cookie(120))
+                self.assertEqual((await client.post(
+                    "/api/auth/refresh", headers=origin
+                )).status_code, 401)
+                self.assertEqual((await client.post(
+                    "/api/auth/refresh", headers={"Origin": "https://other.test"}
+                )).status_code, 403)
 
     async def test_live_bot_never_uses_mock_password(self) -> None:
         with patch.dict(os.environ, {
@@ -285,6 +366,56 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                         "safety_pause": "Normal", "mode": None,
                     })
                     self.assertEqual(calls, [True, False])
+            finally:
+                grid_main.app.state.grid_bot = None
+
+    async def test_recenter_endpoint_authenticates_and_queues_only(self) -> None:
+        calls = []
+        bot = SimpleNamespace(request_manual_recenter=lambda center, width: (
+            calls.append((center, width)) or ("76000", "88000")
+        ))
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+            "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+        }):
+            grid_main.app.state.grid_bot = bot
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    origin = {"Origin": "http://localhost:5173"}
+                    payload = {"center_price": 82000.0,
+                               "half_width_percentage": 15.0}
+                    self.assertEqual((await client.post(
+                        "/api/bot/grid/recenter", json=payload, headers=origin
+                    )).status_code, 401)
+                    await client.post(
+                        "/api/auth/login", json={"password": "unique-private-admin-password"},
+                        headers=origin,
+                    )
+                    self.assertEqual((await client.post(
+                        "/api/bot/grid/recenter", json=payload,
+                        headers={"Origin": "https://other.test"}
+                    )).status_code, 403)
+                    for bad in (
+                        {"center_price": -1, "half_width_percentage": 15},
+                        {"center_price": 82000, "half_width_percentage": 100},
+                        {"center_price": 82000, "half_width_percentage": "nan"},
+                    ):
+                        self.assertEqual((await client.post(
+                            "/api/bot/grid/recenter", json=bad, headers=origin
+                        )).status_code, 422)
+                    self.assertEqual(calls, [])
+                    accepted = await client.post(
+                        "/api/bot/grid/recenter", json=payload, headers=origin
+                    )
+                    self.assertEqual(accepted.status_code, 202)
+                    self.assertEqual(accepted.json(), {
+                        "status": "queued", "lower_bound": 76000.0,
+                        "upper_bound": 88000.0,
+                    })
+                    self.assertEqual(calls, [("82000.0", "15.0")])
             finally:
                 grid_main.app.state.grid_bot = None
 

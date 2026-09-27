@@ -538,6 +538,99 @@ class GridBotTests(unittest.TestCase):
             )
             self.assertIsNone(bot.database.get_state(grid_main.BREAKOUT_NOTICE_KEY))
 
+    def test_manual_recenter_uses_saved_reset_and_carries_btc(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.run_cycle()
+            bot.run_cycle()
+            held_before = exchange.base_free + sum(
+                Decimal(row["amount"]) for row in exchange.fetch_open_orders("BTC/USDT")
+                if row["side"] == "sell"
+            )
+            old_ids = {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")}
+            self.assertEqual(bot.request_manual_recenter("102", "25"),
+                             (Decimal("76.50"), Decimal("127.50")))
+            self.assertEqual({row["id"] for row in
+                              exchange.fetch_open_orders("BTC/USDT")}, old_ids)
+            request = json.loads(bot.database.get_state("grid_reset"))
+            self.assertEqual(request["source"], "manual_recenter")
+
+            restarted = GridBot(bot.config, exchange, GridDatabase(path))
+            restarted.prepare(persist=False)
+            self.assertTrue(restarted.reset_grid())
+            self.assertEqual(restarted.anchor, Decimal("102"))
+            self.assertEqual(restarted.config.lower_price, Decimal("76.50"))
+            self.assertEqual(restarted.config.upper_price, Decimal("127.50"))
+            self.assertEqual(restarted.breakout_width_percent, Decimal("25"))
+            self.assertEqual(restarted.database.get_state(grid_main.BREAKOUT_WIDTH_KEY),
+                             "25")
+            self.assertEqual(restarted.database.get_state("grid_reset"), None)
+            self.assertEqual(restarted.database.get_state(
+                "grid_reset_notification_pending"), "1")
+            self.assertEqual(
+                exchange.base_free + sum(
+                    Decimal(row["amount"]) for row in
+                    exchange.fetch_open_orders("BTC/USDT") if row["side"] == "sell"
+                ), held_before,
+            )
+            self.assertTrue(all(row["params"]["timeInForce"] == "PO"
+                                for row in exchange.fetch_open_orders("BTC/USDT")))
+            self.assertEqual(sum(row["type"] == "market" and row["side"] == "sell"
+                                 for row in exchange.orders.values()), 0)
+
+    def test_manual_recenter_rejects_invalid_or_stale_request_without_canceling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            old_ids = {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")}
+            for center, width in (("nan", "25"), ("100", "35"),
+                                  ("130", "25"), ("100", "100")):
+                with self.assertRaises(ValueError):
+                    bot.request_manual_recenter(center, width)
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            bot.request_manual_recenter("102", "25")
+            with self.assertRaises(TradingHalt):
+                bot.request_manual_recenter("102", "25")
+            exchange.price = Decimal("130")
+            self.assertFalse(bot.reset_grid())
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            self.assertEqual({row["id"] for row in
+                              exchange.fetch_open_orders("BTC/USDT")}, old_ids)
+
+    def test_manual_recenter_market_drift_rebuilds_old_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.request_manual_recenter("102", "25")
+            original_cancel = exchange.cancel_order
+
+            def cancel_and_drift(order_id, symbol, params=None):
+                response = original_cancel(order_id, symbol, params)
+                exchange.price = Decimal("90")
+                return response
+
+            exchange.cancel_order = cancel_and_drift
+            self.assertTrue(bot.reset_grid())
+            self.assertEqual(bot.config.lower_price, Decimal("80"))
+            self.assertEqual(bot.config.upper_price, Decimal("120"))
+            self.assertEqual(bot.anchor, Decimal("90"))
+            self.assertEqual(bot.breakout_width_percent, Decimal("20"))
+            self.assertEqual(bot.database.get_state(grid_main.BREAKOUT_WIDTH_KEY),
+                             "20")
+
+    def test_manual_recenter_does_not_override_safety_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.set_manual_pause(True)
+            with self.assertRaises(TradingHalt):
+                bot.request_manual_recenter("102", "25")
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+
     def test_breakout_fade_during_cancellation_rebuilds_old_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
