@@ -1,54 +1,62 @@
 import asyncio
+import tempfile
 import unittest
-from decimal import Decimal
-from threading import Event
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
 
 import main as grid_main
+from database import GridDatabase
 
 
 class StatusApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_is_read_only_and_allows_dashboard_origin(self) -> None:
-        transport = httpx.ASGITransport(app=grid_main.app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
-            grid_main.app.state.grid_bot = None
-            offline = await client.get("/api/bot/status")
-            self.assertEqual(offline.json()["status"], "offline")
-
-            fake_bot = SimpleNamespace(
-                config=SimpleNamespace(symbol="BTC/USDT"),
-                grid_configuration=lambda: (
-                    Decimal("75000"), Decimal("89000"), 6, Decimal("74500")
-                ),
-                stop_controller=SimpleNamespace(stop_requested=Event()),
-                is_paused=True,
-                grid_needs_reset=False,
-            )
-            grid_main.app.state.grid_bot = fake_bot
-            try:
-                response = await client.get(
-                    "/api/bot/status",
-                    headers={"Origin": "http://localhost:5173"},
-                )
-            finally:
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            transport = httpx.ASGITransport(app=grid_main.app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
                 grid_main.app.state.grid_bot = None
+                with patch.object(grid_main, "GridDatabase", return_value=database):
+                    offline = await client.get("/api/bot/status")
+                self.assertEqual(offline.json(), {
+                    "status": "Offline", "pair": "BTC/USDT",
+                    "safety_pause": "Normal", "grid_levels": 0,
+                    "lower_bound": None, "upper_bound": None,
+                })
+
+                database.insert_order("buy", 1, "BUY", "81000", "0.01")
+                database.insert_order("sell", -1, "SELL", "90000", "0.01")
+                database.insert_order(
+                    "seed", 0, "BUY", "84000", "0.01", order_type="MARKET"
+                )
+                database.insert_order("filled", 2, "BUY", "78000", "0.01")
+                database.mark_order_filled("filled")
+                database.set_state(grid_main.SAFETY_MODE_KEY, grid_main.PAUSED_DOWNSIDE)
+                grid_main.app.state.grid_bot = SimpleNamespace(
+                    config=SimpleNamespace(symbol="BTC/USDT"), database=database
+                )
+                try:
+                    response = await client.get(
+                        "/api/bot/status",
+                        headers={"Origin": "http://localhost:5173"},
+                    )
+                    database.clear_state(grid_main.SAFETY_MODE_KEY)
+                    resumed = await client.get("/api/bot/status")
+                finally:
+                    grid_main.app.state.grid_bot = None
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["access-control-allow-origin"], "*")
         self.assertEqual(response.json(), {
-            "status": "safety_pause",
-            "pair": "BTC/USDT",
-            "safety_pause": True,
-            "lower_price": "75000",
-            "upper_price": "89000",
-            "grid_levels": 6,
-            "pause_trigger": "74500",
+            "status": "Online", "pair": "BTC/USDT",
+            "safety_pause": "Active", "grid_levels": 2,
+            "lower_bound": 81000.0, "upper_bound": 90000.0,
         })
+        self.assertEqual(resumed.json()["safety_pause"], "Normal")
 
     async def test_api_and_telegram_bot_run_concurrently(self) -> None:
         api_started = asyncio.Event()

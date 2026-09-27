@@ -54,26 +54,25 @@ app.state.grid_bot = None
 
 
 @app.get("/api/bot/status")
-async def bot_status() -> Dict[str, Any]:
-    """Expose read-only bot state without exchange credentials or order actions."""
+def bot_status() -> Dict[str, Any]:
+    """Summarize persisted grid orders; only a running bot is marked online."""
     bot = app.state.grid_bot
-    if bot is None:
-        return {"status": "offline", "pair": None, "safety_pause": False}
-    lower, upper, levels, pause_trigger = bot.grid_configuration()
-    status = (
-        "stopping" if bot.stop_controller.stop_requested.is_set()
-        else "safety_pause" if bot.is_paused
-        else "rebuilding" if bot.grid_needs_reset
-        else "active"
-    )
+    database = bot.database if bot is not None else GridDatabase()
+    orders = [
+        order for order in database.fetch_active_grids()
+        if order["order_type"] == "LIMIT"
+    ]
+    prices = [Decimal(order["price"]) for order in orders]
     return {
-        "status": status,
-        "pair": bot.config.symbol,
-        "safety_pause": bot.is_paused,
-        "lower_price": str(lower),
-        "upper_price": str(upper),
-        "grid_levels": levels,
-        "pause_trigger": str(pause_trigger),
+        "status": "Online" if bot is not None else "Offline",
+        "pair": bot.config.symbol if bot is not None else "BTC/USDT",
+        "safety_pause": (
+            "Active" if database.get_state(SAFETY_MODE_KEY) == PAUSED_DOWNSIDE
+            else "Normal"
+        ),
+        "grid_levels": len(orders),
+        "lower_bound": float(min(prices)) if prices else None,
+        "upper_bound": float(max(prices)) if prices else None,
     }
 
 
