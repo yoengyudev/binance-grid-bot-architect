@@ -319,10 +319,17 @@ class GridDatabase:
                             carry_price: Optional[str] = None,
                             carry_amount: Optional[str] = None,
                             carry_cost: Optional[str] = None,
-                            breakout_width_percent: Optional[str] = None) -> None:
+                            breakout_width_percent: Optional[str] = None,
+                            clear_liquidation_state: bool = False) -> None:
         """Archive old lanes and switch runs in one SQLite transaction."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if clear_liquidation_state:
+                mode = connection.execute(
+                    "SELECT value FROM bot_state WHERE key = 'safety_mode'"
+                ).fetchone()
+                if mode is None or mode["value"] != "LIQUIDATED":
+                    raise ValueError("A completed liquidation is required for admin reset.")
             active = connection.execute(
                 "SELECT COUNT(*) FROM grid_orders "
                 "WHERE status IN ('OPEN', 'PARTIALLY_FILLED')"
@@ -359,6 +366,12 @@ class GridDatabase:
                     "INSERT INTO bot_state (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (key, value),
+                )
+            if clear_liquidation_state:
+                connection.execute(
+                    "DELETE FROM bot_state WHERE key IN "
+                    "('safety_mode', 'halt_reason', 'hard_stop_liquidation', "
+                    "'hard_stop_notification_pending')"
                 )
 
     def clear_state(self, key: str) -> None:

@@ -110,6 +110,19 @@ class TelegramNotifier:
     async def notify_grid_reset(self) -> None:
         await self._send("✅ New grid successfully placed and active.")
 
+    async def notify_hard_stop(self, liquidated: bool) -> None:
+        if liquidated:
+            await self._send(
+                "HARD STOP LIQUIDATED: All open BTC/USDT orders were canceled, "
+                "tradable bot-tracked BTC was market-sold, and trading is locked "
+                "until admin reset. Check the dashboard for any unsellable dust."
+            )
+        else:
+            await self._send(
+                "HARD STOP HALTED: Liquidation could not be verified. "
+                "Trading is locked. Inspect orders and BTC balance manually."
+            )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Send one Telegram test alert")

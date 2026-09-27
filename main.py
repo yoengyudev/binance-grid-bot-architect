@@ -42,6 +42,11 @@ RESET_SPACING_PERCENT = Decimal("2.5")
 SAFETY_MODE_KEY = "safety_mode"
 PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
 PAUSED_MANUAL = "PAUSED_MANUAL"
+LIQUIDATING = "LIQUIDATING"
+LIQUIDATED = "LIQUIDATED"
+LIQUIDATION_HALTED = "HALTED"
+LIQUIDATION_KEY = "hard_stop_liquidation"
+LIQUIDATION_NOTICE_KEY = "hard_stop_notification_pending"
 SAFETY_PAUSE_NOTICE_KEY = "safety_pause_notice_pending"
 SAFETY_RECOVERY_NOTICE_KEY = "safety_recovery_notice_pending"
 SAFETY_RESUME_NOTICE_KEY = "safety_resume_notice_pending"
@@ -222,6 +227,13 @@ def _unavailable_wallet() -> Dict[str, Optional[float]]:
 def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
     """Value the current run's remaining BTC lots from persisted fill snapshots."""
     try:
+        liquidation = database.get_state(LIQUIDATION_KEY)
+        if liquidation:
+            state = json.loads(liquidation)
+            if state.get("phase") == "complete":
+                return {"btc_held": float(state.get("residual_base", "0")),
+                        "average_cost": None, "unrealized_pnl": None}
+            return _unavailable_wallet()
         carry_text = database.get_state("carry_inventory")
         carry = json.loads(carry_text) if carry_text else {}
         rows = database.fetch_all_orders()
@@ -301,14 +313,17 @@ def bot_status() -> Dict[str, Any]:
         if order["order_type"] == "LIMIT"
     ]
     prices = [Decimal(order["price"]) for order in orders]
+    safety_mode = database.get_state(SAFETY_MODE_KEY)
     return {
         "status": "Online" if bot is not None else "Offline",
         "pair": bot.config.symbol if bot is not None else "BTC/USDT",
         "safety_pause": (
-            "Active" if database.get_state(SAFETY_MODE_KEY) in (PAUSED_DOWNSIDE, PAUSED_MANUAL)
+            "Active" if safety_mode is not None
             else "Normal"
         ),
-        "pause_mode": database.get_state(SAFETY_MODE_KEY),
+        "pause_mode": safety_mode,
+        "trading_state": safety_mode if safety_mode in (
+            LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED) else "ACTIVE",
         "grid_levels": len(orders),
         "lower_bound": float(min(prices)) if prices else None,
         "upper_bound": float(max(prices)) if prices else None,
@@ -515,7 +530,8 @@ class GridBot:
         self.baseline_base: Optional[Decimal] = None
         self._post_only_rejected_in_cycle = False
         safety_mode = self.database.get_state(SAFETY_MODE_KEY)
-        if safety_mode not in (None, PAUSED_DOWNSIDE, PAUSED_MANUAL):
+        if safety_mode not in (None, PAUSED_DOWNSIDE, PAUSED_MANUAL,
+                               LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
             raise TradingHalt("Unknown saved safety mode; inspect local state.")
         self.is_paused = safety_mode is not None
         self._cycle_lock = RLock()
@@ -672,7 +688,10 @@ class GridBot:
             stop_loss = _decimal(price_text, "stop_loss_price")
         except ValueError as error:
             raise ValueError("Enter a valid positive stop-loss price.") from error
-        with self._grid_lock:
+        with self._cycle_lock, self._grid_lock:
+            if self.database.get_state(SAFETY_MODE_KEY) in (
+                    LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
+                raise TradingHalt("Hard-stop liquidation has locked grid settings.")
             if stop_loss >= self.config.lower_price:
                 raise ValueError(
                     "❌ Rejected: Stop-loss must be lower than the current lower bound."
@@ -745,6 +764,12 @@ class GridBot:
             with self._grid_lock:
                 if self.stop_controller.stop_requested.is_set():
                     raise TradingHalt("Bot is stopping; grid was not changed.")
+                if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATED:
+                    if requested_stop is None:
+                        raise ValueError("A new hard-stop price is required to reset liquidation.")
+                    return self._restart_liquidated_run(
+                        center, width_percent, lower, upper, requested_stop
+                    )
                 if self.is_paused:
                     raise TradingHalt("Release Safety Pause before re-anchoring the grid.")
                 if self.grid_needs_reset or self.database.get_state("grid_reset"):
@@ -775,6 +800,53 @@ class GridBot:
                 self.pending_grid_bounds = (lower, upper)
                 self.grid_needs_reset = True
                 return lower, upper
+
+    def _restart_liquidated_run(self, center: Decimal, width_percent: Decimal,
+                                lower: Decimal, upper: Decimal,
+                                stop_loss: Decimal) -> Tuple[Decimal, Decimal]:
+        """Only an authenticated recenter may release a completed hard stop."""
+        state_text = self.database.get_state(LIQUIDATION_KEY)
+        if not state_text or json.loads(state_text).get("phase") != "complete":
+            raise TradingHalt("Liquidation is unresolved; inspect exchange orders first.")
+        if self._call(self.exchange.fetch_open_orders, self.config.symbol):
+            raise TradingHalt("Open orders remain; cannot reset a liquidated grid.")
+        if self.database.fetch_active_grids():
+            raise TradingHalt("Tracked orders remain active; cannot reset liquidation.")
+        price = self._ticker_price()
+        ratio = 1 + self.config.spacing_percent / 100
+        if not center / ratio < price < center * ratio:
+            raise ValueError("Center must be close to the live market price.")
+        if not stop_loss < lower < price < upper:
+            raise ValueError("New hard stop and bounds must contain the live price.")
+        new_config = replace(self.config, lower_price=lower, upper_price=upper,
+                             stop_loss_price=stop_loss)
+        lowers, uppers = self._validate_reset_grid(new_config, center, Decimal(0))
+        baseline = self._free_balance(self.market["base"])
+        run = {"anchor": str(center), "baseline_base": str(baseline),
+               "fingerprint": new_config.fingerprint()}
+        active = {"lower": str(lower), "upper": str(upper),
+                  "spacing": str(new_config.spacing_percent),
+                  "stop_loss_price": str(stop_loss)}
+        request = {"phase": "placing", "source": "manual_liquidation_reset",
+                   "lower": str(lower), "upper": str(upper),
+                   "spacing": str(new_config.spacing_percent)}
+        self.database.complete_grid_reset(
+            json.dumps(run, sort_keys=True), json.dumps(active, sort_keys=True),
+            json.dumps(request, sort_keys=True),
+            breakout_width_percent=str(width_percent),
+            clear_liquidation_state=True,
+        )
+        self.database.clear_state(BREAKOUT_TIMER_KEY)
+        self.config = new_config
+        self.anchor = center
+        self.baseline_base = baseline
+        self.levels, self.upper_levels = lowers, uppers
+        self.breakout_width_percent = width_percent
+        self.pending_grid_bounds = (lower, upper)
+        self.grid_needs_reset = True
+        self.is_paused = False
+        LOGGER.warning("Admin reset released a completed hard-stop liquidation.")
+        return lower, upper
 
     def _request_breakout_reset(self, price: Decimal) -> None:
         """Persist a reset intent before any order cancellation can begin."""
@@ -1409,16 +1481,190 @@ class GridBot:
                 return True
         raise TradingHalt("Replacement grid did not finish placing orders.")
 
-    def _enter_safety_pause(self, price: Decimal) -> None:
-        if self.is_paused:
+    def _save_liquidation(self, state: Dict[str, Any]) -> None:
+        self.database.set_state(LIQUIDATION_KEY, json.dumps(state, sort_keys=True))
+
+    def _liquidation_order(self, client_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            order = self._call(self.exchange.fetch_order, "", self.config.symbol,
+                               {"origClientOrderId": client_id})
+        except ccxt.OrderNotFound:
+            return None
+        if not isinstance(order, dict) or not order.get("id"):
+            raise TradingHalt("Hard-stop order lookup returned no exchange order ID.")
+        return order
+
+    def _submit_hard_stop_sell(self, state: Dict[str, Any]) -> None:
+        """Retry once only after a timeout and a verified absent order/balance."""
+        client_id = state["client_order_id"]
+        while True:
+            if state["attempts"]:
+                found = self._liquidation_order(client_id)
+                if found is not None:
+                    state["exchange_order_id"] = str(found["id"])
+                    state["phase"] = "confirming"
+                    self._save_liquidation(state)
+                    return
+                if state.get("retry_allowed") and state["attempts"] < 2:
+                    time.sleep(0.3)
+                    found = self._liquidation_order(client_id)
+                    if found is not None:
+                        state["exchange_order_id"] = str(found["id"])
+                        state["phase"] = "confirming"
+                        self._save_liquidation(state)
+                        return
+                if (not state.get("retry_allowed") or state["attempts"] >= 2 or
+                        self._free_balance(self.market["base"]) !=
+                        Decimal(state["pre_submit_base_free"])):
+                    raise TradingHalt(
+                        "Market-sell outcome is uncertain; inspect the client order ID "
+                        "and BTC balance before any further sale."
+                    )
+            state["attempts"] += 1
+            state["retry_allowed"] = False
+            self._save_liquidation(state)  # Durable intent before the network request.
+            try:
+                response = self._call(
+                    self.exchange.create_market_sell_order,
+                    self.config.symbol, float(Decimal(state["sell_amount"])),
+                    {"newClientOrderId": client_id},
+                )
+            except ccxt.RequestTimeout:
+                state["retry_allowed"] = True
+                self._save_liquidation(state)
+                LOGGER.critical("Hard-stop market SELL timed out; verifying client order %s.",
+                                client_id)
+                continue
+            if not isinstance(response, dict) or not response.get("id"):
+                raise TradingHalt("Market SELL returned no exchange ID; outcome is uncertain.")
+            state["exchange_order_id"] = str(response["id"])
+            state["phase"] = "confirming"
+            self._save_liquidation(state)
             return
-        self.database.set_state(SAFETY_MODE_KEY, PAUSED_DOWNSIDE)
-        self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
-        self.database.clear_state(SAFETY_RESUME_NOTICE_KEY)
-        self.database.set_state(SAFETY_PAUSE_NOTICE_KEY, "1")
+
+    def _complete_hard_stop(self, state: Dict[str, Any], sold: Decimal,
+                            proceeds: Decimal = Decimal(0)) -> None:
+        residual = Decimal(state["held_base"]) - sold
+        if residual < 0:
+            raise TradingHalt("Hard-stop SELL exceeded bot-tracked BTC.")
+        if self._amount(residual) > 0:
+            raise TradingHalt("Market SELL left tradable bot BTC; manual review required.")
+        state.update(phase="complete", sold_base=str(sold),
+                     residual_base=str(residual), proceeds_quote=str(proceeds))
+        self._save_liquidation(state)
+        self.database.set_state(SAFETY_MODE_KEY, LIQUIDATED)
+        self.database.set_state("halt_reason", "hard_stop_liquidated")
+        self.database.set_state(LIQUIDATION_NOTICE_KEY, "1")
+        for key in ("grid_reset", BREAKOUT_TIMER_KEY, SAFETY_PAUSE_NOTICE_KEY,
+                    SAFETY_RECOVERY_NOTICE_KEY, SAFETY_RESUME_NOTICE_KEY):
+            self.database.clear_state(key)
+        self.grid_needs_reset = False
+        self.pending_grid_bounds = None
         self.is_paused = True
-        LOGGER.warning("Safety pause activated at %s %s; canceling tracked BUY limits.",
-                       price, self.config.symbol)
+        LOGGER.critical("Hard stop liquidated %s %s; bot is locked until admin reset.",
+                        sold, self.market["base"])
+
+    def _liquidate_locked(self, price: Decimal) -> None:
+        """Cancel, verify, sell only bot inventory, and persist a terminal state."""
+        state_text = self.database.get_state(LIQUIDATION_KEY)
+        state = json.loads(state_text) if state_text else {
+            "phase": "canceling", "trigger_price": str(price),
+        }
+        if state_text is None:
+            self._save_liquidation(state)
+            self.database.set_state(SAFETY_MODE_KEY, LIQUIDATING)
+            self.is_paused = True
+            LOGGER.critical("Hard stop triggered at %s %s; liquidating bot inventory.",
+                            price, self.config.symbol)
+        if state["phase"] == "complete":
+            self._complete_hard_stop(state, Decimal(state["sold_base"]),
+                                     Decimal(state.get("proceeds_quote", "0")))
+            return
+        if state["phase"] == "failed":
+            self.database.set_state(SAFETY_MODE_KEY, LIQUIDATION_HALTED)
+            self.database.set_state("halt_reason", "hard_stop_failed")
+            self.database.set_state(LIQUIDATION_NOTICE_KEY, "1")
+            self.is_paused = True
+            return
+        try:
+            if state["phase"] == "canceling":
+                try:
+                    self._call(self.exchange.cancel_all_orders, self.config.symbol)
+                except ccxt.RequestTimeout:
+                    LOGGER.critical("Cancel-all timed out; checking open orders before retry.")
+                    remaining = self._call(self.exchange.fetch_open_orders,
+                                           self.config.symbol)
+                    if remaining:
+                        self._call(self.exchange.cancel_all_orders, self.config.symbol)
+                open_orders = self._call(self.exchange.fetch_open_orders,
+                                         self.config.symbol)
+                if not isinstance(open_orders, list):
+                    raise TradingHalt("Exchange returned an invalid open-order list.")
+                if open_orders:
+                    raise TradingHalt("Open orders remain after cancel-all; no market sell sent.")
+                for row in self.database.fetch_active_grids():
+                    order = self._fetch_order(row)
+                    status = order.get("status")
+                    if status == "closed":
+                        self.database.mark_order_filled(row["order_id"])
+                    elif status in ("canceled", "expired", "rejected"):
+                        self.database.update_order_status(row["order_id"], status.upper())
+                    else:
+                        raise TradingHalt("A tracked order remains unresolved after cancel-all.")
+                held, cost = self._carry_inventory()
+                amount = self._amount(held)
+                state.update(held_base=str(held), cost_basis_quote=str(cost),
+                             sell_amount=str(amount))
+                if amount <= 0:
+                    if held > 0:
+                        raise TradingHalt(
+                            "Bot BTC is below exchange sell precision; manual review required."
+                        )
+                    self._complete_hard_stop(state, Decimal(0))
+                    return
+                if amount > self._free_bot_base():
+                    raise TradingHalt("Bot-tracked BTC is not free after cancel-all.")
+                self._check_order_size(price, amount)
+                state.update(phase="submitting", client_order_id="gb" + uuid.uuid4().hex[:30],
+                             pre_submit_base_free=str(self._free_balance(self.market["base"])),
+                             attempts=0, retry_allowed=False)
+                self._save_liquidation(state)
+            if state["phase"] == "submitting":
+                self._submit_hard_stop_sell(state)
+            if state["phase"] == "confirming":
+                order = self._liquidation_order(state["client_order_id"])
+                if order is None:
+                    raise TradingHalt("Submitted hard-stop SELL is missing from exchange history.")
+                if order.get("status") == "open":
+                    return  # Wait for the next cycle; never send another SELL.
+                if order.get("status") not in ("closed", "canceled", "expired"):
+                    raise TradingHalt("Hard-stop SELL has an unknown exchange status.")
+                sold = _order_decimal(order.get("filled"))
+                if sold <= 0:
+                    raise TradingHalt("Hard-stop SELL executed no BTC.")
+                proceeds = _order_decimal(order.get("cost"),
+                                          str(sold * _order_decimal(order.get("average"))))
+                if proceeds > 0:
+                    basis = Decimal(state["cost_basis_quote"]) * sold / Decimal(state["held_base"])
+                    profit = proceeds - _fees_in_asset(order, self.market["quote"]) - basis
+                    self.database.record_trade(
+                        basis / sold, proceeds / sold, profit,
+                        sell_order_id=state["client_order_id"],
+                    )
+                self._complete_hard_stop(state, sold, proceeds)
+        except (ccxt.BaseError, TradingHalt, ValueError, KeyError, TypeError) as error:
+            state["phase"] = "failed"
+            self._save_liquidation(state)
+            self.database.set_state(SAFETY_MODE_KEY, LIQUIDATION_HALTED)
+            self.database.set_state("halt_reason", "hard_stop_failed")
+            self.database.set_state(LIQUIDATION_NOTICE_KEY, "1")
+            self.is_paused = True
+            LOGGER.critical("Hard-stop liquidation halted: %s", type(error).__name__,
+                            exc_info=True)
+
+    def liquidate(self, price: Decimal) -> None:
+        with self._cycle_lock:
+            self._liquidate_locked(price)
 
     def set_manual_pause(self, active: bool) -> Optional[str]:
         """Persist a manual pause and use the existing targeted BUY cancellation."""
@@ -1426,6 +1672,8 @@ class GridBot:
             if self.stop_controller.stop_requested.is_set() or self.grid_needs_reset:
                 raise TradingHalt("Bot is stopping or resetting its grid.")
             mode = self.database.get_state(SAFETY_MODE_KEY)
+            if mode in (LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
+                raise TradingHalt("Hard-stop liquidation has locked trading controls.")
             if active:
                 if mode != PAUSED_MANUAL:
                     self.database.set_state(SAFETY_MODE_KEY, PAUSED_MANUAL)
@@ -1542,11 +1790,15 @@ class GridBot:
         self._post_only_rejected_in_cycle = False
         current_price = self._ticker_price()
         self.database.set_state(LAST_MARKET_PRICE_KEY, str(current_price))
+        mode = self.database.get_state(SAFETY_MODE_KEY)
+        if mode in (LIQUIDATED, LIQUIDATION_HALTED):
+            return []
+        if mode == LIQUIDATING or current_price < self.config.stop_loss_price:
+            self._liquidate_locked(current_price)
+            return []
         if self._observe_upper_breakout(current_price):
             return []
         events: List[Tuple[str, Tuple[str, ...]]] = []
-        if current_price <= self.config.stop_loss_price:
-            self._enter_safety_pause(current_price)
         if self.is_paused:
             pause_events, cancellations_complete = self._cancel_buy_orders_for_pause()
             events.extend(pause_events)
@@ -1645,22 +1897,55 @@ class GridBot:
                 self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
                 self.database.clear_state(SAFETY_RESUME_NOTICE_KEY)
 
+    async def _notify_liquidation(self, notifier: TelegramNotifier) -> None:
+        if not self.database.get_state(LIQUIDATION_NOTICE_KEY):
+            return
+        mode = self.database.get_state(SAFETY_MODE_KEY)
+        try:
+            await notifier.notify_hard_stop(mode == LIQUIDATED)
+        except Exception as error:
+            LOGGER.warning("Hard-stop Telegram alert failed: %s", type(error).__name__)
+        else:
+            self.database.clear_state(LIQUIDATION_NOTICE_KEY)
+
     async def run(self, notifier: TelegramNotifier) -> None:
         await asyncio.to_thread(self.prepare, persist=True)
-        if self.database.get_state("halt_reason"):
+        if (self.database.get_state("halt_reason") and
+                self.database.get_state(SAFETY_MODE_KEY) not in
+                (LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED)):
             raise TradingHalt("Saved stop state requires manual review before a new run.")
         await asyncio.to_thread(self._backfill_portfolio_snapshots)
         try:
-            try:
-                await notifier.notify_startup(self.config.symbol)
-            except Exception as error:
-                LOGGER.warning("Startup alert failed: %s", type(error).__name__)
+            if self.database.get_state(SAFETY_MODE_KEY) not in (
+                    LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
+                try:
+                    await notifier.notify_startup(self.config.symbol)
+                except Exception as error:
+                    LOGGER.warning("Startup alert failed: %s", type(error).__name__)
             backoff = 1
             while True:
                 if self.stop_controller.stop_requested.is_set():
                     break
                 try:
+                    mode = self.database.get_state(SAFETY_MODE_KEY)
+                    if mode in (LIQUIDATED, LIQUIDATION_HALTED):
+                        await self._notify_liquidation(notifier)
+                        await asyncio.to_thread(
+                            self.stop_controller.stop_requested.wait,
+                            self.config.poll_seconds,
+                        )
+                        continue
+                    if mode == LIQUIDATING:
+                        price = await asyncio.to_thread(self._ticker_price)
+                        await asyncio.to_thread(self.liquidate, price)
+                        await self._notify_liquidation(notifier)
+                        continue
                     if self.grid_needs_reset:
+                        price = await asyncio.to_thread(self._ticker_price)
+                        if price < self.config.stop_loss_price:
+                            await asyncio.to_thread(self.liquidate, price)
+                            await self._notify_liquidation(notifier)
+                            continue
                         complete = await asyncio.to_thread(self.reset_grid)
                         await self._notify_safety_state(notifier)
                         backoff = 1
@@ -1686,6 +1971,7 @@ class GridBot:
                         else:
                             self.database.clear_state(BREAKOUT_NOTICE_KEY)
                     events = await asyncio.to_thread(self.run_cycle)
+                    await self._notify_liquidation(notifier)
                     for kind, values in events:
                         if kind == "filled":
                             try:

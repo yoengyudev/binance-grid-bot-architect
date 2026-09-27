@@ -56,6 +56,14 @@ class TelegramNotifierTests(unittest.TestCase):
         self.assertIn("SAFETY PAUSE ACTIVE", send.await_args_list[0].args[0])
         self.assertIn("BREAKOUT CONFIRMED", send.await_args_list[1].args[0])
 
+    def test_hard_stop_alerts_report_verified_or_unresolved_outcome(self) -> None:
+        notifier = TelegramNotifier("secret-token", 42)
+        with patch("telegram_bot.send_telegram_alert", new_callable=AsyncMock) as send:
+            asyncio.run(notifier.notify_hard_stop(True))
+            asyncio.run(notifier.notify_hard_stop(False))
+        self.assertIn("LIQUIDATED", send.await_args_list[0].args[0])
+        self.assertIn("HALTED", send.await_args_list[1].args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -30,7 +30,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     offline = await client.get("/api/bot/status")
                 self.assertEqual(offline.json(), {
                     "status": "Offline", "pair": "BTC/USDT",
-                    "safety_pause": "Normal", "pause_mode": None, "grid_levels": 0,
+                    "safety_pause": "Normal", "pause_mode": None,
+                    "trading_state": "ACTIVE", "grid_levels": 0,
                     "lower_bound": None, "upper_bound": None,
                     "wallet": {
                         "btc_held": None, "average_cost": None,
@@ -64,6 +65,10 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     )
                     database.clear_state(grid_main.SAFETY_MODE_KEY)
                     resumed = await client.get("/api/bot/status")
+                    database.set_state(grid_main.SAFETY_MODE_KEY, grid_main.LIQUIDATED)
+                    database.set_state(grid_main.LIQUIDATION_KEY,
+                                       '{"phase":"complete","residual_base":"0.0001"}')
+                    liquidated = await client.get("/api/bot/status")
                 finally:
                     grid_main.app.state.grid_bot = None
 
@@ -75,6 +80,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json(), {
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "pause_mode": grid_main.PAUSED_DOWNSIDE,
+            "trading_state": "ACTIVE",
             "grid_levels": 2,
             "lower_bound": 81000.0, "upper_bound": 90000.0,
             "wallet": {
@@ -83,6 +89,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             },
         })
         self.assertEqual(resumed.json()["safety_pause"], "Normal")
+        self.assertEqual(liquidated.json()["trading_state"], grid_main.LIQUIDATED)
+        self.assertEqual(liquidated.json()["wallet"]["btc_held"], 0.0001)
 
     async def test_admin_login_uses_strict_httponly_cookie(self) -> None:
         protected_app = FastAPI()
