@@ -5,8 +5,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import sys
+import time
 import uuid
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
@@ -32,6 +34,10 @@ PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
 SAFETY_PAUSE_NOTICE_KEY = "safety_pause_notice_pending"
 SAFETY_RECOVERY_NOTICE_KEY = "safety_recovery_notice_pending"
 SAFETY_RESUME_NOTICE_KEY = "safety_resume_notice_pending"
+BREAKOUT_TIMER_KEY = "upper_breakout_timer"
+BREAKOUT_WIDTH_KEY = "breakout_width_percent"
+BREAKOUT_NOTICE_KEY = "breakout_notification_pending"
+BREAKOUT_COOLDOWN_SECONDS = 4 * 60 * 60
 OpenOrderEntry = Tuple[Optional[Decimal], Optional[Decimal]]
 
 
@@ -69,6 +75,7 @@ class GridConfig:
     initial_inventory_percent: Decimal
     stop_loss_price: Decimal
     poll_seconds: int
+    auto_center_percent: Optional[Decimal] = None
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "GridConfig":
@@ -93,8 +100,16 @@ class GridConfig:
             raise ValueError("grid.spacing_percent must be below 100.")
         if inventory_percent >= 100:
             raise ValueError("grid.initial_inventory_percent must be below 100.")
+        configured_width = grid.get("auto_center_percent")
+        width = (
+            _decimal(configured_width, "auto_center_percent")
+            if configured_width is not None
+            else (upper - lower) * 100 / (upper + lower)
+        )
+        if width >= 100:
+            raise ValueError("grid.auto_center_percent must be below 100.")
         return cls(raw["grid"]["symbol"], investment, lower, upper,
-                   spacing, inventory_percent, stop_loss, poll_seconds)
+                   spacing, inventory_percent, stop_loss, poll_seconds, width)
 
     def fingerprint(self) -> str:
         parameters = {
@@ -169,6 +184,15 @@ class GridBot:
         if safety_mode not in (None, PAUSED_DOWNSIDE):
             raise TradingHalt("Unknown saved safety mode; inspect local state.")
         self.is_paused = safety_mode == PAUSED_DOWNSIDE
+        saved_width = self.database.get_state(BREAKOUT_WIDTH_KEY)
+        self.breakout_width_percent = (
+            _decimal(saved_width, BREAKOUT_WIDTH_KEY) if saved_width is not None
+            else config.auto_center_percent or
+            (config.upper_price - config.lower_price) * 100 /
+            (config.upper_price + config.lower_price)
+        )
+        if self.breakout_width_percent >= 100:
+            raise TradingHalt("Saved breakout grid width must be below 100 percent.")
         self._grid_lock = RLock()
         pending_text = self.database.get_state("grid_reset")
         pending = json.loads(pending_text) if pending_text else None
@@ -359,9 +383,68 @@ class GridBot:
                 raise RuntimeError("A grid reset is already in progress.")
             request = {"phase": "canceling", "lower": str(lower),
                        "upper": str(upper), "spacing": str(RESET_SPACING_PERCENT)}
+            self.database.clear_state(BREAKOUT_TIMER_KEY)
             self.database.set_state("grid_reset", json.dumps(request))
             self.pending_grid_bounds = (lower, upper)
             self.grid_needs_reset = True
+
+    def _request_breakout_reset(self, price: Decimal) -> None:
+        """Persist a reset intent before any order cancellation can begin."""
+        width = self.breakout_width_percent / 100
+        lower = price * (1 - width)
+        upper = price * (1 + width)
+        if not self.config.stop_loss_price < lower < price < upper:
+            raise TradingHalt("Breakout bounds would violate the pause trigger.")
+        geometric_levels(price, lower, self.config.spacing_percent)
+        geometric_upper_levels(price, upper, self.config.spacing_percent)
+        with self._grid_lock:
+            if self.stop_controller.stop_requested.is_set() or self.grid_needs_reset:
+                return
+            request = {
+                "phase": "canceling", "source": "breakout",
+                "previous_upper": str(self.config.upper_price),
+                "width_percent": str(self.breakout_width_percent),
+                "lower": str(lower), "upper": str(upper),
+                "spacing": str(self.config.spacing_percent),
+            }
+            self.database.set_state("grid_reset", json.dumps(request, sort_keys=True))
+            self.database.clear_state(BREAKOUT_TIMER_KEY)
+            self.pending_grid_bounds = (lower, upper)
+            self.grid_needs_reset = True
+            LOGGER.info("Four-hour breakout confirmed at %s; grid reset queued.", price)
+
+    def _observe_upper_breakout(self, price: Decimal, *, now: Optional[float] = None) -> bool:
+        """Require four hours of uninterrupted above-bound observations."""
+        if self.is_paused or self.grid_needs_reset or price <= self.config.upper_price:
+            self.database.clear_state(BREAKOUT_TIMER_KEY)
+            return False
+        now = time.time() if now is None else now
+        if not math.isfinite(now) or now < 0:
+            raise TradingHalt("System clock is invalid for breakout tracking.")
+        text = self.database.get_state(BREAKOUT_TIMER_KEY)
+        prior = None
+        if text:
+            try:
+                prior = json.loads(text)
+                started = float(prior["started_at"])
+                last = float(prior["last_seen_at"])
+                if (not math.isfinite(started) or not math.isfinite(last) or
+                        started > last or last > now or
+                        prior["grid_fingerprint"] != self.config.fingerprint() or
+                        now - last > max(60, self.config.poll_seconds * 3)):
+                    prior = None
+            except (TypeError, ValueError, KeyError):
+                prior = None
+        started = float(prior["started_at"]) if prior else now
+        if now - started >= BREAKOUT_COOLDOWN_SECONDS:
+            self._request_breakout_reset(price)
+            return self.grid_needs_reset
+        self.database.set_state(BREAKOUT_TIMER_KEY, json.dumps({
+            "started_at": started,
+            "last_seen_at": now,
+            "grid_fingerprint": self.config.fingerprint(),
+        }, sort_keys=True))
+        return False
 
     def _call(self, method: Any, *args: Any) -> Any:
         with self.exchange_lock:
@@ -440,6 +523,8 @@ class GridBot:
                 "fingerprint": self.config.fingerprint(),
             }
             self.database.set_state("grid_run", json.dumps(state, sort_keys=True))
+        if persist and self.database.get_state(BREAKOUT_WIDTH_KEY) is None:
+            self.database.set_state(BREAKOUT_WIDTH_KEY, str(self.breakout_width_percent))
         return current_price, planned, upper_planned
 
     def _seed_quote(self) -> Decimal:
@@ -778,6 +863,13 @@ class GridBot:
         if self.stop_controller.stop_requested.is_set():
             raise TradingHalt("Stop requested during grid reset.")
         if request["phase"] == "canceling":
+            if request.get("source") == "breakout":
+                if self._ticker_price() <= Decimal(request["previous_upper"]):
+                    self.database.clear_state("grid_reset")
+                    self.pending_grid_bounds = None
+                    self.grid_needs_reset = False
+                    LOGGER.info("Breakout faded before cancellation; grid reset withdrawn.")
+                    return False
             canceled = self.stop_controller.cancel_tracked_orders()
             if canceled.unresolved or self.database.fetch_active_grids():
                 raise TradingHalt("Old grid cancellation could not be verified.")
@@ -786,9 +878,26 @@ class GridBot:
                 raise TradingHalt("Exchange still has open orders; reset stopped.")
             carry_amount, carry_cost = self._carry_inventory()
             price = self._ticker_price()
+            if request.get("source") == "breakout":
+                if price <= Decimal(request["previous_upper"]):
+                    if not self.config.lower_price < price < self.config.upper_price:
+                        raise TradingHalt(
+                            "Breakout faded outside old bounds after cancellation; "
+                            "inspect orders before restart."
+                        )
+                    request["source"] = "breakout_faded"
+                    request["lower"] = str(self.config.lower_price)
+                    request["upper"] = str(self.config.upper_price)
+                    LOGGER.warning("Breakout faded during cancellation; rebuilding old bounds.")
+                else:
+                    width = Decimal(request["width_percent"]) / 100
+                    request["lower"] = str(price * (1 - width))
+                    request["upper"] = str(price * (1 + width))
             new_config = replace(self.config, lower_price=Decimal(request["lower"]),
                                  upper_price=Decimal(request["upper"]),
                                  spacing_percent=Decimal(request["spacing"]))
+            if new_config.stop_loss_price >= new_config.lower_price:
+                raise TradingHalt("New grid lower bound is below the pause trigger.")
             if not new_config.lower_price < price < new_config.upper_price:
                 raise TradingHalt("Price left the requested bounds during reset.")
             lowers, uppers = self._validate_reset_grid(new_config, price, carry_amount)
@@ -824,7 +933,11 @@ class GridBot:
             expected = set(range(1, len(self.levels) + 1)) | set(
                 range(-1, -len(self.upper_levels) - 1, -1)) | {0}
             if expected <= latest.keys():
-                self.database.finish_grid_reset()
+                notification_key = (
+                    BREAKOUT_NOTICE_KEY if request.get("source") == "breakout"
+                    else "grid_reset_notification_pending"
+                )
+                self.database.finish_grid_reset(notification_key)
                 self.pending_grid_bounds = None
                 self.grid_needs_reset = False
                 return True
@@ -925,6 +1038,8 @@ class GridBot:
             raise RuntimeError("Call prepare() before run_cycle().")
         self._post_only_rejected_in_cycle = False
         current_price = self._ticker_price()
+        if self._observe_upper_breakout(current_price):
+            return []
         events: List[Tuple[str, Tuple[str, ...]]] = []
         if current_price <= self.config.stop_loss_price:
             self._enter_safety_pause(current_price)
@@ -1054,13 +1169,21 @@ class GridBot:
                             LOGGER.warning("Grid reset notification could not be delivered.")
                         else:
                             self.database.clear_state("grid_reset_notification_pending")
+                    if self.database.get_state(BREAKOUT_NOTICE_KEY):
+                        try:
+                            await telegram_bot.notify_breakout_shift()
+                        except Exception as error:
+                            LOGGER.warning("Breakout Telegram update failed: %s",
+                                           type(error).__name__)
+                        else:
+                            self.database.clear_state(BREAKOUT_NOTICE_KEY)
                     events = await asyncio.to_thread(self.run_cycle)
                     for kind, values in events:
                         if kind == "filled":
                             await telegram_bot.notify_order_filled(*values)
                     await self._notify_safety_state(telegram_bot)
                     backoff = 1
-                    delay = self.config.poll_seconds
+                    delay = 0 if self.grid_needs_reset else self.config.poll_seconds
                 except (ccxt.RateLimitExceeded, ccxt.DDoSProtection, ccxt.NetworkError):
                     if self.is_paused:
                         await self._notify_safety_state(telegram_bot)

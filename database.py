@@ -361,15 +361,17 @@ class GridDatabase:
         with self._connection() as connection:
             connection.execute("DELETE FROM bot_state WHERE key = ?", (key,))
 
-    def finish_grid_reset(self) -> None:
+    def finish_grid_reset(
+        self, notification_key: str = "grid_reset_notification_pending"
+    ) -> None:
         """Mark placement complete and queue its owner notification atomically."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("DELETE FROM bot_state WHERE key = 'grid_reset'")
             connection.execute(
-                "INSERT INTO bot_state (key, value) "
-                "VALUES ('grid_reset_notification_pending', '1') "
-                "ON CONFLICT(key) DO UPDATE SET value = '1'"
+                "INSERT INTO bot_state (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = '1'",
+                (notification_key,),
             )
 
     def record_trade(

@@ -62,6 +62,12 @@ class TelegramBotTests(unittest.TestCase):
                     send.await_args.args[0],
                     "✅ SAFETY PAUSE LIFTED: Market recovered. BUY orders automatically restored.",
                 )
+                asyncio.run(bot.notify_breakout_shift())
+                self.assertEqual(
+                    send.await_args.args[0],
+                    "🚀 BREAKOUT CONFIRMED: Market held for 4 hours. "
+                    "Grid auto-shifted to new price floor.",
+                )
 
     def test_unexpected_messages_use_last_handler_and_delete_silently(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

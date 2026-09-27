@@ -951,6 +951,13 @@ class TelegramBot:
             "✅ SAFETY PAUSE LIFTED: Market recovered. BUY orders automatically restored."
         )
 
+    async def notify_breakout_shift(self) -> None:
+        await self._refresh_active_status()
+        await self._send(
+            "🚀 BREAKOUT CONFIRMED: Market held for 4 hours. "
+            "Grid auto-shifted to new price floor."
+        )
+
     async def notify_critical_error(self, error: Exception) -> None:
         # Do not send raw exception text: exchange errors may contain request details.
         await self._send(f"Critical bot error: {type(error).__name__}.")

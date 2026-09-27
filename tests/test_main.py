@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -128,6 +129,30 @@ class FakeSpotExchange:
 
 
 class GridBotTests(unittest.TestCase):
+    def test_configured_trailing_width_survives_runtime_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            config_file = path / "config.json"
+            config_file.write_text(json.dumps({
+                "exchange": {"name": "binance", "market_type": "spot", "sandbox": True},
+                "grid": {
+                    "symbol": "BTC/USDT", "investment_quote": 1000,
+                    "lower_price": 80, "upper_price": 120,
+                    "auto_center_percent": 15, "spacing_percent": 10,
+                    "initial_inventory_percent": 50, "stop_loss_price": 70,
+                    "poll_seconds": 2,
+                },
+            }), encoding="utf-8")
+            database = GridDatabase(path / "grid.sqlite3")
+            database.set_state("active_grid_config", json.dumps({
+                "lower": "90", "upper": "130", "spacing": "2.5",
+                "stop_loss_price": "70",
+            }))
+            config = _apply_active_grid_config(GridConfig.load(config_file), database)
+            bot = GridBot(config, FakeSpotExchange(), database)
+            self.assertEqual(bot.breakout_width_percent, Decimal("15"))
+            self.assertEqual(bot.config.spacing_percent, Decimal("2.5"))
+
     def test_process_exit_codes_separate_retry_from_safety_halt(self) -> None:
         for error, expected in (
             (ccxt.NetworkError("Temporary network failure"), 1),
@@ -143,10 +168,10 @@ class GridBotTests(unittest.TestCase):
                       redirect_stderr(StringIO())):
                     self.assertEqual(grid_main.main(), expected)
 
-    def make_bot(self, path: Path):
+    def make_bot(self, path: Path, *, width: Decimal = None):
         config = GridConfig(
             "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
-            Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            Decimal("10"), Decimal("50"), Decimal("70"), 2, width,
         )
         exchange = FakeSpotExchange()
         bot = GridBot(config, exchange, GridDatabase(path))
@@ -327,6 +352,145 @@ class GridBotTests(unittest.TestCase):
                                 exchange.fetch_open_orders("BTC/USDT")))
             asyncio.run(bot._notify_safety_state(notifier))
             notifier.notify_safety_pause.assert_awaited_once()
+
+    def test_upper_breakout_timer_resets_on_dip_gap_and_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path, width=Decimal("15"))
+            self.assertEqual(bot.breakout_width_percent, Decimal("15"))
+            self.assertFalse(bot._observe_upper_breakout(Decimal("121"), now=0))
+            self.assertFalse(bot._observe_upper_breakout(Decimal("121"), now=60))
+            self.assertIsNotNone(bot.database.get_state(grid_main.BREAKOUT_TIMER_KEY))
+            self.assertFalse(bot._observe_upper_breakout(Decimal("120"), now=120))
+            self.assertIsNone(bot.database.get_state(grid_main.BREAKOUT_TIMER_KEY))
+
+            self.assertFalse(bot._observe_upper_breakout(Decimal("121"), now=180))
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.prepare(persist=True)
+            self.assertEqual(reopened.breakout_width_percent, Decimal("15"))
+            self.assertFalse(reopened._observe_upper_breakout(Decimal("121"), now=240))
+            state = json.loads(reopened.database.get_state(grid_main.BREAKOUT_TIMER_KEY))
+            self.assertEqual(state["started_at"], 180)
+
+            self.assertFalse(reopened._observe_upper_breakout(Decimal("121"), now=301))
+            state = json.loads(reopened.database.get_state(grid_main.BREAKOUT_TIMER_KEY))
+            self.assertEqual(state["started_at"], 301)
+            for second in range(361, 301 + grid_main.BREAKOUT_COOLDOWN_SECONDS, 60):
+                self.assertFalse(
+                    reopened._observe_upper_breakout(Decimal("121"), now=second)
+                )
+            self.assertFalse(reopened.grid_needs_reset)
+            self.assertTrue(reopened._observe_upper_breakout(
+                Decimal("121"), now=301 + grid_main.BREAKOUT_COOLDOWN_SECONDS
+            ))
+            self.assertTrue(reopened.grid_needs_reset)
+
+    def test_confirmed_breakout_recenters_without_selling_carried_btc(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(
+                path, width=Decimal("15")
+            )
+            bot.run_cycle()
+            bot.run_cycle()
+            existing_btc = exchange.base_free + sum(
+                Decimal(order["amount"])
+                for order in exchange.fetch_open_orders("BTC/USDT")
+                if order["side"] == "sell"
+            )
+            old_orders = len(exchange.orders)
+            exchange.price = Decimal("140")
+            bot.database.set_state(grid_main.BREAKOUT_TIMER_KEY, json.dumps({
+                "started_at": 0, "last_seen_at": 14340,
+                "grid_fingerprint": bot.config.fingerprint(),
+            }))
+            with patch.object(grid_main.time, "time", return_value=14400):
+                self.assertEqual(bot.run_cycle(), [])
+            self.assertTrue(bot.grid_needs_reset)
+            self.assertEqual(len(exchange.orders), old_orders)
+            request = json.loads(bot.database.get_state("grid_reset"))
+            self.assertEqual(request["source"], "breakout")
+
+            restarted = GridBot(bot.config, exchange, GridDatabase(path))
+            restarted.prepare(persist=False)
+            self.assertTrue(restarted.grid_needs_reset)
+            exchange.price = Decimal("145")  # Use execution-time price as the center.
+            exchange.reject_post_only_once = True
+            exchange.reject_post_only_side = "sell"
+            self.assertFalse(restarted.reset_grid())
+            self.assertIsNone(restarted.database.get_state(grid_main.BREAKOUT_NOTICE_KEY))
+            self.assertTrue(restarted.reset_grid())
+            self.assertEqual(restarted.anchor, Decimal("145"))
+            self.assertEqual(restarted.config.lower_price, Decimal("123.25"))
+            self.assertEqual(restarted.config.upper_price, Decimal("166.75"))
+            self.assertEqual(restarted.config.spacing_percent, Decimal("10"))
+            self.assertFalse(restarted.grid_needs_reset)
+            self.assertIsNone(restarted.database.get_state(grid_main.BREAKOUT_TIMER_KEY))
+            self.assertEqual(restarted.database.get_state(grid_main.BREAKOUT_NOTICE_KEY), "1")
+            self.assertIsNone(restarted.database.get_state("grid_reset_notification_pending"))
+            self.assertEqual(sum(order["type"] == "market" and order["side"] == "buy"
+                                 for order in exchange.orders.values()), 1)
+            self.assertEqual(sum(order["type"] == "market" and order["side"] == "sell"
+                                 for order in exchange.orders.values()), 0)
+            self.assertEqual(
+                exchange.base_free + sum(
+                    Decimal(order["amount"])
+                    for order in exchange.fetch_open_orders("BTC/USDT")
+                    if order["side"] == "sell"
+                ), existing_btc,
+            )
+            self.assertTrue(all(
+                order["params"]["timeInForce"] == "PO"
+                for order in exchange.fetch_open_orders("BTC/USDT")
+            ))
+            exchange.price = Decimal("200")
+            restarted._request_breakout_reset(exchange.price)
+            self.assertTrue(restarted.reset_grid())
+            self.assertEqual(restarted.config.lower_price, Decimal("170.00"))
+            self.assertEqual(restarted.config.upper_price, Decimal("230.00"))
+            self.assertEqual(restarted.breakout_width_percent, Decimal("15"))
+
+    def test_breakout_fade_before_cancellation_keeps_old_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            old_ids = {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")}
+            exchange.price = Decimal("121")
+            bot._request_breakout_reset(exchange.price)
+            exchange.price = Decimal("120")
+            self.assertFalse(bot.reset_grid())
+            self.assertFalse(bot.grid_needs_reset)
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            self.assertEqual(
+                {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")},
+                old_ids,
+            )
+            self.assertIsNone(bot.database.get_state(grid_main.BREAKOUT_NOTICE_KEY))
+
+    def test_breakout_fade_during_cancellation_rebuilds_old_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.price = Decimal("121")
+            bot._request_breakout_reset(exchange.price)
+            original_cancel = exchange.cancel_order
+
+            def cancel_and_fade(order_id, symbol, params=None):
+                response = original_cancel(order_id, symbol, params)
+                exchange.price = Decimal("100")
+                return response
+
+            exchange.cancel_order = cancel_and_fade
+            self.assertTrue(bot.reset_grid())
+            self.assertEqual(bot.config.lower_price, Decimal("80"))
+            self.assertEqual(bot.config.upper_price, Decimal("120"))
+            self.assertEqual(bot.anchor, Decimal("100"))
+            self.assertIsNone(bot.database.get_state(grid_main.BREAKOUT_NOTICE_KEY))
+            self.assertEqual(
+                bot.database.get_state("grid_reset_notification_pending"), "1"
+            )
 
     def test_uncertain_submission_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
