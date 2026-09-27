@@ -34,6 +34,11 @@ class FakeSpotExchange:
         self.cancel_all_timeout = None
         self.market_sell_calls = 0
         self.market_sell_timeout = None
+        self.market_sell_network_errors = 0
+        self.market_sell_exchange_errors = 0
+        self.market_sell_rate_limits = 0
+        self.market_sell_partial_once = False
+        self.market_sell_no_id_after_accept = False
         self.market_sell_insufficient = False
         self.market_sell_crash_after_accept = False
 
@@ -142,18 +147,41 @@ class FakeSpotExchange:
     def create_market_sell_order(self, symbol: str, amount: float,
                                  params: dict = None) -> dict:
         self.market_sell_calls += 1
+        if self.market_sell_network_errors:
+            self.market_sell_network_errors -= 1
+            raise ccxt.NetworkError("Simulated temporary network failure")
+        if self.market_sell_exchange_errors:
+            self.market_sell_exchange_errors -= 1
+            raise ccxt.ExchangeError("Simulated temporary exchange failure")
+        if self.market_sell_rate_limits:
+            self.market_sell_rate_limits -= 1
+            raise ccxt.RateLimitExceeded("Simulated rate limit")
         if self.market_sell_insufficient:
             raise ccxt.InsufficientFunds("Simulated insufficient BTC")
         if self.market_sell_timeout == "before":
             self.market_sell_timeout = None
             raise ccxt.RequestTimeout("Simulated request timeout")
         response = self.create_order(symbol, "market", "sell", amount, None, params or {})
+        if self.market_sell_partial_once:
+            self.market_sell_partial_once = False
+            quantity = Decimal(str(amount))
+            sold = (quantity / 2).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+            unsold = quantity - sold
+            self.base_free += unsold
+            self.quote_free -= unsold * self.price
+            self.orders[response["clientOrderId"]].update(
+                status="canceled", filled=str(sold), cost=str(sold * self.price)
+            )
+            response = dict(self.orders[response["clientOrderId"]])
         if self.market_sell_crash_after_accept:
             self.market_sell_crash_after_accept = False
             raise KeyboardInterrupt("Simulated process interruption after acceptance")
         if self.market_sell_timeout == "after":
             self.market_sell_timeout = None
             raise ccxt.RequestTimeout("Simulated response timeout")
+        if self.market_sell_no_id_after_accept:
+            self.market_sell_no_id_after_accept = False
+            response.pop("id")
         return response
 
     def fill(self, client_id: str) -> None:
@@ -482,12 +510,84 @@ class GridBotTests(unittest.TestCase):
                 bot.run_cycle()
                 exchange.market_sell_timeout = timeout
                 exchange.price = Decimal("69")
-                bot.run_cycle()
+                with patch.object(grid_main.time, "sleep"):
+                    bot.run_cycle()
                 self.assertEqual(exchange.market_sell_calls, expected_calls)
                 self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
                                  grid_main.LIQUIDATED)
                 self.assertEqual(len([row for row in exchange.orders.values()
                                       if row["type"] == "market" and row["side"] == "sell"]), 1)
+
+    def test_hard_stop_retries_temporary_sell_failures_until_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.market_sell_network_errors = 1
+            exchange.market_sell_exchange_errors = 1
+            exchange.price = Decimal("69")
+            with patch.object(grid_main.time, "sleep") as delay:
+                bot.run_cycle()
+            self.assertEqual(exchange.market_sell_calls, 3)
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+            self.assertEqual(len([row for row in exchange.orders.values()
+                                  if row["type"] == "market" and row["side"] == "sell"]), 1)
+            self.assertTrue(any(call.args == (2,) for call in delay.call_args_list))
+
+    def test_hard_stop_reconciles_missing_exchange_id_without_second_sale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.market_sell_no_id_after_accept = True
+            exchange.price = Decimal("69")
+            with patch.object(grid_main.time, "sleep"):
+                bot.run_cycle()
+            self.assertEqual(exchange.market_sell_calls, 1)
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+
+    def test_hard_stop_backs_off_after_rate_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.market_sell_rate_limits = 1
+            exchange.price = Decimal("69")
+            with patch.object(grid_main.time, "sleep") as delay:
+                bot.run_cycle()
+            self.assertIn((60,), [call.args for call in delay.call_args_list])
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+
+    def test_hard_stop_sells_remaining_btc_after_partial_terminal_fill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.market_sell_partial_once = True
+            exchange.price = Decimal("69")
+            with patch.object(grid_main.time, "sleep"):
+                bot.run_cycle()
+            state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
+            self.assertEqual(exchange.market_sell_calls, 2)
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+            self.assertLessEqual(
+                Decimal(state["held_base"]) - Decimal(state["sold_base"]),
+                Decimal("0.001"),
+            )
+
+    def test_hard_stop_treats_only_exchange_minimum_dust_as_unsellable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, _ = self.make_bot(Path(directory) / "grid.sqlite3")
+            self.assertEqual(bot._sellable_hard_stop_amount(
+                Decimal("0.0005"), Decimal("69")), Decimal(0))
+            self.assertEqual(bot._sellable_hard_stop_amount(
+                Decimal("0.1"), Decimal("69")), Decimal(0))
+            self.assertEqual(bot._sellable_hard_stop_amount(
+                Decimal("0.2"), Decimal("69")), Decimal("0.200"))
 
     def test_hard_stop_verifies_timed_out_cancel_all(self) -> None:
         for timeout, expected_calls in (("before", 2), ("after", 1)):
@@ -750,6 +850,32 @@ class GridBotTests(unittest.TestCase):
             reopened = GridBot(saved_config, exchange, GridDatabase(path))
             reopened.prepare(persist=False)
             self.assertEqual(reopened.high_water_mark, Decimal("102"))
+
+    def test_manual_recenter_cannot_lower_active_trailing_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.price = Decimal("110")
+            bot.advance_trailing_stop(exchange.price)
+            self.assertEqual(bot.config.stop_loss_price, Decimal("80"))
+            with self.assertRaisesRegex(ValueError, "Risk Override Denied"):
+                bot.request_manual_recenter("110", "20", "30")
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            self.assertEqual(exchange.cancel_all_calls, 0)
+
+    def test_queued_recenter_is_withdrawn_if_trailing_floor_rises(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.request_manual_recenter("102", "20", "30")
+            exchange.price = Decimal("105")
+            bot.advance_trailing_stop(exchange.price)
+            self.assertGreater(bot.config.stop_loss_price, Decimal("71.4"))
+            self.assertFalse(bot.reset_grid())
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            self.assertEqual(exchange.cancel_all_calls, 0)
 
     def test_stale_manual_recenter_keeps_original_pause_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -514,6 +515,49 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(accepted_new.status_code, 202)
                     self.assertEqual(calls[-1], ("82000.0", "15.0", "25.0"))
+            finally:
+                grid_main.app.state.grid_bot = None
+
+    async def test_recenter_endpoint_rejects_a_lower_active_trailing_floor(self) -> None:
+        class ActiveBot:
+            def __init__(self):
+                self.database = SimpleNamespace(get_state=lambda _: None)
+                self.queued = False
+
+            def grid_configuration(self):
+                return Decimal("70000"), Decimal("90000"), 6, Decimal("75000")
+
+            def request_manual_recenter(self, *_args):
+                self.queued = True
+                return Decimal("70000"), Decimal("90000")
+
+        bot = ActiveBot()
+        with (patch.dict(os.environ, {
+                "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+                "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+              }), patch.object(grid_main, "GridBot", ActiveBot)):
+            grid_main.app.state.grid_bot = bot
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    origin = {"Origin": "http://localhost:5173"}
+                    await client.post(
+                        "/api/auth/login",
+                        json={"password": "unique-private-admin-password"},
+                        headers=origin,
+                    )
+                    response = await client.post(
+                        "/api/bot/grid/recenter",
+                        json={"center_price": 82000, "width_percentage": 15,
+                              "stop_loss_percentage": 20},
+                        headers=origin,
+                    )
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(response.json()["detail"],
+                                     grid_main.RISK_OVERRIDE_DENIED)
+                    self.assertFalse(bot.queued)
             finally:
                 grid_main.app.state.grid_bot = None
 
