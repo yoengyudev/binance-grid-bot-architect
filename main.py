@@ -3,24 +3,30 @@
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import math
 import os
+import secrets
 import sys
 import time
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
 
 import ccxt
+import jwt
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
 from database import GridDatabase
 from exchange_handler import config_path, create_exchange, load_config
@@ -43,16 +49,98 @@ BREAKOUT_TIMER_KEY = "upper_breakout_timer"
 BREAKOUT_WIDTH_KEY = "breakout_width_percent"
 BREAKOUT_NOTICE_KEY = "breakout_notification_pending"
 BREAKOUT_COOLDOWN_SECONDS = 4 * 60 * 60
+MOCK_ADMIN_PASSWORD = "admin123"
+JWT_ALGORITHM = "HS256"
+JWT_ISSUER = "grid-bot"
+JWT_AUDIENCE = "grid-dashboard"
+JWT_LIFETIME_SECONDS = 15 * 60
 OpenOrderEntry = Tuple[Optional[Decimal], Optional[Decimal]]
 
 app = FastAPI(title="Grid Bot Status API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 app.state.grid_bot = None
+app.state.preview_jwt_secret = secrets.token_urlsafe(48)
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+class LoginRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+
+
+def _auth_configuration() -> Tuple[str, str]:
+    """Require private credentials for a live bot; allow explicit mock previews."""
+    password = os.getenv("BOT_ADMIN_PASSWORD")
+    secret = os.getenv("BOT_JWT_SECRET")
+    if password and secret and len(secret) >= 32:
+        return password, secret
+    if os.getenv("BOT_AUTH_MOCK_ENABLED") == "1" and app.state.grid_bot is None:
+        return MOCK_ADMIN_PASSWORD, app.state.preview_jwt_secret
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Admin authentication is not configured.",
+    )
+
+
+@app.post("/api/auth/login")
+def login(request: LoginRequest) -> Dict[str, Any]:
+    password, secret = _auth_configuration()
+    if not hmac.compare_digest(request.password, password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "sub": "admin",
+            "iss": JWT_ISSUER,
+            "aud": JWT_AUDIENCE,
+            "iat": now,
+            "nbf": now,
+            "exp": now + timedelta(seconds=JWT_LIFETIME_SECONDS),
+        },
+        secret,
+        algorithm=JWT_ALGORITHM,
+    )
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": JWT_LIFETIME_SECONDS,
+    }
+
+
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> str:
+    """Validate a bearer token for future admin-only API endpoints."""
+    unauthorized = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired token.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    if credentials is None:
+        raise unauthorized
+    try:
+        _, secret = _auth_configuration()
+        claims = jwt.decode(
+            credentials.credentials,
+            secret,
+            algorithms=[JWT_ALGORITHM],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+            options={"require": ["sub", "iss", "aud", "iat", "nbf", "exp"]},
+        )
+    except (jwt.InvalidTokenError, HTTPException):
+        raise unauthorized from None
+    if claims.get("sub") != "admin":
+        raise unauthorized
+    return "admin"
 
 
 def _unavailable_wallet() -> Dict[str, Optional[float]]:

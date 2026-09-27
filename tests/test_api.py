@@ -1,11 +1,15 @@
 import asyncio
+import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+import jwt
+from fastapi import Depends, FastAPI
 
 import main as grid_main
 from database import GridDatabase
@@ -62,7 +66,10 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     grid_main.app.state.grid_bot = None
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["access-control-allow-origin"], "*")
+        self.assertEqual(
+            response.headers["access-control-allow-origin"],
+            "http://localhost:5173",
+        )
         self.assertEqual(response.json(), {
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "grid_levels": 2,
@@ -73,6 +80,142 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             },
         })
         self.assertEqual(resumed.json()["safety_pause"], "Normal")
+
+    async def test_admin_login_and_bearer_dependency(self) -> None:
+        protected_app = FastAPI()
+
+        @protected_app.get("/protected")
+        def protected(user: str = Depends(grid_main.get_current_user)) -> dict:
+            return {"user": user}
+
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "",
+            "BOT_JWT_SECRET": "",
+            "BOT_AUTH_MOCK_ENABLED": "1",
+        }):
+            grid_main.app.state.grid_bot = None
+            async with (
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="http://testserver",
+                ) as auth_client,
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=protected_app),
+                    base_url="http://testserver",
+                ) as protected_client,
+            ):
+                wrong = await auth_client.post(
+                    "/api/auth/login", json={"password": "wrong"}
+                )
+                self.assertEqual(wrong.status_code, 401)
+                login = await auth_client.post(
+                    "/api/auth/login", json={"password": "admin123"}
+                )
+                self.assertEqual(login.status_code, 200)
+                token = login.json()["access_token"]
+                self.assertEqual(login.json()["expires_in"], 900)
+                self.assertEqual(login.json()["token_type"], "bearer")
+                self.assertEqual((await protected_client.get("/protected")).status_code, 401)
+                self.assertEqual(
+                    (await protected_client.get(
+                        "/protected", headers={"Authorization": "Bearer invalid"}
+                    )).status_code, 401,
+                )
+                authorized = await protected_client.get(
+                    "/protected", headers={"Authorization": f"Bearer {token}"}
+                )
+                self.assertEqual(authorized.json(), {"user": "admin"})
+                expired = jwt.encode({
+                    "sub": "admin", "iss": grid_main.JWT_ISSUER,
+                    "aud": grid_main.JWT_AUDIENCE,
+                    "iat": datetime.now(timezone.utc) - timedelta(hours=1),
+                    "nbf": datetime.now(timezone.utc) - timedelta(hours=1),
+                    "exp": datetime.now(timezone.utc) - timedelta(minutes=1),
+                }, grid_main.app.state.preview_jwt_secret, algorithm="HS256")
+                self.assertEqual(
+                    (await protected_client.get(
+                        "/protected", headers={"Authorization": f"Bearer {expired}"}
+                    )).status_code, 401,
+                )
+                forged = jwt.encode({
+                    "sub": "admin", "iss": grid_main.JWT_ISSUER,
+                    "aud": grid_main.JWT_AUDIENCE,
+                    "iat": datetime.now(timezone.utc),
+                    "nbf": datetime.now(timezone.utc),
+                    "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+                }, "a-different-signing-secret-with-enough-length",
+                    algorithm="HS256")
+                self.assertEqual(
+                    (await protected_client.get(
+                        "/protected", headers={"Authorization": f"Bearer {forged}"}
+                    )).status_code, 401,
+                )
+                preflight = await auth_client.options(
+                    "/api/auth/login",
+                    headers={
+                        "Origin": "http://127.0.0.1:5173",
+                        "Access-Control-Request-Method": "POST",
+                        "Access-Control-Request-Headers": "content-type",
+                    },
+                )
+                self.assertEqual(preflight.status_code, 200)
+                self.assertEqual(
+                    preflight.headers["access-control-allow-origin"],
+                    "http://127.0.0.1:5173",
+                )
+                blocked_origin = await auth_client.options(
+                    "/api/auth/login",
+                    headers={
+                        "Origin": "https://example.invalid",
+                        "Access-Control-Request-Method": "POST",
+                    },
+                )
+                self.assertNotIn(
+                    "access-control-allow-origin", blocked_origin.headers
+                )
+
+    async def test_live_bot_never_uses_mock_password(self) -> None:
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "",
+            "BOT_JWT_SECRET": "",
+            "BOT_AUTH_MOCK_ENABLED": "1",
+        }):
+            grid_main.app.state.grid_bot = object()
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="http://testserver",
+                ) as client:
+                    response = await client.post(
+                        "/api/auth/login", json={"password": "admin123"}
+                    )
+                self.assertEqual(response.status_code, 503)
+            finally:
+                grid_main.app.state.grid_bot = None
+
+    async def test_live_bot_uses_private_admin_configuration(self) -> None:
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+            "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+            "BOT_AUTH_MOCK_ENABLED": "1",
+        }):
+            grid_main.app.state.grid_bot = object()
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="http://testserver",
+                ) as client:
+                    mock = await client.post(
+                        "/api/auth/login", json={"password": "admin123"}
+                    )
+                    private = await client.post(
+                        "/api/auth/login",
+                        json={"password": "unique-private-admin-password"},
+                    )
+                self.assertEqual(mock.status_code, 401)
+                self.assertEqual(private.status_code, 200)
+            finally:
+                grid_main.app.state.grid_bot = None
 
     async def test_wallet_values_carry_and_partial_sell_without_guessing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
