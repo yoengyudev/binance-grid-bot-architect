@@ -33,6 +33,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "safety_pause": "Normal", "pause_mode": None,
                     "trading_state": "ACTIVE", "grid_levels": 0,
                     "lower_bound": None, "upper_bound": None,
+                    "atr_value": None, "atr_percentage": None,
                     "wallet": {
                         "btc_held": None, "average_cost": None,
                         "unrealized_pnl": None,
@@ -58,6 +59,9 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 grid_main.app.state.grid_bot = SimpleNamespace(
                     config=SimpleNamespace(symbol="BTC/USDT"), database=database
                 )
+                grid_main.app.state.atr_snapshot = {
+                    "atr_value": 850.5, "atr_percentage": 1.0,
+                }
                 try:
                     response = await client.get(
                         "/api/bot/status",
@@ -71,6 +75,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     liquidated = await client.get("/api/bot/status")
                 finally:
                     grid_main.app.state.grid_bot = None
+                    grid_main.app.state.atr_snapshot = None
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -83,6 +88,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "trading_state": "ACTIVE",
             "grid_levels": 2,
             "lower_bound": 81000.0, "upper_bound": 90000.0,
+            "atr_value": 850.5, "atr_percentage": 1.0,
             "wallet": {
                 "btc_held": 0.02, "average_cost": 81000.0,
                 "unrealized_pnl": 80.0,
@@ -91,6 +97,19 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resumed.json()["safety_pause"], "Normal")
         self.assertEqual(liquidated.json()["trading_state"], grid_main.LIQUIDATED)
         self.assertEqual(liquidated.json()["wallet"]["btc_held"], 0.0001)
+
+    async def test_hourly_atr_uses_15_candles_and_handles_missing_data(self) -> None:
+        candles = [
+            [index * 3_600_000, 100, 110, 90, 100, 1]
+            for index in range(15)
+        ]
+        snapshot = grid_main._calculate_atr_snapshot(candles)
+        self.assertIsNotNone(snapshot)
+        self.assertAlmostEqual(snapshot["atr_value"], 20)
+        self.assertAlmostEqual(snapshot["atr_percentage"], 20)
+        self.assertIsNone(grid_main._calculate_atr_snapshot(candles[:14]))
+        candles[-1][4] = None
+        self.assertIsNone(grid_main._calculate_atr_snapshot(candles))
 
     async def test_admin_login_uses_strict_httponly_cookie(self) -> None:
         protected_app = FastAPI()

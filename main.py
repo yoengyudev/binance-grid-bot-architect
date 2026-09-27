@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 
 import ccxt
 import jwt
+import pandas as pd
+import pandas_ta
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
@@ -56,6 +58,7 @@ BREAKOUT_TIMER_KEY = "upper_breakout_timer"
 BREAKOUT_WIDTH_KEY = "breakout_width_percent"
 BREAKOUT_NOTICE_KEY = "breakout_notification_pending"
 BREAKOUT_COOLDOWN_SECONDS = 4 * 60 * 60
+ATR_REFRESH_SECONDS = 60
 MOCK_ADMIN_PASSWORD = "admin123"
 JWT_ALGORITHM = "HS256"
 JWT_ISSUER = "grid-bot"
@@ -94,6 +97,7 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 app.state.grid_bot = None
+app.state.atr_snapshot = None
 app.state.preview_jwt_secret = secrets.token_urlsafe(48)
 
 
@@ -303,6 +307,50 @@ def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
         return _unavailable_wallet()
 
 
+def _calculate_atr_snapshot(candles: List[List[float]]) -> Optional[Dict[str, float]]:
+    """Calculate 14-period ATR from 15 hourly OHLCV candles."""
+    if len(candles) < 15:
+        return None
+    frame = pd.DataFrame(
+        candles, columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
+    for column in ("high", "low", "close"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if frame[["high", "low", "close"]].isna().any().any():
+        return None
+    close = float(frame["close"].iloc[-1])
+    if not math.isfinite(close) or close <= 0:
+        return None
+    values = pandas_ta.atr(
+        high=frame["high"], low=frame["low"], close=frame["close"], length=14
+    )
+    if values is None or values.empty:
+        return None
+    atr_value = float(values.iloc[-1])
+    if not math.isfinite(atr_value) or atr_value < 0:
+        return None
+    return {"atr_value": atr_value, "atr_percentage": atr_value / close * 100}
+
+
+def _fetch_atr_snapshot(bot: "GridBot") -> Optional[Dict[str, float]]:
+    with bot.exchange_lock:
+        candles = bot.exchange.fetch_ohlcv(
+            bot.config.symbol, timeframe="1h", limit=15
+        )
+    return _calculate_atr_snapshot(candles)
+
+
+async def _refresh_atr(bot: "GridBot") -> None:
+    """Keep CCXT and Pandas work off the API and trading event loop."""
+    while True:
+        try:
+            app.state.atr_snapshot = await asyncio.to_thread(_fetch_atr_snapshot, bot)
+        except Exception as error:
+            app.state.atr_snapshot = None
+            LOGGER.warning("Hourly ATR unavailable: %s", type(error).__name__)
+        await asyncio.sleep(ATR_REFRESH_SECONDS)
+
+
 @app.get("/api/bot/status")
 def bot_status() -> Dict[str, Any]:
     """Summarize persisted grid orders; only a running bot is marked online."""
@@ -314,6 +362,7 @@ def bot_status() -> Dict[str, Any]:
     ]
     prices = [Decimal(order["price"]) for order in orders]
     safety_mode = database.get_state(SAFETY_MODE_KEY)
+    atr = app.state.atr_snapshot if bot is not None else None
     return {
         "status": "Online" if bot is not None else "Offline",
         "pair": bot.config.symbol if bot is not None else "BTC/USDT",
@@ -329,6 +378,8 @@ def bot_status() -> Dict[str, Any]:
         "upper_bound": float(max(prices)) if prices else None,
         "wallet": _portfolio_wallet(database) if bot is not None
                   else _unavailable_wallet(),
+        "atr_value": atr["atr_value"] if atr is not None else None,
+        "atr_percentage": atr["atr_percentage"] if atr is not None else None,
     }
 
 
@@ -2066,6 +2117,7 @@ def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> Gri
 async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
     """Run the local API and trading loop with outbound alerts only."""
     app.state.grid_bot = bot
+    app.state.atr_snapshot = None
     server = uvicorn.Server(uvicorn.Config(
         app, host=os.getenv("BOT_API_HOST", "127.0.0.1"),
         port=8000, log_level="warning",
@@ -2084,9 +2136,12 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
                 LOGGER.error("Status API stopped while the trading bot is running.")
 
     api_task = asyncio.create_task(serve_api(), name="status-api")
+    atr_task = asyncio.create_task(_refresh_atr(bot), name="hourly-atr")
     try:
         await bot.run(notifier)
     finally:
+        atr_task.cancel()
+        await asyncio.gather(atr_task, return_exceptions=True)
         server.should_exit = True
         try:
             await asyncio.wait_for(
@@ -2097,6 +2152,7 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
             await asyncio.gather(api_task, return_exceptions=True)
         finally:
             app.state.grid_bot = None
+            app.state.atr_snapshot = None
 
 
 def main() -> int:
