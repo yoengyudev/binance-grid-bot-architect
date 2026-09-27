@@ -36,6 +36,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "atr_value": None, "atr_percentage": None,
                     "bid_volume": None, "ask_volume": None,
                     "imbalance_ratio": None,
+                    "current_hard_stop_loss": None,
+                    "high_water_mark": None,
                     "wallet": {
                         "btc_held": None, "average_cost": None,
                         "unrealized_pnl": None,
@@ -58,8 +60,12 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                                    '"base_fee":"0","quote_fee":"0"}')
                 database.set_state(grid_main.LAST_MARKET_PRICE_KEY, "85000")
                 database.set_state(grid_main.SAFETY_MODE_KEY, grid_main.PAUSED_DOWNSIDE)
+                database.set_state(grid_main.TRAILING_STOP_KEY,
+                                   '{"high_water_mark":"85000",'
+                                   '"stop_loss_distance":"15000"}')
                 grid_main.app.state.grid_bot = SimpleNamespace(
-                    config=SimpleNamespace(symbol="BTC/USDT"), database=database
+                    config=SimpleNamespace(symbol="BTC/USDT",
+                                           stop_loss_price=70000), database=database
                 )
                 grid_main.app.state.atr_snapshot = {
                     "atr_value": 850.5, "atr_percentage": 1.0,
@@ -98,6 +104,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "atr_value": 850.5, "atr_percentage": 1.0,
             "bid_volume": 15.2, "ask_volume": 4.1,
             "imbalance_ratio": 15.2 / 4.1,
+            "current_hard_stop_loss": 70000.0,
+            "high_water_mark": 85000.0,
             "wallet": {
                 "btc_held": 0.02, "average_cost": 81000.0,
                 "unrealized_pnl": 80.0,

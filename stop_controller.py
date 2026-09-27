@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from threading import Event, Lock, RLock
-from typing import Any, Optional
+from typing import Any, Callable, Dict, Optional
 
 from database import GridDatabase
 
@@ -40,11 +40,15 @@ class StopController:
         self.stop_requested.set()
         return self.cancel_tracked_orders()
 
-    def cancel_tracked_orders(self) -> StopResult:
+    def cancel_tracked_orders(
+        self, predicate: Optional[Callable[[Dict[str, Any]], bool]] = None
+    ) -> StopResult:
         """Cancel tracked orders without pausing the trading loop."""
         canceled = filled = unresolved = 0
         with self._lock:
             for order in self.database.fetch_active_grids():
+                if predicate is not None and not predicate(order):
+                    continue
                 order_id = order["order_id"]
                 reference = order.get("exchange_order_id") or order_id
                 params = (

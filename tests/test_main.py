@@ -240,6 +240,58 @@ class GridBotTests(unittest.TestCase):
                 grid_main._portfolio_wallet(bot.database)["unrealized_pnl"], 25.0
             )
 
+    def test_trailing_stop_raises_only_and_survives_restart_before_liquidation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            original_config = bot.config
+            bot.run_cycle()
+            exchange.price = Decimal("110")
+            bot.run_cycle()
+            self.assertEqual(bot.high_water_mark, Decimal("110"))
+            self.assertEqual(bot.stop_loss_distance, Decimal("30"))
+            self.assertEqual(bot.config.stop_loss_price, Decimal("80"))
+            exchange.price = Decimal("105")
+            bot.run_cycle()
+            self.assertEqual(bot.config.stop_loss_price, Decimal("80"))
+            self.assertEqual(bot.high_water_mark, Decimal("110"))
+
+            active_config = _apply_active_grid_config(original_config,
+                                                       GridDatabase(path))
+            reopened = GridBot(active_config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            self.assertEqual(reopened.high_water_mark, Decimal("110"))
+            self.assertEqual(reopened.stop_loss_distance, Decimal("30"))
+            exchange.price = Decimal("79")
+            reopened.run_cycle()
+            self.assertEqual(reopened.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+            self.assertEqual(exchange.market_sell_calls, 1)
+
+    def test_trailing_stop_cancels_unsafe_buys_without_resetting_breakout_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            self.assertTrue(any(order["side"] == "buy" for order in
+                                exchange.fetch_open_orders("BTC/USDT")))
+            exchange.price = Decimal("121")
+            with patch.object(grid_main.time, "time", return_value=0):
+                bot.run_cycle()
+            self.assertEqual(bot.config.stop_loss_price, Decimal("91"))
+            self.assertFalse(any(order["side"] == "buy" for order in
+                                 exchange.fetch_open_orders("BTC/USDT")))
+            self.assertTrue(any(order["side"] == "sell" for order in
+                                exchange.fetch_open_orders("BTC/USDT")))
+            self.assertEqual(json.loads(bot.database.get_state(
+                grid_main.BREAKOUT_TIMER_KEY))["started_at"], 0)
+            exchange.price = Decimal("122")
+            with patch.object(grid_main.time, "time", return_value=60):
+                bot.run_cycle()
+            self.assertEqual(bot.config.stop_loss_price, Decimal("92"))
+            self.assertEqual(json.loads(bot.database.get_state(
+                grid_main.BREAKOUT_TIMER_KEY))["started_at"], 0)
+
     def test_geometric_levels_and_buy_sell_cycle(self) -> None:
         self.assertEqual(
             geometric_levels(Decimal("100"), Decimal("80"), Decimal("10")),
@@ -552,7 +604,7 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("140")
             bot.database.set_state(grid_main.BREAKOUT_TIMER_KEY, json.dumps({
                 "started_at": 0, "last_seen_at": 14340,
-                "grid_fingerprint": bot.config.fingerprint(),
+                "grid_fingerprint": bot.config.breakout_fingerprint(),
             }))
             with patch.object(grid_main.time, "time", return_value=14400):
                 self.assertEqual(bot.run_cycle(), [])
@@ -599,6 +651,17 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(restarted.config.lower_price, Decimal("170.00"))
             self.assertEqual(restarted.config.upper_price, Decimal("230.00"))
             self.assertEqual(restarted.breakout_width_percent, Decimal("15"))
+            exchange.price = Decimal("250")
+            restarted._request_breakout_reset(exchange.price)
+            self.assertTrue(restarted.reset_grid())
+            self.assertEqual(restarted.config.stop_loss_price, Decimal("220"))
+            self.assertGreater(restarted.config.stop_loss_price,
+                               restarted.config.lower_price)
+            self.assertTrue(all(
+                order["side"] != "buy" or Decimal(order["price"]) >
+                restarted.config.stop_loss_price
+                for order in exchange.fetch_open_orders("BTC/USDT")
+            ))
 
     def test_breakout_fade_before_cancellation_keeps_old_orders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -679,10 +742,14 @@ class GridBotTests(unittest.TestCase):
             restarted.prepare(persist=False)
             self.assertTrue(restarted.reset_grid())
             self.assertEqual(restarted.config.stop_loss_price, Decimal("71.4"))
+            self.assertEqual(restarted.high_water_mark, Decimal("102"))
+            self.assertEqual(restarted.stop_loss_distance, Decimal("30.6"))
             saved_config = _apply_active_grid_config(bot.config, GridDatabase(path))
             self.assertEqual(saved_config.stop_loss_price, Decimal("71.4"))
             self.assertEqual(saved_config.lower_price, Decimal("81.6"))
-            GridBot(saved_config, exchange, GridDatabase(path)).prepare(persist=False)
+            reopened = GridBot(saved_config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            self.assertEqual(reopened.high_water_mark, Decimal("102"))
 
     def test_stale_manual_recenter_keeps_original_pause_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -909,6 +976,8 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(bot.set_stop_loss("74"), Decimal("74"))
 
             self.assertEqual(bot.config.stop_loss_price, Decimal("74"))
+            with self.assertRaisesRegex(ValueError, "cannot be lowered"):
+                bot.set_stop_loss("73")
             self.assertFalse(bot.grid_needs_reset)
             self.assertIsNone(bot.database.get_state("grid_reset"))
             self.assertEqual(

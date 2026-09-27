@@ -292,7 +292,9 @@ class GridDatabase:
                 (key, value),
             )
 
-    def update_runtime_grid_settings(self, grid_run: str, active_config: str) -> None:
+    def update_runtime_grid_settings(self, grid_run: str, active_config: str,
+                                     *, trailing_stop: Optional[str] = None,
+                                     allow_pending_reset: bool = False) -> None:
         """Persist a setting change with its matching run fingerprint atomically."""
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -302,12 +304,16 @@ class GridDatabase:
             pending_reset = connection.execute(
                 "SELECT 1 FROM bot_state WHERE key = 'grid_reset'"
             ).fetchone()
-            if saved_run is None or pending_reset is not None:
+            if saved_run is None or (pending_reset is not None and
+                                     not allow_pending_reset):
                 raise ValueError("A running grid without a pending reset is required.")
-            for key, value in (
+            states = [
                 ("grid_run", grid_run),
                 ("active_grid_config", active_config),
-            ):
+            ]
+            if trailing_stop is not None:
+                states.append(("trailing_stop", trailing_stop))
+            for key, value in states:
                 connection.execute(
                     "INSERT INTO bot_state (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -320,6 +326,7 @@ class GridDatabase:
                             carry_amount: Optional[str] = None,
                             carry_cost: Optional[str] = None,
                             breakout_width_percent: Optional[str] = None,
+                            trailing_stop: Optional[str] = None,
                             clear_liquidation_state: bool = False) -> None:
         """Archive old lanes and switch runs in one SQLite transaction."""
         with self._connection() as connection:
@@ -361,6 +368,8 @@ class GridDatabase:
             ]
             if breakout_width_percent is not None:
                 states.append(("breakout_width_percent", breakout_width_percent))
+            if trailing_stop is not None:
+                states.append(("trailing_stop", trailing_stop))
             for key, value in states:
                 connection.execute(
                     "INSERT INTO bot_state (key, value) VALUES (?, ?) "

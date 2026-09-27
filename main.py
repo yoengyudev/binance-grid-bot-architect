@@ -53,6 +53,7 @@ SAFETY_PAUSE_NOTICE_KEY = "safety_pause_notice_pending"
 SAFETY_RECOVERY_NOTICE_KEY = "safety_recovery_notice_pending"
 SAFETY_RESUME_NOTICE_KEY = "safety_resume_notice_pending"
 LAST_MARKET_PRICE_KEY = "last_market_price"
+TRAILING_STOP_KEY = "trailing_stop"
 FILL_SNAPSHOT_PREFIX = "fill_snapshot:"
 BREAKOUT_TIMER_KEY = "upper_breakout_timer"
 BREAKOUT_WIDTH_KEY = "breakout_width_percent"
@@ -414,6 +415,21 @@ def bot_status() -> Dict[str, Any]:
     safety_mode = database.get_state(SAFETY_MODE_KEY)
     atr = app.state.atr_snapshot if bot is not None else None
     order_book = app.state.order_book_snapshot if bot is not None else None
+    stop_value = getattr(bot.config, "stop_loss_price", None) if bot is not None else None
+    if stop_value is None:
+        active_text = database.get_state("active_grid_config")
+        if active_text:
+            try:
+                stop_value = Decimal(json.loads(active_text)["stop_loss_price"])
+            except (KeyError, ValueError, InvalidOperation, TypeError):
+                stop_value = None
+    high_water_mark = None
+    trailing_text = database.get_state(TRAILING_STOP_KEY)
+    if trailing_text:
+        try:
+            high_water_mark = Decimal(json.loads(trailing_text)["high_water_mark"])
+        except (KeyError, ValueError, InvalidOperation, TypeError):
+            pass
     return {
         "status": "Online" if bot is not None else "Offline",
         "pair": bot.config.symbol if bot is not None else "BTC/USDT",
@@ -434,6 +450,9 @@ def bot_status() -> Dict[str, Any]:
         "bid_volume": order_book["bid_volume"] if order_book is not None else None,
         "ask_volume": order_book["ask_volume"] if order_book is not None else None,
         "imbalance_ratio": order_book["imbalance_ratio"] if order_book is not None else None,
+        "current_hard_stop_loss": float(stop_value) if stop_value is not None else None,
+        "high_water_mark": (float(high_water_mark)
+                            if high_water_mark is not None else None),
     }
 
 
@@ -578,6 +597,19 @@ class GridConfig:
         encoded = json.dumps(parameters, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def breakout_fingerprint(self) -> str:
+        """Grid geometry stays stable when the trailing stop rises."""
+        parameters = {
+            "symbol": self.symbol,
+            "investment_quote": str(self.investment_quote),
+            "lower_price": str(self.lower_price),
+            "upper_price": str(self.upper_price),
+            "spacing_percent": str(self.spacing_percent),
+            "initial_inventory_percent": str(self.initial_inventory_percent),
+        }
+        encoded = json.dumps(parameters, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
 
 def geometric_levels(anchor: Decimal, lower: Decimal, spacing_percent: Decimal) -> List[Decimal]:
     """Each next buy price is a percentage below the previous level."""
@@ -633,6 +665,8 @@ class GridBot:
         self.levels: List[Decimal] = []
         self.upper_levels: List[Decimal] = []
         self.baseline_base: Optional[Decimal] = None
+        self.high_water_mark: Optional[Decimal] = None
+        self.stop_loss_distance: Optional[Decimal] = None
         self._post_only_rejected_in_cycle = False
         safety_mode = self.database.get_state(SAFETY_MODE_KEY)
         if safety_mode not in (None, PAUSED_DOWNSIDE, PAUSED_MANUAL,
@@ -801,6 +835,8 @@ class GridBot:
                 raise ValueError(
                     "❌ Rejected: Stop-loss must be lower than the current lower bound."
                 )
+            if stop_loss < self.config.stop_loss_price:
+                raise ValueError("The trailing hard stop cannot be lowered.")
             if self.stop_controller.stop_requested.is_set():
                 raise RuntimeError("Bot is stopping; stop-loss was not changed.")
             if self.grid_needs_reset:
@@ -819,10 +855,20 @@ class GridBot:
                 "spacing": str(new_config.spacing_percent),
                 "stop_loss_price": str(stop_loss),
             }
+            if self.high_water_mark is None:
+                raise TradingHalt("Trailing stop was not initialized.")
+            distance = self.high_water_mark - stop_loss
+            if distance <= 0:
+                raise ValueError("Stop-loss must remain below the high water mark.")
             self.database.update_runtime_grid_settings(
-                json.dumps(saved, sort_keys=True), json.dumps(active, sort_keys=True)
+                json.dumps(saved, sort_keys=True), json.dumps(active, sort_keys=True),
+                trailing_stop=json.dumps({
+                    "high_water_mark": str(self.high_water_mark),
+                    "stop_loss_distance": str(distance),
+                }, sort_keys=True),
             )
             self.config = new_config
+            self.stop_loss_distance = distance
         return stop_loss
 
     def request_grid_reset(self, lower_text: str, upper_text: str) -> None:
@@ -883,11 +929,17 @@ class GridBot:
                     raise TradingHalt("No active grid run is available.")
                 if requested_stop is None and self.config.stop_loss_price >= lower:
                     raise ValueError("New lower bound must exceed the pause trigger.")
-                geometric_levels(center, lower, self.config.spacing_percent)
+                candidate_buys = geometric_levels(
+                    center, lower, self.config.spacing_percent
+                )
                 geometric_upper_levels(center, upper, self.config.spacing_percent)
                 price = self._ticker_price()
+                self.advance_trailing_stop(price)
                 if price <= self.config.stop_loss_price:
                     raise TradingHalt("Market is at the pause trigger; recentering is unavailable.")
+                planned_stop = requested_stop or self.config.stop_loss_price
+                if not any(self._price(raw) > planned_stop for raw in candidate_buys):
+                    raise ValueError("Hard stop leaves no safe BUY grid level.")
                 ratio = 1 + self.config.spacing_percent / 100
                 if not center / ratio < price < center * ratio:
                     raise ValueError("Center must be close to the live market price.")
@@ -932,6 +984,8 @@ class GridBot:
         active = {"lower": str(lower), "upper": str(upper),
                   "spacing": str(new_config.spacing_percent),
                   "stop_loss_price": str(stop_loss)}
+        trailing = {"high_water_mark": str(center),
+                    "stop_loss_distance": str(center - stop_loss)}
         request = {"phase": "placing", "source": "manual_liquidation_reset",
                    "lower": str(lower), "upper": str(upper),
                    "spacing": str(new_config.spacing_percent)}
@@ -939,6 +993,7 @@ class GridBot:
             json.dumps(run, sort_keys=True), json.dumps(active, sort_keys=True),
             json.dumps(request, sort_keys=True),
             breakout_width_percent=str(width_percent),
+            trailing_stop=json.dumps(trailing, sort_keys=True),
             clear_liquidation_state=True,
         )
         self.database.clear_state(BREAKOUT_TIMER_KEY)
@@ -947,6 +1002,8 @@ class GridBot:
         self.baseline_base = baseline
         self.levels, self.upper_levels = lowers, uppers
         self.breakout_width_percent = width_percent
+        self.high_water_mark = center
+        self.stop_loss_distance = center - stop_loss
         self.pending_grid_bounds = (lower, upper)
         self.grid_needs_reset = True
         self.is_paused = False
@@ -958,10 +1015,12 @@ class GridBot:
         width = self.breakout_width_percent / 100
         lower = price * (1 - width)
         upper = price * (1 + width)
-        if not self.config.stop_loss_price < lower < price < upper:
-            raise TradingHalt("Breakout bounds would violate the pause trigger.")
-        geometric_levels(price, lower, self.config.spacing_percent)
+        if not lower < price < upper or self.config.stop_loss_price >= price:
+            raise TradingHalt("Breakout bounds would violate the hard stop.")
+        lowers = geometric_levels(price, lower, self.config.spacing_percent)
         geometric_upper_levels(price, upper, self.config.spacing_percent)
+        if not any(self._price(raw) > self.config.stop_loss_price for raw in lowers):
+            raise TradingHalt("Trailing stop leaves no safe BUY grid level.")
         with self._grid_lock:
             if self.stop_controller.stop_requested.is_set() or self.grid_needs_reset:
                 return
@@ -995,7 +1054,7 @@ class GridBot:
                 last = float(prior["last_seen_at"])
                 if (not math.isfinite(started) or not math.isfinite(last) or
                         started > last or last > now or
-                        prior["grid_fingerprint"] != self.config.fingerprint() or
+                        prior["grid_fingerprint"] != self.config.breakout_fingerprint() or
                         now - last > max(60, self.config.poll_seconds * 3)):
                     prior = None
             except (TypeError, ValueError, KeyError):
@@ -1007,7 +1066,7 @@ class GridBot:
         self.database.set_state(BREAKOUT_TIMER_KEY, json.dumps({
             "started_at": started,
             "last_seen_at": now,
-            "grid_fingerprint": self.config.fingerprint(),
+            "grid_fingerprint": self.config.breakout_fingerprint(),
         }, sort_keys=True))
         return False
 
@@ -1021,6 +1080,48 @@ class GridBot:
         if not price.is_finite() or price <= 0:
             raise TradingHalt("Ticker has no valid last price.")
         return price
+
+    def advance_trailing_stop(self, price: Decimal) -> None:
+        """Persist a new high and raised liquidation floor as one grid update."""
+        with self._cycle_lock, self._grid_lock:
+            if self.high_water_mark is None or self.stop_loss_distance is None:
+                raise TradingHalt("Trailing stop was not initialized.")
+            if price <= self.high_water_mark:
+                return
+            if self.database.get_state(SAFETY_MODE_KEY) in (
+                    LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
+                return
+            saved_text = self.database.get_state("grid_run")
+            if saved_text is None:
+                raise TradingHalt("No active grid run is available for trailing.")
+            saved = json.loads(saved_text)
+            if saved["fingerprint"] != self.config.fingerprint():
+                raise TradingHalt("Saved grid settings changed during trailing.")
+            proposed_stop = price - self.stop_loss_distance
+            new_stop = max(self.config.stop_loss_price, proposed_stop)
+            new_config = replace(self.config, stop_loss_price=new_stop)
+            saved["fingerprint"] = new_config.fingerprint()
+            active = {
+                "lower": str(new_config.lower_price),
+                "upper": str(new_config.upper_price),
+                "spacing": str(new_config.spacing_percent),
+                "stop_loss_price": str(new_stop),
+            }
+            trailing = {
+                "high_water_mark": str(price),
+                "stop_loss_distance": str(self.stop_loss_distance),
+            }
+            self.database.update_runtime_grid_settings(
+                json.dumps(saved, sort_keys=True),
+                json.dumps(active, sort_keys=True),
+                trailing_stop=json.dumps(trailing, sort_keys=True),
+                allow_pending_reset=True,
+            )
+            if new_stop > self.config.stop_loss_price:
+                LOGGER.info("Trailing hard stop raised to %s after new high %s.",
+                            new_stop, price)
+            self.config = new_config
+            self.high_water_mark = price
 
     def prepare(
         self, *, persist: bool
@@ -1055,6 +1156,32 @@ class GridBot:
 
         if not self.config.lower_price < self.anchor < self.config.upper_price:
             raise TradingHalt("Saved anchor lies outside the configured grid bounds.")
+        trailing_text = self.database.get_state(TRAILING_STOP_KEY)
+        if trailing_text:
+            try:
+                trailing = json.loads(trailing_text)
+                self.high_water_mark = _decimal(
+                    trailing["high_water_mark"], "high_water_mark"
+                )
+                self.stop_loss_distance = _decimal(
+                    trailing["stop_loss_distance"], "stop_loss_distance"
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise TradingHalt("Saved trailing stop state is invalid.") from error
+            if (self.high_water_mark <= self.config.stop_loss_price or
+                    self.high_water_mark - self.stop_loss_distance >
+                    self.config.stop_loss_price):
+                raise TradingHalt("Saved trailing stop conflicts with the active grid.")
+        else:
+            self.high_water_mark = self.anchor
+            self.stop_loss_distance = self.anchor - self.config.stop_loss_price
+            if self.stop_loss_distance <= 0:
+                raise TradingHalt("Grid anchor must exceed the hard stop.")
+            if persist:
+                self.database.set_state(TRAILING_STOP_KEY, json.dumps({
+                    "high_water_mark": str(self.high_water_mark),
+                    "stop_loss_distance": str(self.stop_loss_distance),
+                }, sort_keys=True))
         self.levels = geometric_levels(
             self.anchor, self.config.lower_price, self.config.spacing_percent
         )
@@ -1068,6 +1195,8 @@ class GridBot:
         planned: List[Tuple[int, Decimal, Decimal]] = []
         for level, raw_price in enumerate(self.levels, start=1):
             price = self._price(raw_price)
+            if price <= self.config.stop_loss_price:
+                continue
             amount = self._amount(quote_per_level / price)
             self._check_order_size(price, amount)
             if price * amount > quote_per_level:
@@ -1312,6 +1441,8 @@ class GridBot:
             price = self._price(
                 self.anchor if level == -1 else self.upper_levels[-level - 2]
             )
+        if price <= self.config.stop_loss_price:
+            return  # Never create a BUY at or beneath the liquidation floor.
         self._check_order_size(price, amount)
         if self._free_balance(self.market["quote"]) < price * amount:
             raise TradingHalt("Insufficient free quote balance for the next grid buy.")
@@ -1443,10 +1574,14 @@ class GridBot:
                                   new_config.spacing_percent)
         uppers = geometric_upper_levels(price, new_config.upper_price,
                                         new_config.spacing_percent)
+        if not any(self._price(raw) > new_config.stop_loss_price for raw in lowers):
+            raise TradingHalt("Trailing stop leaves no safe BUY grid level.")
         seed_quote = new_config.investment_quote * new_config.initial_inventory_percent / 100
         lower_quote = (new_config.investment_quote - seed_quote) / len(lowers)
         for raw in lowers:
             level_price = self._price(raw)
+            if level_price <= new_config.stop_loss_price:
+                continue
             self._check_order_size(level_price, self._amount(lower_quote / level_price))
         upper_total = carry_amount if carry_amount > 0 else self._amount(seed_quote / price)
         upper_amount = self._amount(upper_total * (1 - SELL_AMOUNT_BUFFER) / len(uppers))
@@ -1497,6 +1632,10 @@ class GridBot:
                 raise TradingHalt("Exchange still has open orders; reset stopped.")
             carry_amount, carry_cost = self._carry_inventory()
             price = self._ticker_price()
+            self.advance_trailing_stop(price)
+            if price < self.config.stop_loss_price:
+                self._liquidate_locked(price)
+                return False
             if request.get("source") == "breakout":
                 if price <= Decimal(request["previous_upper"]):
                     if not self.config.lower_price < price < self.config.upper_price:
@@ -1534,8 +1673,8 @@ class GridBot:
                                  upper_price=Decimal(request["upper"]),
                                  spacing_percent=Decimal(request["spacing"]),
                                  stop_loss_price=stop_loss)
-            if new_config.stop_loss_price >= new_config.lower_price:
-                raise TradingHalt("New grid lower bound is below the pause trigger.")
+            if new_config.stop_loss_price >= anchor:
+                raise TradingHalt("New grid anchor is at or below the hard stop.")
             if not new_config.lower_price < price < new_config.upper_price:
                 raise TradingHalt("Price left the requested bounds during reset.")
             lowers, uppers = self._validate_reset_grid(new_config, anchor, carry_amount)
@@ -1547,6 +1686,12 @@ class GridBot:
             active = {"lower": request["lower"], "upper": request["upper"],
                       "spacing": request["spacing"],
                       "stop_loss_price": str(new_config.stop_loss_price)}
+            trailing = None
+            if request.get("source") == "manual_recenter":
+                trailing = {
+                    "high_water_mark": str(anchor),
+                    "stop_loss_distance": str(anchor - new_config.stop_loss_price),
+                }
             request["phase"] = "placing"
             carry_id = "carry-" + uuid.uuid4().hex if carry_amount > 0 else None
             self.database.complete_grid_reset(
@@ -1558,6 +1703,8 @@ class GridBot:
                 breakout_width_percent=(request["width_percent"]
                                         if request.get("source") == "manual_recenter"
                                         else None),
+                trailing_stop=(json.dumps(trailing, sort_keys=True)
+                               if trailing is not None else None),
             )
             with self._grid_lock:
                 self.config = new_config
@@ -1566,6 +1713,8 @@ class GridBot:
                 self.levels, self.upper_levels = lowers, uppers
                 if request.get("source") == "manual_recenter":
                     self.breakout_width_percent = Decimal(request["width_percent"])
+                    self.high_water_mark = anchor
+                    self.stop_loss_distance = anchor - new_config.stop_loss_price
         elif request["phase"] != "placing":
             raise TradingHalt("Unknown grid reset phase.")
         for _ in range(3):
@@ -1573,7 +1722,11 @@ class GridBot:
             if self._post_only_rejected_in_cycle:
                 return False
             latest = self.database.fetch_latest_orders_by_level()
-            expected = set(range(1, len(self.levels) + 1)) | set(
+            safe_buys = {
+                level for level, raw in enumerate(self.levels, start=1)
+                if self._price(raw) > self.config.stop_loss_price
+            }
+            expected = safe_buys | set(
                 range(-1, -len(self.upper_levels) - 1, -1)) | {0}
             if expected <= latest.keys():
                 notification_key = (
@@ -1885,6 +2038,24 @@ class GridBot:
             for row in self.database.fetch_latest_orders_by_level().values()
         )
 
+    def _cancel_buys_below_stop(self) -> None:
+        """Remove tracked BUY limits that a raised hard stop has overtaken."""
+        affected = [
+            row for row in self.database.fetch_active_grids()
+            if row["side"] == "BUY" and row["order_type"] == "LIMIT"
+            and Decimal(row["price"]) <= self.config.stop_loss_price
+        ]
+        if not affected:
+            return
+        ids = {row["order_id"] for row in affected}
+        for row in affected:
+            self.database.set_state(f"trailing_stop_buy:{row['order_id']}", "1")
+        result = self.stop_controller.cancel_tracked_orders(
+            lambda row: row["order_id"] in ids
+        )
+        if result.unresolved:
+            raise TradingHalt("BUY orders below the trailing stop need reconciliation.")
+
     def run_cycle(self) -> List[Tuple[str, Tuple[str, ...]]]:
         with self._cycle_lock:
             return self._run_cycle_locked()
@@ -1898,9 +2069,12 @@ class GridBot:
         mode = self.database.get_state(SAFETY_MODE_KEY)
         if mode in (LIQUIDATED, LIQUIDATION_HALTED):
             return []
+        if mode != LIQUIDATING:
+            self.advance_trailing_stop(current_price)
         if mode == LIQUIDATING or current_price < self.config.stop_loss_price:
             self._liquidate_locked(current_price)
             return []
+        self._cancel_buys_below_stop()
         if self._observe_upper_breakout(current_price):
             return []
         events: List[Tuple[str, Tuple[str, ...]]] = []
@@ -1961,7 +2135,10 @@ class GridBot:
                 if in_bounds:
                     self._place_buy(level, row["order_id"])
             elif (row["status"] == "CANCELED" and row["side"] == "BUY" and
-                  self.database.get_state(f"safety_pause_buy:{row['order_id']}") == "1"):
+                  (self.database.get_state(
+                      f"safety_pause_buy:{row['order_id']}") == "1" or
+                   self.database.get_state(
+                      f"trailing_stop_buy:{row['order_id']}") == "1")):
                 canceled_buy = self._fetch_order(row)
                 if _order_decimal(canceled_buy.get("filled")) > 0:
                     self._place_sell(row)
@@ -2047,6 +2224,7 @@ class GridBot:
                         continue
                     if self.grid_needs_reset:
                         price = await asyncio.to_thread(self._ticker_price)
+                        await asyncio.to_thread(self.advance_trailing_stop, price)
                         if price < self.config.stop_loss_price:
                             await asyncio.to_thread(self.liquidate, price)
                             await self._notify_liquidation(notifier)
