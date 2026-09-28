@@ -21,7 +21,10 @@ class HardResetTests(unittest.TestCase):
         }))
         self.exchange = Mock()
         self.exchange.market.return_value = {"spot": True, "active": True}
-        self.exchange.fetch_open_orders.return_value = []
+        self.exchange.fetch_open_orders.side_effect = (
+            lambda _symbol: [] if self.exchange.cancel_all_orders.call_count
+            else [{"id": "old-order"}]
+        )
         self.exchange.fetch_balance.return_value = {
             "BTC": {"free": "1", "used": "0", "total": "1"},
         }
@@ -45,15 +48,26 @@ class HardResetTests(unittest.TestCase):
             fixture.start()
             self.addCleanup(fixture.stop)
 
-    def run_utility(self, answer: str = "Y") -> int:
+    def run_utility(self, answer: str = "Y", *, keep_btc_manual=False) -> int:
         return reset_util.hard_reset(
+            keep_btc_manual=keep_btc_manual,
             input_fn=lambda _prompt: answer, output=self.messages.append,
         )
+
+    def add_bot_inventory(self) -> None:
+        self.database.insert_order(
+            "seed", 0, "BUY", "80000", "0.01", order_type="MARKET",
+        )
+        self.database.mark_order_filled("seed")
+        self.database.set_state("fill_snapshot:seed", json.dumps({
+            "filled_base": "0.01", "filled_quote": "800",
+            "base_fee": "0", "quote_fee": "0",
+        }))
 
     def test_confirmed_reset_cancels_and_verifies_before_deleting(self) -> None:
         self.assertEqual(self.run_utility(), 0)
         self.exchange.cancel_all_orders.assert_called_once_with("BTC/USDT")
-        self.exchange.fetch_open_orders.assert_called_once_with("BTC/USDT")
+        self.assertEqual(self.exchange.fetch_open_orders.call_count, 2)
         self.assertFalse(self.database_path.exists())
         self.assertIn(
             "Successfully deleted the SQLite database file.", self.messages,
@@ -75,29 +89,49 @@ class HardResetTests(unittest.TestCase):
         self.assertTrue(self.database_path.exists())
 
     def test_unconfirmed_exchange_cleanup_retains_database(self) -> None:
+        self.exchange.fetch_open_orders.side_effect = None
         self.exchange.fetch_open_orders.return_value = [{"id": "still-open"}]
         with self.assertRaisesRegex(reset_util.ResetError, "still open"):
             self.run_utility()
         self.assertTrue(self.database_path.exists())
 
-        self.exchange.fetch_open_orders.return_value = []
+        self.exchange.fetch_open_orders.return_value = [{"id": "still-open"}]
         self.exchange.cancel_all_orders.side_effect = ccxt.NetworkError("timeout")
         with self.assertRaises(ccxt.NetworkError):
             self.run_utility()
         self.assertTrue(self.database_path.exists())
 
+    def test_no_open_orders_skips_cancel_request(self) -> None:
+        self.exchange.fetch_open_orders.side_effect = None
+        self.exchange.fetch_open_orders.return_value = []
+        self.assertEqual(self.run_utility(), 0)
+        self.exchange.cancel_all_orders.assert_not_called()
+        self.assertFalse(self.database_path.exists())
+
     def test_tracked_btc_inventory_retains_database_after_cancel(self) -> None:
-        self.database.insert_order(
-            "seed", 0, "BUY", "80000", "0.01", order_type="MARKET",
-        )
-        self.database.mark_order_filled("seed")
-        self.database.set_state("fill_snapshot:seed", json.dumps({
-            "filled_base": "0.01", "filled_quote": "800",
-            "base_fee": "0", "quote_fee": "0",
-        }))
+        self.add_bot_inventory()
         with self.assertRaisesRegex(reset_util.ResetError, "Bot-tracked BTC"):
             self.run_utility()
         self.exchange.cancel_all_orders.assert_called_once()
+        self.assertTrue(self.database_path.exists())
+
+    def test_reconciled_bot_btc_can_be_kept_as_manual_holding(self) -> None:
+        self.add_bot_inventory()
+        self.exchange.fetch_balance.return_value["BTC"].update({
+            "free": "1.01", "total": "1.01",
+        })
+        self.assertEqual(self.run_utility(keep_btc_manual=True), 0)
+        self.assertFalse(self.database_path.exists())
+        self.assertTrue(any("Retaining 0.01 BTC" in message
+                            for message in self.messages))
+
+    def test_manual_holding_requires_free_reconciled_btc(self) -> None:
+        self.add_bot_inventory()
+        self.exchange.fetch_balance.return_value["BTC"].update({
+            "free": "1", "used": "0.01", "total": "1.01",
+        })
+        with self.assertRaisesRegex(reset_util.ResetError, "BTC account balance"):
+            self.run_utility(keep_btc_manual=True)
         self.assertTrue(self.database_path.exists())
 
     def test_untracked_btc_above_baseline_retains_database(self) -> None:

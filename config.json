@@ -1,18 +1,14 @@
 {
-  "exchange": {
-    "name": "binance",
-    "market_type": "spot",
-    "sandbox": true
-  },
+  "exchange": {"name": "binance", "market_type": "spot", "sandbox": true},
   "grid": {
     "symbol": "BTC/USDT",
-    "investment_quote": 1000,
-    "lower_price": 71695.8085,
-    "upper_price": 97000.2115,
-    "auto_center_percent": 15,
-    "spacing_percent": 1.5,
+    "investment_quote": 100,
+    "lower_price": 75880,
+    "upper_price": 89000,
+    "auto_center_percent": null,
+    "spacing_percent": 2.5,
     "initial_inventory_percent": 50,
-    "stop_loss_price": 71000.0,
+    "stop_loss_price": 75686.01,
     "poll_seconds": 10
   }
 }

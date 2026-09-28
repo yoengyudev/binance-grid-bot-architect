@@ -5,6 +5,7 @@ This cancels every BTC/USDT order in the account, including manual orders.
 It never sells BTC or changes the grid allocation in config.json.
 """
 
+import argparse
 import json
 import os
 import shutil
@@ -99,7 +100,38 @@ def _require_no_bot_inventory(database: GridDatabase, exchange: ccxt.binance) ->
             )
 
 
-def hard_reset(*, input_fn=input, output=print) -> int:
+def _require_manual_holding_reconciled(
+    database: GridDatabase, exchange: ccxt.binance,
+) -> Decimal:
+    """Confirm all previously tracked BTC is free and can become manual inventory."""
+    held_value = _portfolio_wallet(database)["btc_held"]
+    run_text = database.get_state("grid_run")
+    if held_value is None or not run_text:
+        raise ResetError("Cannot establish the previous bot BTC inventory and baseline.")
+    try:
+        held = Decimal(str(held_value))
+        baseline = Decimal(json.loads(run_text)["baseline_base"])
+        account = exchange.fetch_balance({"type": "spot"})["BTC"]
+        free = Decimal(str(account["free"]))
+        used = Decimal(str(account["used"]))
+        total = Decimal(str(account["total"]))
+    except (KeyError, TypeError, ValueError, InvalidOperation) as error:
+        raise ResetError("Cannot reconcile the BTC account balance; database retained.") from error
+    amounts = (held, baseline, free, used, total)
+    if any(not amount.is_finite() or amount < 0 for amount in amounts):
+        raise ResetError("Invalid BTC ledger or exchange balance; database retained.")
+    tolerance = Decimal("0.00000001")
+    if (held <= 0 or used > tolerance or
+            abs(total - free - used) > tolerance or
+            abs(total - baseline - held) > tolerance):
+        raise ResetError(
+            "BTC account balance does not match the saved baseline plus bot "
+            "inventory, or BTC is locked; database retained."
+        )
+    return held
+
+
+def hard_reset(*, keep_btc_manual=False, input_fn=input, output=print) -> int:
     """Cancel all testnet orders, verify exposure, then remove the local DB."""
     load_dotenv(dotenv_path=BASE_DIR / ".env")
     config = load_config()
@@ -122,11 +154,13 @@ def hard_reset(*, input_fn=input, output=print) -> int:
             "Keep the bot stopped until the new allocation is configured."
         )
     preview_held = _portfolio_wallet(GridDatabase(database_path))["btc_held"]
-    if preview_held is None or preview_held != 0:
+    if (preview_held is None or preview_held != 0) and not keep_btc_manual:
         output(
             "Bot inventory is present or unverifiable. Orders can be canceled, "
             "but database deletion will be blocked until inventory is reconciled."
         )
+    if keep_btc_manual:
+        output("Previously bot-tracked BTC will remain in the Spot wallet as a manual holding.")
     answer = input_fn("Cancel ALL BTC/USDT orders and delete this database? (Y/n; type Y): ")
     if answer.strip().lower() != "y":
         output("Hard reset canceled; no exchange or database changes were made.")
@@ -142,13 +176,24 @@ def hard_reset(*, input_fn=input, output=print) -> int:
     if not market.get("spot") or market.get("active") is False:
         raise ResetError("BTC/USDT is not an active Spot Testnet market.")
 
-    exchange.cancel_all_orders(SYMBOL)
+    if exchange.fetch_open_orders(SYMBOL):
+        try:
+            exchange.cancel_all_orders(SYMBOL)
+        except ccxt.OrderNotFound:
+            # A fill/cancel race may leave nothing to cancel. Verify below.
+            pass
     if exchange.fetch_open_orders(SYMBOL):
         raise ResetError("BTC/USDT orders are still open; database retained.")
     output("Successfully canceled all active BTC/USDT orders on Binance Testnet.")
 
     _require_stopped_service()
-    _require_no_bot_inventory(GridDatabase(database_path), exchange)
+    if keep_btc_manual:
+        adopted = _require_manual_holding_reconciled(
+            GridDatabase(database_path), exchange,
+        )
+        output(f"Retaining {adopted} BTC as a manual holding outside the new bot baseline.")
+    else:
+        _require_no_bot_inventory(GridDatabase(database_path), exchange)
     os.remove(database_path)
     for suffix in ("-wal", "-shm", "-journal"):
         sidecar = Path(f"{database_path}{suffix}")
@@ -162,7 +207,13 @@ def hard_reset(*, input_fn=input, output=print) -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(hard_reset())
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument(
+            "--keep-btc-manual", action="store_true",
+            help="retain reconciled bot BTC in the wallet as a manual holding",
+        )
+        args = parser.parse_args()
+        sys.exit(hard_reset(keep_btc_manual=args.keep_btc_manual))
     except ResetError as error:
         print(f"Hard reset stopped: {error}", file=sys.stderr)
     except (ccxt.NetworkError, ccxt.ExchangeError) as error:
