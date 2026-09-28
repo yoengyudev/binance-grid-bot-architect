@@ -245,6 +245,91 @@ class GridBotTests(unittest.TestCase):
         bot.prepare(persist=True)
         return bot, exchange
 
+    def test_startup_checks_rounded_buy_cost_and_seed_before_any_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
+                Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            )
+            exchange = FakeSpotExchange()
+            bot = GridBot(config, exchange, GridDatabase(Path(directory) / "grid.sqlite3"))
+            _, planned, _ = bot.prepare(persist=False)
+            required_limits = sum((price * amount for _, price, amount in planned),
+                                  Decimal(0))
+            self.assertEqual(
+                bot._required_buy_limit_quote(config, bot.levels, config.stop_loss_price),
+                required_limits,
+            )
+            required_total = required_limits + bot._seed_quote()
+            exchange.quote_free = required_total - Decimal("0.01")
+            with self.assertRaisesRegex(
+                grid_main.InsufficientGridCapital, "Insufficient Capital: Grid requires"
+            ):
+                bot.prepare(persist=True)
+            self.assertIsNone(bot.database.get_state("grid_run"))
+            self.assertEqual(exchange.orders, {})
+
+            exchange.quote_free = required_total
+            bot.prepare(persist=True)
+            bot.run_cycle()
+            bot.run_cycle()
+            self.assertGreater(len(exchange.fetch_open_orders("BTC/USDT")), 0)
+
+    def test_seed_fill_rechecks_buy_capital_before_any_limit_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()  # Seed market buy is filled, but no limit orders exist.
+            exchange.quote_free = Decimal("1")
+            with self.assertRaises(grid_main.InsufficientGridCapital):
+                bot.run_cycle()
+            self.assertEqual(
+                [order for order in exchange.orders.values()
+                 if order["type"] == "limit"], [],
+            )
+
+    def test_seed_fill_waits_for_enough_bot_btc_before_initial_sells(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            exchange.base_free = bot.baseline_base  # Seed balance is unavailable.
+            bot.run_cycle()
+            self.assertEqual(
+                [order for order in exchange.orders.values()
+                 if order["type"] == "limit"], [],
+            )
+
+    def test_manual_recenter_rejects_insufficient_free_quote_before_canceling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            old_ids = {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")}
+            exchange.quote_free = Decimal("100")
+            with self.assertRaisesRegex(
+                grid_main.InsufficientGridCapital,
+                r"Insufficient Capital: Grid requires .* USDT for BUY limits, "
+                r"but only 100 USDT is available in the Spot wallet\.",
+            ):
+                bot.request_manual_recenter("102", "25")
+            self.assertIsNone(bot.database.get_state("grid_reset"))
+            self.assertEqual(exchange.cancel_calls, [])
+            self.assertEqual(
+                {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")},
+                old_ids,
+            )
+
+    def test_reset_balance_drift_places_no_replacement_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.request_manual_recenter("102", "25")
+            submitted_before = set(exchange.orders)
+            exchange.quote_free = Decimal("0")
+            with self.assertRaises(grid_main.InsufficientGridCapital):
+                bot.reset_grid()
+            self.assertEqual(set(exchange.orders), submitted_before)
+
     def test_market_price_and_confirmed_fills_support_portfolio_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")

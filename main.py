@@ -534,6 +534,8 @@ def recenter_grid(payload: RecenterRequest,
             lower, upper = bot.request_manual_recenter(
                 str(payload.center_price), str(width), str(stop_distance)
             )
+    except InsufficientGridCapital as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except ValueError as error:
         code = 400 if str(error) == RISK_OVERRIDE_DENIED else 422
         raise HTTPException(status_code=code, detail=str(error)) from error
@@ -548,6 +550,10 @@ def recenter_grid(payload: RecenterRequest,
 
 class TradingHalt(RuntimeError):
     """An unsafe or unresolved state that requires the bot to stop."""
+
+
+class InsufficientGridCapital(TradingHalt):
+    """A requested grid cannot be funded from the free Spot quote balance."""
 
 
 class UncertainOrderError(TradingHalt):
@@ -1153,6 +1159,10 @@ class GridBot:
                 ratio = max(center / candidate_buys[0], candidate_sells[0] / center)
                 if not center / ratio < price < center * ratio:
                     raise ValueError("Center must be close to the live market price.")
+                self._check_grid_buy_capital(
+                    candidate, candidate_buys, planned_stop,
+                    seed_required=self._bot_base_exposure() == 0,
+                )
                 request = {
                     "phase": "canceling", "source": "manual_recenter",
                     "center_price": str(center),
@@ -1444,6 +1454,10 @@ class GridBot:
             upper_planned.append((-index, price, upper_amount))
 
         if persist and not saved:
+            self._check_grid_buy_capital(
+                self.config, self.levels, self.config.stop_loss_price,
+                seed_required=True,
+            )
             state = {
                 "anchor": str(self.anchor),
                 "baseline_base": str(self.baseline_base),
@@ -1460,6 +1474,41 @@ class GridBot:
     def _lower_quote_per_level(self) -> Decimal:
         lower_budget = self.config.investment_quote - self._seed_quote()
         return lower_budget / Decimal(len(self.levels))
+
+    def _required_buy_limit_quote(
+        self, config: GridConfig, lowers: List[Decimal], stop_loss: Decimal,
+    ) -> Decimal:
+        """Sum the actual exchange-rounded price times amount for each BUY limit."""
+        seed_quote = config.investment_quote * config.initial_inventory_percent / 100
+        quote_per_level = (config.investment_quote - seed_quote) / len(lowers)
+        required = Decimal(0)
+        for raw in lowers:
+            price = self._price(raw)
+            if price <= stop_loss:
+                continue
+            amount = self._amount(quote_per_level / price)
+            self._check_order_size(price, amount)
+            cost = price * amount
+            if cost > quote_per_level:
+                raise TradingHalt("A rounded grid order exceeds its quote allocation.")
+            required += cost
+        return required
+
+    def _check_grid_buy_capital(
+        self, config: GridConfig, lowers: List[Decimal], stop_loss: Decimal,
+        *, seed_required: bool,
+    ) -> None:
+        required = self._required_buy_limit_quote(config, lowers, stop_loss)
+        if seed_required:
+            required += config.investment_quote * config.initial_inventory_percent / 100
+        available = self._free_balance(self.market["quote"])
+        if available < required:
+            raise InsufficientGridCapital(
+                "Insufficient Capital: Grid requires "
+                f"{format(required, 'f')} {self.market['quote']} for BUY limits, "
+                f"but only {format(available, 'f')} {self.market['quote']} "
+                "is available in the Spot wallet."
+            )
 
     def _price(self, value: Decimal) -> Decimal:
         return Decimal(self.exchange.price_to_precision(self.config.symbol, str(value)))
@@ -1646,7 +1695,13 @@ class GridBot:
 
     def _free_balance(self, asset: str) -> Decimal:
         balances = self._call(self.exchange.fetch_balance, {"type": "spot"})
-        return _order_decimal((balances.get(asset) or {}).get("free"))
+        try:
+            free = _order_decimal((balances.get(asset) or {}).get("free"))
+        except (AttributeError, InvalidOperation, TypeError) as error:
+            raise TradingHalt(f"Exchange returned an invalid free {asset} balance.") from error
+        if not free.is_finite() or free < 0:
+            raise TradingHalt(f"Exchange returned an invalid free {asset} balance.")
+        return free
 
     def _free_bot_base(self) -> Decimal:
         if self.baseline_base is None:
@@ -1668,15 +1723,7 @@ class GridBot:
             )
 
     def _place_seed_upper_sell(self, level: int, seed_row: Dict[str, Any]) -> None:
-        seed = self._fetch_order(seed_row)
-        filled = _order_decimal(seed.get("filled"))
-        if filled <= 0:
-            raise TradingHalt("Seed buy has no executed amount.")
-        base_fee = _fees_in_asset(seed, self.market["base"])
-        allocated_base = min(
-            filled - base_fee, filled * (1 - SELL_AMOUNT_BUFFER)
-        ) / Decimal(len(self.upper_levels))
-        amount = self._amount(allocated_base)
+        amount = self._seed_upper_sell_amount(seed_row)
         price = self._price(self.upper_levels[-level - 1])
         self._check_order_size(price, amount)
         if self._free_bot_base() < amount:
@@ -1686,6 +1733,17 @@ class GridBot:
                 level, "SELL", price, amount,
                 parent_order_id=seed_row["order_id"],
             )
+
+    def _seed_upper_sell_amount(self, seed_row: Dict[str, Any]) -> Decimal:
+        seed = self._fetch_order(seed_row)
+        filled = _order_decimal(seed.get("filled"))
+        if filled <= 0:
+            raise TradingHalt("Seed buy has no executed amount.")
+        base_fee = _fees_in_asset(seed, self.market["base"])
+        allocated_base = min(
+            filled - base_fee, filled * (1 - SELL_AMOUNT_BUFFER)
+        ) / Decimal(len(self.upper_levels))
+        return self._amount(allocated_base)
 
     def _place_buy(self, level: int, parent_order_id: Optional[str]) -> None:
         if level > 0:
@@ -1849,10 +1907,18 @@ class GridBot:
         upper_amount = self._amount(upper_total * (1 - SELL_AMOUNT_BUFFER) / len(uppers))
         for raw in uppers:
             self._check_order_size(self._price(raw), upper_amount)
-        needed_quote = new_config.investment_quote if carry_amount == 0 else (
-            new_config.investment_quote - seed_quote)
-        if self._free_balance(self.market["quote"]) < needed_quote:
-            raise TradingHalt("Insufficient free quote for the replacement grid.")
+        self._check_grid_buy_capital(
+            new_config, lowers, new_config.stop_loss_price,
+            seed_required=carry_amount == 0,
+        )
+        if carry_amount > 0:
+            required_base = upper_amount * len(uppers)
+            available_base = self._free_bot_base()
+            if available_base < required_base:
+                raise TradingHalt(
+                    f"Insufficient bot BTC for SELL limits: requires {required_base}, "
+                    f"but only {available_base} is free after cancellation."
+                )
         return lowers, uppers
 
     def reset_grid(self) -> bool:
@@ -2453,6 +2519,10 @@ class GridBot:
         seed_row = latest.get(0)
         if seed_row is None:
             if not self.is_paused:
+                self._check_grid_buy_capital(
+                    self.config, self.levels, self.config.stop_loss_price,
+                    seed_required=True,
+                )
                 self._place_seed_buy(current_price)
             return events
         if seed_row["status"] not in ("FILLED",):
@@ -2465,6 +2535,28 @@ class GridBot:
             not self.is_paused and
             self.config.lower_price <= current_price <= self.config.upper_price
         )
+        if in_bounds and all(
+            level not in latest for level in range(1, len(self.levels) + 1)
+        ):
+            # The seed may have filled in an earlier cycle. Recheck the wallet
+            # before the first LIMIT order, since other account activity can
+            # consume quote between the seed and this batch.
+            self._check_grid_buy_capital(
+                self.config, self.levels, self.config.stop_loss_price,
+                seed_required=False,
+            )
+        if all(level not in latest for level in
+               range(-1, -len(self.upper_levels) - 1, -1)):
+            sell_amount = self._seed_upper_sell_amount(seed_row)
+            required_base = sell_amount * len(self.upper_levels)
+            for raw in self.upper_levels:
+                self._check_order_size(self._price(raw), sell_amount)
+            if self._free_bot_base() < required_base:
+                LOGGER.warning(
+                    "Insufficient free bot BTC for initial SELL limits; "
+                    "waiting for balance reconciliation."
+                )
+                return events
         lane_levels = (
             list(range(-1, -len(self.upper_levels) - 1, -1))
             + list(range(1, len(self.levels) + 1))

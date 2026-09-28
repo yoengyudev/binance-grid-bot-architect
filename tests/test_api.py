@@ -454,6 +454,43 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 grid_main.app.state.grid_bot = None
 
+    async def test_recenter_insufficient_capital_returns_http_400(self) -> None:
+        detail = (
+            "Insufficient Capital: Grid requires 498.42 USDT for BUY limits, "
+            "but only 100 USDT is available in the Spot wallet."
+        )
+
+        def reject_recenter(*_args):
+            raise grid_main.InsufficientGridCapital(detail)
+
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+            "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+        }):
+            grid_main.app.state.grid_bot = SimpleNamespace(
+                request_manual_recenter=reject_recenter
+            )
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    origin = {"Origin": "http://localhost:5173"}
+                    await client.post(
+                        "/api/auth/login",
+                        json={"password": "unique-private-admin-password"},
+                        headers=origin,
+                    )
+                    response = await client.post(
+                        "/api/bot/grid/recenter",
+                        json={"center_price": 102, "half_width_percentage": 25},
+                        headers=origin,
+                    )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json(), {"detail": detail})
+            finally:
+                grid_main.app.state.grid_bot = None
+
     async def test_recenter_endpoint_authenticates_and_queues_only(self) -> None:
         calls = []
         bot = SimpleNamespace(request_manual_recenter=lambda *values: (
