@@ -465,6 +465,24 @@ def bot_status() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/wallet-balance")
+def wallet_balance(response: Response,
+                   _: str = Depends(get_current_user)) -> Dict[str, str]:
+    """Return only the admin's currently free Spot USDT balance."""
+    response.headers["Cache-Control"] = "no-store"
+    bot = app.state.grid_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="The trading bot is offline.")
+    try:
+        free_usdt = bot._free_balance("USDT")
+    except (ccxt.BaseError, TradingHalt, OSError) as error:
+        LOGGER.warning("Spot USDT balance fetch failed: %s", type(error).__name__)
+        raise HTTPException(
+            status_code=502, detail="Could not fetch the Spot USDT balance."
+        ) from error
+    return {"available_usdt": str(free_usdt)}
+
+
 @app.post("/api/bot/pause")
 def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_origin),
                   __: str = Depends(get_current_user)) -> Dict[str, Any]:

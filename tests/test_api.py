@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import ccxt
 import httpx
 import jwt
 from fastapi import Depends, FastAPI
@@ -401,6 +402,45 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertEqual(mock.status_code, 401)
                 self.assertEqual(private.status_code, 200)
+            finally:
+                grid_main.app.state.grid_bot = None
+
+    async def test_wallet_balance_requires_admin_and_handles_exchange_timeout(self) -> None:
+        balance_reader = Mock(return_value=Decimal("123.4567"))
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+            "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+        }):
+            grid_main.app.state.grid_bot = SimpleNamespace(_free_balance=balance_reader)
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    unauthenticated = await client.get("/api/wallet-balance")
+                    self.assertEqual(unauthenticated.status_code, 401)
+                    balance_reader.assert_not_called()
+
+                    await client.post(
+                        "/api/auth/login",
+                        json={"password": "unique-private-admin-password"},
+                        headers={"Origin": "http://localhost:5173"},
+                    )
+                    available = await client.get("/api/wallet-balance")
+                    self.assertEqual(available.status_code, 200)
+                    self.assertEqual(available.json(), {"available_usdt": "123.4567"})
+                    self.assertEqual(available.headers["cache-control"], "no-store")
+                    balance_reader.assert_called_once_with("USDT")
+
+                    balance_reader.side_effect = ccxt.RequestTimeout("Exchange timed out")
+                    unavailable = await client.get("/api/wallet-balance")
+                    self.assertEqual(unavailable.status_code, 502)
+                    self.assertEqual(unavailable.json()["detail"],
+                                     "Could not fetch the Spot USDT balance.")
+
+                    grid_main.app.state.grid_bot = None
+                    offline = await client.get("/api/wallet-balance")
+                    self.assertEqual(offline.status_code, 503)
             finally:
                 grid_main.app.state.grid_bot = None
 
