@@ -121,6 +121,10 @@ class PauseRequest(BaseModel):
     active: StrictBool
 
 
+class StopLossRequest(BaseModel):
+    price: FiniteFloat = Field(gt=0)
+
+
 class RecenterRequest(BaseModel):
     center_price: FiniteFloat = Field(gt=0)
     width_percentage: Optional[FiniteFloat] = Field(default=None, gt=0, lt=100)
@@ -598,6 +602,30 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
         LOGGER.exception("Manual safety pause could not finish.")
         raise HTTPException(status_code=502, detail="Exchange pause update failed; state remains paused.") from error
     return {"safety_pause": "Active" if mode else "Normal", "mode": mode}
+
+
+@app.post("/api/bot/stop-loss")
+def update_hard_stop(payload: StopLossRequest, response: Response,
+                     _: None = Depends(_require_dashboard_origin),
+                     __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """Raise the active trailing floor without rebuilding or canceling the grid."""
+    response.headers["Cache-Control"] = "no-store"
+    if app.state.standby:
+        raise HTTPException(status_code=409, detail="The bot is idle; no grid is active.")
+    bot = app.state.grid_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="The trading bot is offline.")
+    try:
+        stop = bot.set_stop_loss(str(payload.price))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except TradingHalt as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (OSError, RuntimeError, sqlite3.Error) as error:
+        LOGGER.exception("Hard stop update failed.")
+        raise HTTPException(status_code=503, detail="Could not update the hard stop.") from error
+    LOGGER.warning("Admin raised the active hard stop to %s without a grid reset.", stop)
+    return {"current_hard_stop_loss": float(stop), "grid_reset": False}
 
 
 @app.post("/api/admin/factory-reset")

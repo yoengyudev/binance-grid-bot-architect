@@ -632,6 +632,51 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 grid_main.app.state.grid_bot = None
 
+    async def test_hard_stop_endpoint_raises_floor_without_grid_reset(self) -> None:
+        bot = Mock()
+        bot.set_stop_loss.return_value = Decimal("79500")
+        grid_main.app.state.grid_bot = bot
+        try:
+            with patch.dict(os.environ, {
+                "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+                "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+            }):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    origin = {"Origin": "http://localhost:5173"}
+                    denied = await client.post(
+                        "/api/bot/stop-loss", json={"price": 79500}, headers=origin,
+                    )
+                    self.assertEqual(denied.status_code, 401)
+                    await client.post(
+                        "/api/auth/login", json={"password": "unique-private-admin-password"},
+                        headers=origin,
+                    )
+                    foreign = await client.post(
+                        "/api/bot/stop-loss", json={"price": 79500},
+                        headers={"Origin": "https://other.test"},
+                    )
+                    self.assertEqual(foreign.status_code, 403)
+                    invalid = await client.post(
+                        "/api/bot/stop-loss", json={"price": -1}, headers=origin,
+                    )
+                    self.assertEqual(invalid.status_code, 422)
+                    updated = await client.post(
+                        "/api/bot/stop-loss", json={"price": 79500}, headers=origin,
+                    )
+                    self.assertEqual(updated.status_code, 200)
+                    self.assertEqual(updated.json(), {
+                        "current_hard_stop_loss": 79500.0, "grid_reset": False,
+                    })
+                    self.assertEqual(updated.headers["cache-control"], "no-store")
+                    bot.set_stop_loss.assert_called_once_with("79500.0")
+                    bot.request_grid_reset.assert_not_called()
+                    bot.request_manual_recenter.assert_not_called()
+        finally:
+            grid_main.app.state.grid_bot = None
+
     async def test_factory_reset_requires_admin_cookie_and_trusted_origin(self) -> None:
         reset = Mock()
         with patch.dict(os.environ, {
