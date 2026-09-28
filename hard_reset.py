@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 from database import DATABASE_PATH, GridDatabase
 from exchange_handler import BASE_DIR, create_exchange, load_config
-from main import _portfolio_wallet
+from main import GridBot, GridConfig, _portfolio_wallet
 
 
 SYMBOL = "BTC/USDT"
@@ -131,6 +131,33 @@ def _require_manual_holding_reconciled(
     return held
 
 
+def _refresh_bot_order_fills(
+    database: GridDatabase, exchange: ccxt.binance, market: dict,
+) -> None:
+    """Capture fills that occurred while the bot was stopped or orders canceled."""
+    bot = GridBot(GridConfig.load(), exchange, database)
+    bot.market = market
+    for row in database.fetch_all_orders():
+        order = bot._fetch_order(row)
+        status = order.get("status")
+        if status == "open":
+            raise ResetError(
+                f"Tracked order {row['order_id']} remains open; database retained."
+            )
+        if status == "closed":
+            if row["status"] not in ("FILLED", "CANCELED"):
+                database.mark_order_filled(row["order_id"])
+        elif status in ("canceled", "expired", "rejected"):
+            if row["status"] in ("OPEN", "PARTIALLY_FILLED"):
+                database.update_order_status(row["order_id"], status.upper())
+        else:
+            raise ResetError(
+                f"Unknown exchange status for {row['order_id']}; database retained."
+            )
+    if database.fetch_active_grids():
+        raise ResetError("Tracked orders still need reconciliation; database retained.")
+
+
 def hard_reset(*, keep_btc_manual=False, input_fn=input, output=print) -> int:
     """Cancel all testnet orders, verify exposure, then remove the local DB."""
     load_dotenv(dotenv_path=BASE_DIR / ".env")
@@ -192,13 +219,15 @@ def hard_reset(*, keep_btc_manual=False, input_fn=input, output=print) -> int:
     output("Successfully canceled all active BTC/USDT orders on Binance Testnet.")
 
     _require_stopped_service()
+    database = GridDatabase(database_path)
+    _refresh_bot_order_fills(database, exchange, market)
     if keep_btc_manual:
         adopted = _require_manual_holding_reconciled(
-            GridDatabase(database_path), exchange,
+            database, exchange,
         )
         output(f"Retaining {adopted} BTC as a manual holding outside the new bot baseline.")
     else:
-        _require_no_bot_inventory(GridDatabase(database_path), exchange)
+        _require_no_bot_inventory(database, exchange)
     os.remove(database_path)
     for suffix in ("-wal", "-shm", "-journal"):
         sidecar = Path(f"{database_path}{suffix}")

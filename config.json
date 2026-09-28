@@ -3,12 +3,12 @@
   "grid": {
     "symbol": "BTC/USDT",
     "investment_quote": 100,
-    "lower_price": 75880,
+    "lower_price": 76005.19,
     "upper_price": 89000,
     "auto_center_percent": null,
     "spacing_percent": 2.5,
     "initial_inventory_percent": 50,
-    "stop_loss_price": 75686.01,
+    "stop_loss_price": 76005.18,
     "poll_seconds": 10
   }
 }

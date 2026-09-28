@@ -22,7 +22,13 @@ class HardResetTests(unittest.TestCase):
             "baseline_base": "1", "anchor": "80000", "fingerprint": "test",
         }))
         self.exchange = Mock()
-        self.exchange.market.return_value = {"spot": True, "active": True}
+        self.exchange.market.return_value = {
+            "spot": True, "active": True, "base": "BTC", "quote": "USDT",
+        }
+        self.exchange.fetch_order.return_value = {
+            "id": "seed", "status": "closed", "filled": 0.01,
+            "average": 80000, "cost": 800, "fee": None,
+        }
         self.exchange.fetch_open_orders.side_effect = (
             lambda _symbol: [] if self.exchange.cancel_all_orders.call_count
             else [{"id": "old-order"}]
@@ -145,6 +151,24 @@ class HardResetTests(unittest.TestCase):
         with self.assertRaisesRegex(reset_util.ResetError, "BTC account balance"):
             self.run_utility(keep_btc_manual=True)
         self.assertTrue(self.database_path.exists())
+
+    def test_fills_during_shutdown_are_reconciled_before_manual_adoption(self) -> None:
+        self.add_bot_inventory()
+        self.database.insert_order("late-buy", 1, "BUY", "80000", "0.005")
+        self.exchange.fetch_order.side_effect = lambda reference, *_args: {
+            "id": reference, "status": "closed",
+            "filled": 0.01 if reference == "seed" else 0.005,
+            "average": 80000,
+            "cost": 800 if reference == "seed" else 400,
+            "fee": None,
+        }
+        self.exchange.fetch_balance.return_value["BTC"].update({
+            "free": "1.015", "total": "1.015",
+        })
+        self.assertEqual(self.run_utility(keep_btc_manual=True), 0)
+        self.assertFalse(self.database_path.exists())
+        self.assertTrue(any("Retaining 0.015 BTC" in message
+                            for message in self.messages))
 
     def test_untracked_btc_above_baseline_retains_database(self) -> None:
         self.exchange.fetch_balance.return_value["BTC"]["total"] = "1.01"
