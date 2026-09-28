@@ -2277,6 +2277,11 @@ class GridBot:
 
     def _sellable_hard_stop_amount(self, held: Decimal, price: Decimal) -> Decimal:
         """Apply market-order lot and notional filters before submitting a SELL."""
+        if held < 0:
+            raise TradingHalt("Bot BTC exposure cannot be negative.")
+        if held == 0:
+            return Decimal(0)
+
         def minimum(value: Any) -> Decimal:
             try:
                 parsed = _order_decimal(value)
@@ -2286,7 +2291,14 @@ class GridBot:
                 raise TradingHalt("Exchange market minimum is invalid.")
             return parsed
 
-        amount = self._amount(held)
+        try:
+            amount = self._amount(held)
+        except ccxt.InvalidOrder:
+            # Binance rejects amounts below its precision step before we can
+            # apply the market's explicit lot and notional filters.
+            if held * price < Decimal("10"):
+                return Decimal(0)
+            raise
         if amount <= 0:
             return Decimal(0)
         limits = self.market.get("limits") or {}

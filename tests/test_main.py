@@ -746,6 +746,25 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(bot._sellable_hard_stop_amount(
                 Decimal("0.2"), Decimal("69")), Decimal("0.200"))
 
+    def test_hard_stop_zero_residual_skips_exchange_precision_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            with patch.object(
+                exchange, "amount_to_precision",
+                side_effect=ccxt.InvalidOrder("below BTC precision"),
+            ) as precision:
+                self.assertEqual(
+                    bot._sellable_hard_stop_amount(Decimal(0), Decimal("100")),
+                    Decimal(0),
+                )
+                precision.assert_not_called()
+                self.assertEqual(
+                    bot._sellable_hard_stop_amount(Decimal("0.000001"), Decimal("100")),
+                    Decimal(0),
+                )
+                with self.assertRaises(ccxt.InvalidOrder):
+                    bot._sellable_hard_stop_amount(Decimal("0.2"), Decimal("100"))
+
     def test_hard_stop_caps_sell_at_fresh_free_balance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
