@@ -23,6 +23,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_standby_reports_idle_and_rejects_trading_controls(self) -> None:
         standby_bot = Mock()
         standby_bot.config.symbol = "BTC/USDT"
+        standby_bot.request_initial_grid.return_value = (Decimal("80"), Decimal("120"))
         grid_main.app.state.grid_bot = standby_bot
         grid_main.app.state.standby = True
         try:
@@ -38,7 +39,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(status_response.status_code, 200)
                     self.assertEqual(status_response.json()["trading_state"], "IDLE")
                     self.assertEqual(status_response.json()["grid_levels"], 0)
-                    self.assertFalse(status_response.json()["exact_grid_recenter_supported"])
+                    self.assertTrue(status_response.json()["exact_grid_recenter_supported"])
                     login = await client.post(
                         "/api/auth/login",
                         json={"password": "unique-private-admin-password"},
@@ -51,8 +52,18 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(pause.status_code, 409)
                     self.assertEqual(pause.json()["detail"], "The bot is idle; no grid is active.")
+                    start = await client.post(
+                        "/api/bot/grid/recenter",
+                        json={"center_price": 100, "width_percentage": 20,
+                              "stop_loss_percentage": 30, "allocated_capital": 1000,
+                              "grid_levels": 10},
+                        headers={"Origin": "http://localhost:5173"},
+                    )
+                    self.assertEqual(start.status_code, 202)
+                    self.assertEqual(start.json()["status"], "queued")
             standby_bot.run.assert_not_called()
             standby_bot.set_manual_pause.assert_not_called()
+            standby_bot.request_initial_grid.assert_called_once()
         finally:
             grid_main.app.state.standby = False
             grid_main.app.state.grid_bot = None

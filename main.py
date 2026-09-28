@@ -426,7 +426,7 @@ def bot_status() -> Dict[str, Any]:
             "status": "Online", "pair": bot.config.symbol,
             "safety_pause": "Idle", "pause_mode": None,
             "trading_state": "IDLE", "grid_levels": 0,
-            "exact_grid_recenter_supported": False,
+            "exact_grid_recenter_supported": True,
             "lower_bound": None, "upper_bound": None,
             "wallet": {"btc_held": 0.0, "average_cost": None,
                        "unrealized_pnl": 0.0},
@@ -577,8 +577,6 @@ def factory_reset(_: None = Depends(_require_dashboard_origin),
 def recenter_grid(payload: RecenterRequest,
                   _: None = Depends(_require_dashboard_origin),
                   __: str = Depends(get_current_user)) -> Dict[str, Any]:
-    if app.state.standby:
-        raise HTTPException(status_code=409, detail="The bot is idle; grid execution is locked.")
     if (payload.allocated_capital is None) != (payload.grid_levels is None):
         raise HTTPException(
             status_code=422,
@@ -607,6 +605,28 @@ def recenter_grid(payload: RecenterRequest,
     bot = app.state.grid_bot
     if bot is None:
         raise HTTPException(status_code=503, detail="The trading bot is offline.")
+    if app.state.standby:
+        if stop_distance is None or payload.allocated_capital is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Starting a grid requires stop loss, allocated capital, and exact grid levels.",
+            )
+        try:
+            lower, upper = bot.request_initial_grid(
+                str(payload.center_price), str(width), str(stop_distance),
+                str(payload.allocated_capital), payload.grid_levels,
+            )
+        except InsufficientGridCapital as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except TradingHalt as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
+            LOGGER.exception("Initial grid request failed.")
+            raise HTTPException(status_code=502, detail="Could not start the grid.") from error
+        return {"status": "queued", "lower_bound": float(lower),
+                "upper_bound": float(upper)}
     if (stop_distance is not None and isinstance(bot, GridBot) and
             bot.database.get_state(SAFETY_MODE_KEY) not in
             (LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED)):
@@ -866,6 +886,93 @@ class GridBot:
             (Decimal(pending["lower"]), Decimal(pending["upper"])) if pending else None
         )
         self.grid_needs_reset = pending is not None
+        self.grid_activation_requested = False
+
+    def request_initial_grid(self, center_text: str, width_text: str,
+                             stop_distance_text: str, capital_text: str,
+                             grid_levels: int) -> Tuple[Decimal, Decimal]:
+        """Activate a fresh standby bot only after explicit authenticated settings."""
+        center = _decimal(center_text, "center_price")
+        width_percent = _decimal(width_text, "width_percentage")
+        stop_distance = _decimal(stop_distance_text, "stop_loss_percentage")
+        capital = _decimal(capital_text, "allocated_capital")
+        if width_percent >= 100 or stop_distance >= 100:
+            raise ValueError("Grid width and stop-loss distance must be below 100%.")
+        if (isinstance(grid_levels, bool) or not isinstance(grid_levels, int) or
+                not 2 <= grid_levels <= 2 * MAX_LEVELS):
+            raise ValueError("Grid levels must be a whole number from 2 to 100.")
+        if capital / grid_levels < Decimal("7"):
+            raise ValueError("Order size must be at least 7 USDT.")
+        lower = center * (1 - width_percent / 100)
+        upper = center * (1 + width_percent / 100)
+        stop = center * (1 - stop_distance / 100)
+        if not 0 < stop < lower < center < upper:
+            raise ValueError("Require hard stop < lower bound < center < upper bound.")
+        candidate = replace(
+            self.config, lower_price=lower, upper_price=upper,
+            stop_loss_price=stop, investment_quote=capital,
+            buy_grid_levels=(grid_levels + 1) // 2,
+            sell_grid_levels=grid_levels // 2,
+        )
+        with self._cycle_lock:
+            if (self.grid_activation_requested or
+                    self.database.get_state("grid_run") is not None or
+                    self.database.get_state("grid_reset") is not None or
+                    self.database.fetch_all_orders()):
+                raise TradingHalt("A grid is already starting or active.")
+            if self._live_open_orders():
+                raise TradingHalt("Open BTC/USDT orders exist; resolve them before starting.")
+            self._call(self.exchange.load_markets)
+            self.market = self.exchange.market(candidate.symbol)
+            if not self.market.get("spot") or self.market.get("active") is False:
+                raise TradingHalt("Configured symbol is not an active Spot market.")
+            current = self._ticker_price()
+            if not lower < current < upper or current <= stop:
+                raise ValueError("Live price must be inside the new bounds and above the hard stop.")
+            buys, sells = configured_grid_levels(center, candidate)
+            self._validate_level_prices(center, buys, sells)
+            ratio = max(center / buys[0], sells[0] / center)
+            if not center / ratio < current < center * ratio:
+                raise ValueError("Center must be close to the live market price.")
+            self._validate_nominal_grid_sizes(candidate, center, buys, sells)
+            lowers, uppers = self._validate_reset_grid(candidate, center, Decimal(0))
+            baseline = self._free_balance(self.market["base"])
+            run = {"anchor": str(center), "baseline_base": str(baseline),
+                   "fingerprint": candidate.fingerprint()}
+            active = {"lower": str(lower), "upper": str(upper),
+                      "spacing": str(candidate.spacing_percent),
+                      "investment_quote": str(capital),
+                      "stop_loss_price": str(stop),
+                      "buy_levels": candidate.buy_grid_levels,
+                      "sell_levels": candidate.sell_grid_levels}
+            trailing = {"high_water_mark": str(center),
+                        "stop_loss_distance": str(center - stop)}
+            request = {"phase": "placing", "source": "manual_initial",
+                       "lower": str(lower), "upper": str(upper),
+                       "spacing": str(candidate.spacing_percent),
+                       "investment_quote": str(capital),
+                       "buy_levels": candidate.buy_grid_levels,
+                       "sell_levels": candidate.sell_grid_levels}
+            self.database.complete_grid_reset(
+                json.dumps(run, sort_keys=True),
+                json.dumps(active, sort_keys=True),
+                json.dumps(request, sort_keys=True),
+                breakout_width_percent=str(width_percent),
+                trailing_stop=json.dumps(trailing, sort_keys=True),
+            )
+            self.config = candidate
+            self.anchor = center
+            self.baseline_base = baseline
+            self.levels, self.upper_levels = lowers, uppers
+            self.breakout_width_percent = width_percent
+            self.high_water_mark = center
+            self.stop_loss_distance = center - stop
+            self.pending_grid_bounds = (lower, upper)
+            self.grid_needs_reset = True
+            self.grid_activation_requested = True
+            LOGGER.warning("Admin approved a new %s-level grid with %s USDT allocation.",
+                           grid_levels, capital)
+            return lower, upper
 
     def factory_reset(self) -> None:
         """Stop trading and clear history only after a fail-closed safety check."""
@@ -2772,6 +2879,21 @@ class GridBot:
             self.database.clear_state(LIQUIDATION_NOTICE_KEY)
 
     async def run(self, notifier: TelegramNotifier) -> None:
+        initial_request_text = self.database.get_state("grid_reset")
+        if initial_request_text and not self.database.fetch_all_orders():
+            initial_request = json.loads(initial_request_text)
+            if initial_request.get("source") == "manual_initial":
+                current = await asyncio.to_thread(self._ticker_price)
+                if not self.config.lower_price < current < self.config.upper_price:
+                    raise TradingHalt("Price left the approved grid bounds before startup.")
+                saved_run = self.database.get_state("grid_run")
+                if not saved_run:
+                    raise TradingHalt("Approved grid has no saved run.")
+                approved_center = Decimal(json.loads(saved_run)["anchor"])
+                buys, sells = configured_grid_levels(approved_center, self.config)
+                ratio = max(approved_center / buys[0], sells[0] / approved_center)
+                if not approved_center / ratio < current < approved_center * ratio:
+                    raise TradingHalt("Price moved too far from the approved grid center.")
         await asyncio.to_thread(self.prepare, persist=True)
         if (self.database.get_state("halt_reason") and
                 self.database.get_state(SAFETY_MODE_KEY) not in
@@ -2976,7 +3098,7 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
 
 
 async def _run_standby_services(bot: GridBot) -> None:
-    """Serve the configured bot and market data without starting its order loop."""
+    """Wait for an explicit grid request while serving the API and market data."""
     app.state.grid_bot = bot
     app.state.standby = True
     app.state.atr_snapshot = None
@@ -2984,14 +3106,23 @@ async def _run_standby_services(bot: GridBot) -> None:
     market_data_task = asyncio.create_task(
         _refresh_market_data(bot), name="standby-market-intelligence"
     )
+    server = uvicorn.Server(uvicorn.Config(
+        app, host="127.0.0.1", port=8000, log_level="warning",
+    ))
+    api_task = asyncio.create_task(server.serve(), name="standby-api")
     try:
-        server = uvicorn.Server(uvicorn.Config(
-            app, host="127.0.0.1", port=8000, log_level="warning",
-        ))
-        await server.serve()
-        if not server.started:
-            raise TradingHalt("Standby API could not start.")
+        while not bot.grid_activation_requested:
+            if api_task.done():
+                await api_task
+                raise TradingHalt("Standby API stopped before grid activation.")
+            await asyncio.sleep(0.25)
+        app.state.standby = False
+        token, owner_chat_id = load_telegram_credentials()
+        notifier = TelegramNotifier(token, owner_chat_id)
+        await bot.run(notifier)
     finally:
+        server.should_exit = True
+        await asyncio.gather(api_task, return_exceptions=True)
         market_data_task.cancel()
         await asyncio.gather(market_data_task, return_exceptions=True)
         app.state.grid_bot = None
@@ -3025,15 +3156,22 @@ def main() -> int:
             key, secret = _credentials()
             exchange = create_exchange(key, secret)
             database = GridDatabase()
-            if (any(database.get_state(key) is not None for key in (
-                    "grid_run", "grid_reset", "active_grid_config",
-                    SAFETY_MODE_KEY, LIQUIDATION_KEY, TRAILING_STOP_KEY)) or
-                    database.fetch_all_orders()):
-                raise TradingHalt("Standby requires a fresh, empty bot database.")
-            bot = GridBot(GridConfig.load(), exchange, database)
-            if bot._live_open_orders():
-                raise TradingHalt("Standby requires no open BTC/USDT orders.")
-            asyncio.run(_run_standby_services(bot))
+            existing_run = database.get_state("grid_run") is not None
+            if existing_run:
+                config = _apply_active_grid_config(GridConfig.load(), database)
+                bot = GridBot(config, exchange, database)
+                token, owner_chat_id = load_telegram_credentials()
+                asyncio.run(_run_services(bot, TelegramNotifier(token, owner_chat_id)))
+            else:
+                if (any(database.get_state(key) is not None for key in (
+                        "grid_reset", "active_grid_config", SAFETY_MODE_KEY,
+                        LIQUIDATION_KEY, TRAILING_STOP_KEY)) or
+                        database.fetch_all_orders()):
+                    raise TradingHalt("Standby requires a fresh, empty bot database.")
+                bot = GridBot(GridConfig.load(), exchange, database)
+                if bot._live_open_orders():
+                    raise TradingHalt("Standby requires no open BTC/USDT orders.")
+                asyncio.run(_run_standby_services(bot))
             return 0
         key, secret = _credentials()
         exchange = create_exchange(key, secret)

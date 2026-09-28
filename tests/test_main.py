@@ -332,6 +332,66 @@ class GridBotTests(unittest.TestCase):
             bot.run_cycle()
             self.assertGreater(len(exchange.fetch_open_orders("BTC/USDT")), 0)
 
+    def test_idle_bot_starts_only_after_explicit_grid_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            exchange = FakeSpotExchange()
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
+                Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            )
+            database = GridDatabase(path)
+            bot = GridBot(config, exchange, database)
+            self.assertEqual(exchange.orders, {})
+            self.assertIsNone(database.get_state("grid_run"))
+
+            bot.request_initial_grid("100", "20", "30", "1000", 10)
+            self.assertEqual(exchange.orders, {})
+            self.assertTrue(bot.grid_activation_requested)
+            self.assertEqual(json.loads(database.get_state("grid_run"))["baseline_base"], "1")
+            self.assertEqual(json.loads(database.get_state("grid_reset"))["phase"], "placing")
+            with self.assertRaisesRegex(TradingHalt, "already starting or active"):
+                bot.request_initial_grid("100", "20", "30", "1000", 10)
+
+            reopened = GridBot(_apply_active_grid_config(config, GridDatabase(path)),
+                               exchange, GridDatabase(path))
+            reopened.prepare(persist=True)
+            self.assertTrue(reopened.reset_grid())
+            self.assertEqual((len(reopened.levels), len(reopened.upper_levels)), (5, 5))
+            self.assertGreater(exchange.base_free, Decimal("1"))
+
+    def test_approved_idle_grid_does_not_trade_after_price_drifts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            exchange = FakeSpotExchange()
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
+                Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            )
+            bot = GridBot(config, exchange, GridDatabase(path))
+            bot.request_initial_grid("100", "20", "30", "1000", 10)
+            exchange.price = Decimal("115")
+            reopened = GridBot(_apply_active_grid_config(config, GridDatabase(path)),
+                               exchange, GridDatabase(path))
+            with self.assertRaisesRegex(TradingHalt, "moved too far"):
+                asyncio.run(reopened.run(AsyncMock()))
+            self.assertEqual(exchange.orders, {})
+
+    def test_idle_grid_rejects_insufficient_capital_without_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            exchange = FakeSpotExchange()
+            exchange.quote_free = Decimal("100")
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
+                Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            )
+            bot = GridBot(config, exchange, database)
+            with self.assertRaises(grid_main.InsufficientGridCapital):
+                bot.request_initial_grid("100", "20", "30", "1000", 10)
+            self.assertIsNone(database.get_state("grid_run"))
+            self.assertEqual(exchange.orders, {})
+
     def test_seed_fill_rechecks_buy_capital_before_any_limit_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
