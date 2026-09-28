@@ -107,6 +107,7 @@ app.add_middleware(
 )
 app.state.grid_bot = None
 app.state.monitor_only = False
+app.state.standby = False
 app.state.atr_snapshot = None
 app.state.order_book_snapshot = None
 app.state.preview_jwt_secret = secrets.token_urlsafe(48)
@@ -418,6 +419,24 @@ async def _refresh_market_data(bot: "GridBot") -> None:
 def bot_status() -> Dict[str, Any]:
     """Summarize the bot or report the read-only monitor's stopped state."""
     bot = app.state.grid_bot
+    if app.state.standby and bot is not None:
+        atr = app.state.atr_snapshot
+        order_book = app.state.order_book_snapshot
+        return {
+            "status": "Online", "pair": bot.config.symbol,
+            "safety_pause": "Idle", "pause_mode": None,
+            "trading_state": "IDLE", "grid_levels": 0,
+            "exact_grid_recenter_supported": False,
+            "lower_bound": None, "upper_bound": None,
+            "wallet": {"btc_held": 0.0, "average_cost": None,
+                       "unrealized_pnl": 0.0},
+            "atr_value": atr["atr_value"] if atr is not None else None,
+            "atr_percentage": atr["atr_percentage"] if atr is not None else None,
+            "bid_volume": order_book["bid_volume"] if order_book is not None else None,
+            "ask_volume": order_book["ask_volume"] if order_book is not None else None,
+            "imbalance_ratio": order_book["imbalance_ratio"] if order_book is not None else None,
+            "current_hard_stop_loss": None, "high_water_mark": None,
+        }
     if app.state.monitor_only and bot is None:
         return {
             "status": "Online", "pair": "BTC/USDT",
@@ -517,6 +536,8 @@ def wallet_balance(response: Response,
 @app.post("/api/bot/pause")
 def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_origin),
                   __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    if app.state.standby:
+        raise HTTPException(status_code=409, detail="The bot is idle; no grid is active.")
     bot = app.state.grid_bot
     if bot is None:
         raise HTTPException(status_code=503, detail="The trading bot is offline.")
@@ -534,6 +555,8 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
 def factory_reset(_: None = Depends(_require_dashboard_origin),
                   __: str = Depends(get_current_user)) -> Dict[str, Any]:
     """Erase bot accounting only after exchange and local exposure are clear."""
+    if app.state.standby:
+        raise HTTPException(status_code=409, detail="The bot is idle; no grid is active.")
     bot = app.state.grid_bot
     if bot is None:
         raise HTTPException(status_code=503, detail="The trading bot is offline.")
@@ -554,6 +577,8 @@ def factory_reset(_: None = Depends(_require_dashboard_origin),
 def recenter_grid(payload: RecenterRequest,
                   _: None = Depends(_require_dashboard_origin),
                   __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    if app.state.standby:
+        raise HTTPException(status_code=409, detail="The bot is idle; grid execution is locked.")
     if (payload.allocated_capital is None) != (payload.grid_levels is None):
         raise HTTPException(
             status_code=422,
@@ -2950,6 +2975,31 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
             app.state.order_book_snapshot = None
 
 
+async def _run_standby_services(bot: GridBot) -> None:
+    """Serve the configured bot and market data without starting its order loop."""
+    app.state.grid_bot = bot
+    app.state.standby = True
+    app.state.atr_snapshot = None
+    app.state.order_book_snapshot = None
+    market_data_task = asyncio.create_task(
+        _refresh_market_data(bot), name="standby-market-intelligence"
+    )
+    try:
+        server = uvicorn.Server(uvicorn.Config(
+            app, host="127.0.0.1", port=8000, log_level="warning",
+        ))
+        await server.serve()
+        if not server.started:
+            raise TradingHalt("Standby API could not start.")
+    finally:
+        market_data_task.cancel()
+        await asyncio.gather(market_data_task, return_exceptions=True)
+        app.state.grid_bot = None
+        app.state.standby = False
+        app.state.atr_snapshot = None
+        app.state.order_book_snapshot = None
+
+
 def main() -> int:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -2962,12 +3012,28 @@ def main() -> int:
     mode.add_argument("--execute", action="store_true", help="Trade on Spot Testnet")
     mode.add_argument("--monitor-only", action="store_true",
                       help="Serve the dashboard API without starting the trading bot")
+    mode.add_argument("--standby", action="store_true",
+                      help="Start the bot idle with market data, without trading")
     arguments = parser.parse_args()
     try:
         if arguments.monitor_only:
             app.state.grid_bot = None
             app.state.monitor_only = True
             uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+            return 0
+        if arguments.standby:
+            key, secret = _credentials()
+            exchange = create_exchange(key, secret)
+            database = GridDatabase()
+            if (any(database.get_state(key) is not None for key in (
+                    "grid_run", "grid_reset", "active_grid_config",
+                    SAFETY_MODE_KEY, LIQUIDATION_KEY, TRAILING_STOP_KEY)) or
+                    database.fetch_all_orders()):
+                raise TradingHalt("Standby requires a fresh, empty bot database.")
+            bot = GridBot(GridConfig.load(), exchange, database)
+            if bot._live_open_orders():
+                raise TradingHalt("Standby requires no open BTC/USDT orders.")
+            asyncio.run(_run_standby_services(bot))
             return 0
         key, secret = _credentials()
         exchange = create_exchange(key, secret)

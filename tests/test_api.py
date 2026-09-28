@@ -20,6 +20,43 @@ from database import GridDatabase
 
 
 class StatusApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_standby_reports_idle_and_rejects_trading_controls(self) -> None:
+        standby_bot = Mock()
+        standby_bot.config.symbol = "BTC/USDT"
+        grid_main.app.state.grid_bot = standby_bot
+        grid_main.app.state.standby = True
+        try:
+            with patch.dict(os.environ, {
+                "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+                "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+            }), patch.object(grid_main, "GridDatabase", side_effect=AssertionError("DB opened")):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    status_response = await client.get("/api/bot/status")
+                    self.assertEqual(status_response.status_code, 200)
+                    self.assertEqual(status_response.json()["trading_state"], "IDLE")
+                    self.assertEqual(status_response.json()["grid_levels"], 0)
+                    self.assertFalse(status_response.json()["exact_grid_recenter_supported"])
+                    login = await client.post(
+                        "/api/auth/login",
+                        json={"password": "unique-private-admin-password"},
+                        headers={"Origin": "http://localhost:5173"},
+                    )
+                    self.assertEqual(login.status_code, 200)
+                    pause = await client.post(
+                        "/api/bot/pause", json={"active": True},
+                        headers={"Origin": "http://localhost:5173"},
+                    )
+                    self.assertEqual(pause.status_code, 409)
+                    self.assertEqual(pause.json()["detail"], "The bot is idle; no grid is active.")
+            standby_bot.run.assert_not_called()
+            standby_bot.set_manual_pause.assert_not_called()
+        finally:
+            grid_main.app.state.standby = False
+            grid_main.app.state.grid_bot = None
+
     async def test_monitor_only_status_never_opens_database_or_enables_trading(self) -> None:
         grid_main.app.state.grid_bot = None
         grid_main.app.state.monitor_only = True
