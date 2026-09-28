@@ -387,6 +387,33 @@ class GridDatabase:
         with self._connection() as connection:
             connection.execute("DELETE FROM bot_state WHERE key = ?", (key,))
 
+    def factory_reset(self) -> None:
+        """Erase trading history atomically while retaining restart configuration."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            active = connection.execute(
+                "SELECT COUNT(*) FROM grid_orders "
+                "WHERE status IN ('OPEN', 'PARTIALLY_FILLED')"
+            ).fetchone()[0]
+            if active:
+                raise ValueError("Tracked orders remain active; reconcile them first.")
+            connection.execute("DELETE FROM trade_history")
+            connection.execute("DELETE FROM archived_grid_orders")
+            connection.execute("DELETE FROM grid_orders")
+            connection.execute(
+                "DELETE FROM bot_state WHERE key NOT IN "
+                "('grid_run', 'active_grid_config', 'trailing_stop', "
+                "'breakout_width_percent', 'order_client_prefix')"
+            )
+            connection.execute(
+                "INSERT INTO bot_state (key, value) VALUES ('safety_mode', 'LIQUIDATED')"
+            )
+            connection.execute(
+                "INSERT INTO bot_state (key, value) VALUES "
+                "('hard_stop_liquidation', ?)",
+                (json.dumps({"phase": "complete", "residual_base": "0"}),),
+            )
+
     def finish_grid_reset(
         self, notification_key: str = "grid_reset_notification_pending"
     ) -> None:

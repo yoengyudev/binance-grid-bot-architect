@@ -245,6 +245,63 @@ class GridBotTests(unittest.TestCase):
         bot.prepare(persist=True)
         return bot, exchange
 
+    def test_factory_reset_erases_history_and_keeps_trading_halted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.database.insert_order("old", 1, "BUY", "90", "0.01")
+            bot.database.update_order_status("old", "CANCELED")
+            bot.database.record_trade("80", "90", "0.1")
+            bot.database.set_state("fill_snapshot:old", json.dumps({
+                "filled_base": "0", "filled_quote": "0",
+                "base_fee": "0", "quote_fee": "0",
+            }))
+            bot.database.set_state("grid_reset_notification_pending", "1")
+            bot.factory_reset()
+            self.assertEqual(bot.database.fetch_all_orders(), [])
+            self.assertEqual(bot.database.fetch_trade_history(), [])
+            self.assertIsNone(bot.database.get_state("fill_snapshot:old"))
+            self.assertIsNone(bot.database.get_state("grid_reset_notification_pending"))
+            self.assertIsNotNone(bot.database.get_state("grid_run"))
+            self.assertEqual(bot.database.get_state("safety_mode"), "LIQUIDATED")
+            self.assertEqual(grid_main._portfolio_wallet(bot.database)["unrealized_pnl"], 0)
+            self.assertEqual(bot.run_cycle(), [])
+            self.assertEqual(exchange.orders, {})
+            restarted = GridBot(bot.config, exchange, bot.database)
+            restarted.prepare(persist=True)
+            self.assertEqual(restarted.run_cycle(), [])
+            self.assertEqual(exchange.orders, {})
+
+    def test_factory_reset_rejects_exchange_orders_and_bot_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.database.record_trade("80", "90", "0.1")
+            exchange.orders["manual"] = {"status": "open", "side": "buy"}
+            with self.assertRaisesRegex(TradingHalt, "Active orders exist"):
+                bot.factory_reset()
+            self.assertEqual(len(bot.database.fetch_trade_history()), 1)
+            exchange.orders.clear()
+            bot.database.insert_order("seed", 0, "BUY", "100", "0.01",
+                                      order_type="MARKET")
+            bot.database.mark_order_filled("seed")
+            bot.database.set_state("fill_snapshot:seed", json.dumps({
+                "filled_base": "0.01", "filled_quote": "1",
+                "base_fee": "0", "quote_fee": "0",
+            }))
+            with self.assertRaisesRegex(TradingHalt, "Bot-owned BTC remains"):
+                bot.factory_reset()
+            self.assertEqual(len(bot.database.fetch_trade_history()), 1)
+
+    def test_factory_reset_fails_closed_when_exchange_cannot_be_checked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.database.record_trade("80", "90", "0.1")
+            exchange.fetch_open_orders = lambda _symbol: (_ for _ in ()).throw(
+                ccxt.NetworkError("Order query timed out")
+            )
+            with self.assertRaises(ccxt.NetworkError):
+                bot.factory_reset()
+            self.assertEqual(len(bot.database.fetch_trade_history()), 1)
+
     def test_startup_checks_rounded_buy_cost_and_seed_before_any_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = GridConfig(

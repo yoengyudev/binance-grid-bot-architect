@@ -494,6 +494,42 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 grid_main.app.state.grid_bot = None
 
+    async def test_factory_reset_requires_admin_cookie_and_trusted_origin(self) -> None:
+        reset = Mock()
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+            "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+        }):
+            grid_main.app.state.grid_bot = SimpleNamespace(factory_reset=reset)
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    origin = {"Origin": "http://localhost:5173"}
+                    denied = await client.post("/api/admin/factory-reset", headers=origin)
+                    self.assertEqual(denied.status_code, 401)
+                    await client.post(
+                        "/api/auth/login", json={"password": "unique-private-admin-password"},
+                        headers=origin,
+                    )
+                    foreign = await client.post(
+                        "/api/admin/factory-reset",
+                        headers={"Origin": "https://other.test"},
+                    )
+                    self.assertEqual(foreign.status_code, 403)
+                    reset.side_effect = grid_main.TradingHalt("Cannot reset: Active orders exist. Please pause the bot first.")
+                    blocked = await client.post("/api/admin/factory-reset", headers=origin)
+                    self.assertEqual(blocked.status_code, 400)
+                    reset.side_effect = None
+                    accepted = await client.post("/api/admin/factory-reset", headers=origin)
+                    self.assertEqual(accepted.json(), {
+                        "status": "reset", "trading_state": grid_main.LIQUIDATED,
+                    })
+                    self.assertEqual(reset.call_count, 2)
+            finally:
+                grid_main.app.state.grid_bot = None
+
     async def test_recenter_insufficient_capital_returns_http_400(self) -> None:
         detail = (
             "Insufficient Capital: Grid requires 498.42 USDT for BUY limits, "

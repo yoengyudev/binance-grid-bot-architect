@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import secrets
+import sqlite3
 import sys
 import time
 import uuid
@@ -246,8 +247,9 @@ def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
         if liquidation:
             state = json.loads(liquidation)
             if state.get("phase") == "complete":
-                return {"btc_held": float(state.get("residual_base", "0")),
-                        "average_cost": None, "unrealized_pnl": None}
+                residual = float(state.get("residual_base", "0"))
+                return {"btc_held": residual, "average_cost": None,
+                        "unrealized_pnl": 0.0 if residual == 0 else None}
             return _unavailable_wallet()
         carry_text = database.get_state("carry_inventory")
         carry = json.loads(carry_text) if carry_text else {}
@@ -497,6 +499,26 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
         LOGGER.exception("Manual safety pause could not finish.")
         raise HTTPException(status_code=502, detail="Exchange pause update failed; state remains paused.") from error
     return {"safety_pause": "Active" if mode else "Normal", "mode": mode}
+
+
+@app.post("/api/admin/factory-reset")
+def factory_reset(_: None = Depends(_require_dashboard_origin),
+                  __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """Erase bot accounting only after exchange and local exposure are clear."""
+    bot = app.state.grid_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="The trading bot is offline.")
+    try:
+        bot.factory_reset()
+    except TradingHalt as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
+        LOGGER.exception("Factory reset could not verify the exchange or database.")
+        raise HTTPException(
+            status_code=502, detail="Factory reset could not verify account safety. No data was deleted."
+        ) from error
+    LOGGER.warning("Admin factory reset erased bot order and trade history.")
+    return {"status": "reset", "trading_state": LIQUIDATED}
 
 
 @app.post("/api/bot/grid/recenter", status_code=202)
@@ -790,6 +812,37 @@ class GridBot:
             (Decimal(pending["lower"]), Decimal(pending["upper"])) if pending else None
         )
         self.grid_needs_reset = pending is not None
+
+    def factory_reset(self) -> None:
+        """Stop trading and clear history only after a fail-closed safety check."""
+        with self._cycle_lock:
+            with self._grid_lock:
+                mode = self.database.get_state(SAFETY_MODE_KEY)
+                if mode in (LIQUIDATING, LIQUIDATION_HALTED):
+                    raise TradingHalt("Cannot reset while liquidation is unresolved.")
+                if self.grid_needs_reset or self.database.get_state("grid_reset"):
+                    raise TradingHalt("Cannot reset while a grid rebuild is in progress.")
+                if self._live_open_orders():
+                    raise TradingHalt(
+                        "Cannot reset: Active orders exist. Please pause the bot first."
+                    )
+                if self.database.fetch_active_grids():
+                    raise TradingHalt(
+                        "Cannot reset: Tracked orders still need reconciliation."
+                    )
+                held = _portfolio_wallet(self.database)["btc_held"]
+                if held is None:
+                    raise TradingHalt(
+                        "Cannot reset: Bot-owned BTC inventory cannot be verified."
+                    )
+                if not math.isfinite(held) or held != 0:
+                    raise TradingHalt(
+                        "Cannot reset: Bot-owned BTC remains. Resolve it before wiping history."
+                    )
+                self.database.factory_reset()
+                self.is_paused = True
+                self.grid_needs_reset = False
+                self.pending_grid_bounds = None
 
     def grid_status(self) -> Tuple[Decimal, Decimal, Decimal, int, Decimal]:
         price = self._ticker_price()
