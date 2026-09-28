@@ -502,6 +502,55 @@ def bot_status() -> Dict[str, Any]:
     }
 
 
+def _ledger_order(row: Dict[str, Any], *, filled: bool = False) -> Dict[str, str]:
+    """Use saved execution data for fills and identify legacy price estimates."""
+    price = Decimal(row["price"])
+    amount = Decimal(row["amount"])
+    price_source = "order"
+    if filled and row.get("fill_snapshot"):
+        try:
+            snapshot = json.loads(row["fill_snapshot"])
+            executed = Decimal(snapshot["filled_base"])
+            quote = Decimal(snapshot["filled_quote"])
+            if executed.is_finite() and quote.is_finite() and executed > 0 and quote > 0:
+                amount = executed
+                price = quote / executed
+                price_source = "execution"
+        except (KeyError, TypeError, ValueError, InvalidOperation, ZeroDivisionError):
+            LOGGER.warning("Invalid saved fill snapshot for order ledger.")
+    return {
+        "id": str(row["order_id"]),
+        "timestamp": row["updated_at"] if filled else row["created_at"],
+        "side": row["side"],
+        "status": ("PENDING_CONFIRMATION" if not filled and
+                   row.get("exchange_order_id") is None else row["status"]),
+        "order_type": row["order_type"],
+        "price": format(price, "f"), "amount": format(amount, "f"),
+        "price_source": price_source,
+    }
+
+
+@app.get("/api/orders/live")
+def live_orders(response: Response,
+                _: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """Show bot-tracked limits and recent fills without exchange API calls."""
+    response.headers["Cache-Control"] = "no-store"
+    bot = app.state.grid_bot
+    if bot is None:
+        return {"open_limits": [], "filled_trades": []}
+    database = bot.database
+    active = [
+        _ledger_order(row) for row in database.fetch_active_grids()
+        if row["order_type"] == "LIMIT"
+    ]
+    recent = [
+        _ledger_order(row, filled=True)
+        for row in database.fetch_recent_filled_orders(20)
+    ]
+    active.sort(key=lambda row: (row["timestamp"], row["id"]), reverse=True)
+    return {"open_limits": active, "filled_trades": recent}
+
+
 @app.get("/api/wallet-balance")
 def wallet_balance(response: Response,
                    _: str = Depends(get_current_user)) -> Dict[str, str]:

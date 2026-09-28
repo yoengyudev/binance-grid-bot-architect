@@ -20,6 +20,46 @@ from database import GridDatabase
 
 
 class StatusApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_order_ledger_requires_admin_and_uses_saved_fill_price(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database.insert_order("buy-open", 1, "BUY", "82000", "0.02",
+                                  client_order_id="gridbot-open")
+            database.insert_order("sell-filled", -1, "SELL", "88000", "0.01",
+                                  client_order_id="gridbot-filled")
+            database.mark_order_filled("sell-filled")
+            database.set_state(grid_main.FILL_SNAPSHOT_PREFIX + "sell-filled",
+                               '{"filled_base":"0.009","filled_quote":"792",'
+                               '"base_fee":"0","quote_fee":"0"}')
+            grid_main.app.state.grid_bot = SimpleNamespace(database=database)
+            try:
+                with patch.dict(os.environ, {
+                    "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+                    "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+                }):
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=grid_main.app),
+                        base_url="https://testserver",
+                    ) as client:
+                        self.assertEqual((await client.get("/api/orders/live")).status_code, 401)
+                        login = await client.post(
+                            "/api/auth/login",
+                            json={"password": "unique-private-admin-password"},
+                            headers={"Origin": "http://localhost:5173"},
+                        )
+                        self.assertEqual(login.status_code, 200)
+                        response = await client.get("/api/orders/live")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["cache-control"], "no-store")
+                self.assertEqual(response.json()["open_limits"][0]["id"], "buy-open")
+                filled = response.json()["filled_trades"][0]
+                self.assertEqual(filled["id"], "sell-filled")
+                self.assertEqual(filled["price"], "88000")
+                self.assertEqual(filled["amount"], "0.009")
+                self.assertEqual(filled["price_source"], "execution")
+            finally:
+                grid_main.app.state.grid_bot = None
+
     async def test_standby_reports_idle_and_rejects_trading_controls(self) -> None:
         standby_bot = Mock()
         standby_bot.config.symbol = "BTC/USDT"

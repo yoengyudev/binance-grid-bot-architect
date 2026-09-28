@@ -51,6 +51,27 @@ class GridDatabaseTests(unittest.TestCase):
                 database.discard_rejected_post_only_order("maker-1")
             self.assertEqual(database.get_order("maker-1")["exchange_order_id"], "exchange-1")
 
+    def test_recent_fills_include_archived_runs_and_exclude_synthetic_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            database.insert_order("old-fill", 1, "BUY", "80000", "0.01",
+                                  client_order_id="gridbot-old-fill")
+            database.mark_order_filled("old-fill")
+            database.insert_order("synthetic-carry", 0, "BUY", "79000", "0.01",
+                                  order_type="MARKET")
+            database.mark_order_filled("synthetic-carry")
+            database.complete_grid_reset("{}", "{}", "{}")
+            database.insert_order("new-fill", -1, "SELL", "90000", "0.01",
+                                  client_order_id="gridbot-new-fill")
+            database.mark_order_filled("new-fill")
+            self.assertEqual(
+                {row["order_id"] for row in database.fetch_recent_filled_orders()},
+                {"old-fill", "new-fill"},
+            )
+            self.assertEqual(len(database.fetch_recent_filled_orders(1)), 1)
+            with self.assertRaises(ValueError):
+                database.fetch_recent_filled_orders(101)
+
 
 if __name__ == "__main__":
     unittest.main()

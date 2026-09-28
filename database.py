@@ -100,6 +100,10 @@ class GridDatabase:
                 """
             )
             connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_grid_orders_recent_fills "
+                "ON grid_orders (status, updated_at DESC)"
+            )
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS trade_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +140,10 @@ class GridDatabase:
                     AS archived_at
                 FROM grid_orders WHERE 0
                 """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_archived_grid_orders_recent_fills "
+                "ON archived_grid_orders (status, updated_at DESC)"
             )
 
     def insert_order(
@@ -253,6 +261,34 @@ class GridDatabase:
                 WHERE status IN ('OPEN', 'PARTIALLY_FILLED')
                 ORDER BY level, order_id
                 """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def fetch_recent_filled_orders(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return recent exchange-backed fills from current and archived runs."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("Filled-order limit must be from 1 to 100.")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT fills.*, snapshots.value AS fill_snapshot
+                FROM (
+                    SELECT order_id, side, order_type, status, price, amount,
+                           created_at, updated_at
+                    FROM grid_orders
+                    WHERE status = 'FILLED' AND client_order_id IS NOT NULL
+                    UNION ALL
+                    SELECT order_id, side, order_type, status, price, amount,
+                           created_at, updated_at
+                    FROM archived_grid_orders
+                    WHERE status = 'FILLED' AND client_order_id IS NOT NULL
+                ) AS fills
+                LEFT JOIN bot_state AS snapshots
+                  ON snapshots.key = 'fill_snapshot:' || fills.order_id
+                ORDER BY fills.updated_at DESC, fills.order_id DESC
+                LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
 
