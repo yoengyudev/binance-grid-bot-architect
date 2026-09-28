@@ -1,8 +1,10 @@
 import json
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import ccxt
 
@@ -49,10 +51,14 @@ class HardResetTests(unittest.TestCase):
             self.addCleanup(fixture.stop)
 
     def run_utility(self, answer: str = "Y", *, keep_btc_manual=False) -> int:
-        return reset_util.hard_reset(
-            keep_btc_manual=keep_btc_manual,
-            input_fn=lambda _prompt: answer, output=self.messages.append,
-        )
+        preview = io.StringIO()
+        with redirect_stdout(preview):
+            result = reset_util.hard_reset(
+                keep_btc_manual=keep_btc_manual,
+                input_fn=lambda _prompt: answer, output=self.messages.append,
+            )
+        self.preview = preview.getvalue()
+        return result
 
     def add_bot_inventory(self) -> None:
         self.database.insert_order(
@@ -66,6 +72,12 @@ class HardResetTests(unittest.TestCase):
 
     def test_confirmed_reset_cancels_and_verifies_before_deleting(self) -> None:
         self.assertEqual(self.run_utility(), 0)
+        calls = self.exchange.mock_calls
+        self.assertLess(
+            calls.index(call.set_sandbox_mode(True)),
+            calls.index(call.load_markets()),
+        )
+        self.assertIn("old-order", self.preview)
         self.exchange.cancel_all_orders.assert_called_once_with("BTC/USDT")
         self.assertEqual(self.exchange.fetch_open_orders.call_count, 2)
         self.assertFalse(self.database_path.exists())

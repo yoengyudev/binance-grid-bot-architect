@@ -171,12 +171,17 @@ def hard_reset(*, keep_btc_manual=False, input_fn=input, output=print) -> int:
     if not api_key or not api_secret:
         raise ResetError("Both Binance Spot Testnet API keys are required in .env.")
     exchange = create_exchange(api_key, api_secret)
+    # create_exchange already enables sandbox mode; assert it here as well before
+    # the first request so this destructive utility cannot use Mainnet URLs.
+    exchange.set_sandbox_mode(True)
     exchange.load_markets()
     market = exchange.market(SYMBOL)
     if not market.get("spot") or market.get("active") is False:
         raise ResetError("BTC/USDT is not an active Spot Testnet market.")
 
-    if exchange.fetch_open_orders(SYMBOL):
+    open_orders = exchange.fetch_open_orders(SYMBOL)
+    print(f"Open {SYMBOL} orders on Binance Spot Testnet before cancellation: {open_orders}")
+    if open_orders:
         try:
             exchange.cancel_all_orders(SYMBOL)
         except ccxt.OrderNotFound:
@@ -216,9 +221,11 @@ if __name__ == "__main__":
         sys.exit(hard_reset(keep_btc_manual=args.keep_btc_manual))
     except ResetError as error:
         print(f"Hard reset stopped: {error}", file=sys.stderr)
-    except (ccxt.NetworkError, ccxt.ExchangeError) as error:
-        print(f"Binance Testnet request failed ({type(error).__name__}); database retained.",
-              file=sys.stderr)
+    except ccxt.BaseError as error:
+        print(
+            f"Binance Testnet request failed ({type(error).__name__}): "
+            f"{error}; database retained.", file=sys.stderr,
+        )
     except (OSError, sqlite3.Error) as error:
         print(f"Database or service check failed ({type(error).__name__}); inspect the path and state.",
               file=sys.stderr)
