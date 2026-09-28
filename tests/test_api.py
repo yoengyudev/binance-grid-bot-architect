@@ -20,6 +20,56 @@ from database import GridDatabase
 
 
 class StatusApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_monitor_only_status_never_opens_database_or_enables_trading(self) -> None:
+        grid_main.app.state.grid_bot = None
+        grid_main.app.state.monitor_only = True
+        try:
+            with patch.object(grid_main, "GridDatabase", side_effect=AssertionError("DB opened")):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="http://testserver",
+                ) as client:
+                    response = await client.get("/api/bot/status")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["status"], "Online")
+            self.assertEqual(response.json()["trading_state"], "STOPPED")
+            self.assertEqual(response.json()["grid_levels"], 0)
+            self.assertFalse(response.json()["exact_grid_recenter_supported"])
+        finally:
+            grid_main.app.state.monitor_only = False
+
+    async def test_monitor_only_wallet_is_read_only_and_controls_remain_unavailable(self) -> None:
+        exchange = Mock()
+        exchange.fetch_balance.return_value = {"USDT": {"free": "9403.45"}}
+        grid_main.app.state.grid_bot = None
+        grid_main.app.state.monitor_only = True
+        try:
+            with patch.dict(os.environ, {
+                "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+                "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+            }), patch.object(grid_main, "create_exchange", return_value=exchange):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    self.assertEqual((await client.get("/api/wallet-balance")).status_code, 401)
+                    login = await client.post(
+                        "/api/auth/login",
+                        json={"password": "unique-private-admin-password"},
+                        headers={"Origin": "http://localhost:5173"},
+                    )
+                    self.assertEqual(login.status_code, 200)
+                    wallet = await client.get("/api/wallet-balance")
+                    self.assertEqual(wallet.json(), {"available_usdt": "9403.45"})
+                    pause = await client.post(
+                        "/api/bot/pause", json={"active": True},
+                        headers={"Origin": "http://localhost:5173"},
+                    )
+                    self.assertEqual(pause.status_code, 503)
+            exchange.create_order.assert_not_called()
+        finally:
+            grid_main.app.state.monitor_only = False
+
     async def test_status_is_read_only_and_allows_dashboard_origin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = GridDatabase(Path(directory) / "grid.sqlite3")

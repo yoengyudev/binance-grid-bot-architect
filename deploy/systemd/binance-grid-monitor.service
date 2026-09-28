@@ -1,0 +1,18 @@
+[Unit]
+Description=Grid Master read-only dashboard API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/binance-grid-bot-architect
+ExecStart=/home/ubuntu/binance-grid-bot-architect/.venv/bin/python /home/ubuntu/binance-grid-bot-architect/main.py --monitor-only
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

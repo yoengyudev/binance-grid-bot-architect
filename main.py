@@ -106,6 +106,7 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 app.state.grid_bot = None
+app.state.monitor_only = False
 app.state.atr_snapshot = None
 app.state.order_book_snapshot = None
 app.state.preview_jwt_secret = secrets.token_urlsafe(48)
@@ -140,7 +141,8 @@ def _auth_configuration() -> Tuple[str, str]:
     secret = os.getenv("BOT_JWT_SECRET")
     if password and secret and len(secret) >= 32:
         return password, secret
-    if os.getenv("BOT_AUTH_MOCK_ENABLED") == "1" and app.state.grid_bot is None:
+    if (os.getenv("BOT_AUTH_MOCK_ENABLED") == "1" and
+            app.state.grid_bot is None and not app.state.monitor_only):
         return MOCK_ADMIN_PASSWORD, app.state.preview_jwt_secret
     raise HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -414,8 +416,22 @@ async def _refresh_market_data(bot: "GridBot") -> None:
 
 @app.get("/api/bot/status")
 def bot_status() -> Dict[str, Any]:
-    """Summarize persisted grid orders; only a running bot is marked online."""
+    """Summarize the bot or report the read-only monitor's stopped state."""
     bot = app.state.grid_bot
+    if app.state.monitor_only and bot is None:
+        return {
+            "status": "Online", "pair": "BTC/USDT",
+            "safety_pause": "Stopped", "pause_mode": None,
+            "trading_state": "STOPPED", "grid_levels": 0,
+            "exact_grid_recenter_supported": False,
+            "lower_bound": None, "upper_bound": None,
+            "wallet": {"btc_held": 0.0, "average_cost": None,
+                       "unrealized_pnl": 0.0},
+            "atr_value": None, "atr_percentage": None,
+            "bid_volume": None, "ask_volume": None,
+            "imbalance_ratio": None,
+            "current_hard_stop_loss": None, "high_water_mark": None,
+        }
     database = bot.database if bot is not None else GridDatabase()
     orders = [
         order for order in database.fetch_active_grids()
@@ -473,11 +489,24 @@ def wallet_balance(response: Response,
     """Return only the admin's currently free Spot USDT balance."""
     response.headers["Cache-Control"] = "no-store"
     bot = app.state.grid_bot
-    if bot is None:
+    if bot is None and not app.state.monitor_only:
         raise HTTPException(status_code=503, detail="The trading bot is offline.")
     try:
-        free_usdt = bot._free_balance("USDT")
-    except (ccxt.BaseError, TradingHalt, OSError) as error:
+        if bot is None:
+            key, secret = _credentials()
+            exchange = create_exchange(key, secret)
+            balances = exchange.fetch_balance({"type": "spot"})
+            asset = balances.get("USDT") if isinstance(balances, dict) else None
+            free = asset.get("free") if isinstance(asset, dict) else None
+            if free is None:
+                raise TradingHalt("Exchange did not return a free USDT balance.")
+            free_usdt = _order_decimal(free)
+            if not free_usdt.is_finite() or free_usdt < 0:
+                raise TradingHalt("Exchange returned an invalid free USDT balance.")
+        else:
+            free_usdt = bot._free_balance("USDT")
+    except (ccxt.BaseError, TradingHalt, OSError, ValueError, TypeError,
+            InvalidOperation) as error:
         LOGGER.warning("Spot USDT balance fetch failed: %s", type(error).__name__)
         raise HTTPException(
             status_code=502, detail="Could not fetch the Spot USDT balance."
@@ -2931,8 +2960,15 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="Center and preview without orders")
     mode.add_argument("--execute", action="store_true", help="Trade on Spot Testnet")
+    mode.add_argument("--monitor-only", action="store_true",
+                      help="Serve the dashboard API without starting the trading bot")
     arguments = parser.parse_args()
     try:
+        if arguments.monitor_only:
+            app.state.grid_bot = None
+            app.state.monitor_only = True
+            uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+            return 0
         key, secret = _credentials()
         exchange = create_exchange(key, secret)
         database = GridDatabase()
