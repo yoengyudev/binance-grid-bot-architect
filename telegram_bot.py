@@ -86,6 +86,13 @@ class TelegramNotifier:
             "SELL limits remain open."
         )
 
+    async def notify_sizing_pause(self, reason: str) -> None:
+        await self._send(
+            "GRID SIZING PAUSE: New orders are blocked and bot BUY limits are "
+            f"being canceled. Existing SELL limits remain open. {reason} "
+            "Re-anchor with adequate order sizes to resume."
+        )
+
     async def notify_safety_recovery(self) -> None:
         await self._send(
             "✅ SAFETY PAUSE LIFTED: Market recovered. Remaining BUY levels will "

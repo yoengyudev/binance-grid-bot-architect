@@ -56,6 +56,15 @@ class TelegramNotifierTests(unittest.TestCase):
         self.assertIn("SAFETY PAUSE ACTIVE", send.await_args_list[0].args[0])
         self.assertIn("BREAKOUT CONFIRMED", send.await_args_list[1].args[0])
 
+    def test_sizing_pause_alert_explains_manual_reanchor(self) -> None:
+        notifier = TelegramNotifier("secret-token", 42)
+        with patch("telegram_bot.send_telegram_alert", new_callable=AsyncMock) as send:
+            asyncio.run(notifier.notify_sizing_pause("Rounded order below 7 USDT."))
+        message = send.await_args.args[0]
+        self.assertIn("GRID SIZING PAUSE", message)
+        self.assertIn("Rounded order below 7 USDT", message)
+        self.assertIn("Re-anchor", message)
+
     def test_hard_stop_alerts_report_verified_or_unresolved_outcome(self) -> None:
         notifier = TelegramNotifier("secret-token", 42)
         with patch("telegram_bot.send_telegram_alert", new_callable=AsyncMock) as send:

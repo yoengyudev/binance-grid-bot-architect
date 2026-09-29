@@ -360,6 +360,53 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual((len(reopened.levels), len(reopened.upper_levels)), (5, 5))
             self.assertGreater(exchange.base_free, Decimal("1"))
 
+    def test_exact_grid_rejects_exchange_rounded_sub_seven_orders_before_start(self) -> None:
+        class SpotPrecisionExchange(FakeSpotExchange):
+            def __init__(self) -> None:
+                super().__init__()
+                self.price = Decimal("83518")
+
+            def market(self, _symbol: str) -> dict:
+                result = super().market(_symbol)
+                result["limits"] = {"amount": {"min": 0.00001}, "cost": {"min": 5}}
+                return result
+
+            def amount_to_precision(self, _symbol: str, amount: str) -> str:
+                return str(Decimal(amount).quantize(Decimal("0.00001"), rounding=ROUND_DOWN))
+
+        with tempfile.TemporaryDirectory() as directory:
+            exchange = SpotPrecisionExchange()
+            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80050"), Decimal("86256"),
+                Decimal("2.5"), Decimal("50"), Decimal("79700"), 2,
+            )
+            bot = GridBot(config, exchange, database)
+            with self.assertRaisesRegex(grid_main.GridSizingError, "each grid order must be at least 7"):
+                bot.request_initial_grid("83153", "3.73", "4.2", "100", 14)
+            self.assertEqual(exchange.orders, {})
+            self.assertIsNone(database.get_state("grid_run"))
+
+    def test_undersized_replacement_pauses_without_stopping_risk_monitor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.run_cycle()
+            bot.run_cycle()
+            self.assertTrue(any(order["side"] == "buy" for order in exchange.fetch_open_orders("BTC/USDT")))
+            self.assertTrue(any(order["side"] == "sell" for order in exchange.fetch_open_orders("BTC/USDT")))
+            with patch.object(bot, "_run_cycle_locked", side_effect=grid_main.GridSizingError("Rounded sell below 7")):
+                self.assertEqual(bot.run_cycle(), [])
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY), grid_main.PAUSED_SIZING)
+            self.assertFalse(bot.stop_controller.stop_requested.is_set())
+            self.assertEqual({order["side"] for order in exchange.fetch_open_orders("BTC/USDT")}, {"sell"})
+            with self.assertRaisesRegex(TradingHalt, "valid grid re-anchor"):
+                bot.set_manual_pause(False)
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            self.assertEqual(reopened.run_cycle(), [])
+            self.assertEqual({order["side"] for order in exchange.fetch_open_orders("BTC/USDT")}, {"sell"})
+
     def test_approved_idle_grid_does_not_trade_after_price_drifts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "grid.sqlite3"
@@ -1731,7 +1778,7 @@ class GridBotTests(unittest.TestCase):
             self.assertFalse(any(order["type"] == "market" and order["side"] == "sell"
                                  for order in exchange.orders.values()))
 
-    def test_reset_halts_if_carried_btc_cannot_fund_upper_sells(self) -> None:
+    def test_reset_pauses_if_carried_btc_cannot_fund_upper_sells(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
             bot.run_cycle()
@@ -1740,11 +1787,11 @@ class GridBotTests(unittest.TestCase):
             exchange.fill(old_upper["client_order_id"])
             bot.request_grid_reset("75", "125")
 
-            with self.assertRaisesRegex(ValueError, "market minimum"):
-                bot.reset_grid()
+            self.assertFalse(bot.reset_grid())
 
-            self.assertTrue(bot.grid_needs_reset)
-            self.assertEqual(bot.database.get_state("grid_reset") is not None, True)
+            self.assertFalse(bot.grid_needs_reset)
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY), grid_main.PAUSED_SIZING)
+            self.assertIsNone(bot.database.get_state("grid_reset"))
             self.assertFalse(exchange.fetch_open_orders("BTC/USDT"))
             self.assertFalse(any(order["type"] == "market" and order["side"] == "sell"
                                  for order in exchange.orders.values()))

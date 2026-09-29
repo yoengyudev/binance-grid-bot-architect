@@ -43,10 +43,12 @@ MAX_LEVELS = 50
 ORDER_CLIENT_PREFIX = "gridbot"
 ORDER_CLIENT_PREFIX_KEY = "order_client_prefix"
 SELL_AMOUNT_BUFFER = Decimal("0.002")
+MIN_GRID_ORDER_NOTIONAL = Decimal("7")
 RESET_SPACING_PERCENT = Decimal("2.5")
 SAFETY_MODE_KEY = "safety_mode"
 PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
 PAUSED_MANUAL = "PAUSED_MANUAL"
+PAUSED_SIZING = "PAUSED_SIZING"
 LIQUIDATING = "LIQUIDATING"
 LIQUIDATED = "LIQUIDATED"
 LIQUIDATION_HALTED = "HALTED"
@@ -59,6 +61,8 @@ LIQUIDATION_NOTICE_KEY = "hard_stop_notification_pending"
 SAFETY_PAUSE_NOTICE_KEY = "safety_pause_notice_pending"
 SAFETY_RECOVERY_NOTICE_KEY = "safety_recovery_notice_pending"
 SAFETY_RESUME_NOTICE_KEY = "safety_resume_notice_pending"
+SIZING_PAUSE_REASON_KEY = "sizing_pause_reason"
+SIZING_PAUSE_NOTICE_KEY = "sizing_pause_notice_pending"
 LAST_MARKET_PRICE_KEY = "last_market_price"
 TRAILING_STOP_KEY = "trailing_stop"
 FILL_SNAPSHOT_PREFIX = "fill_snapshot:"
@@ -488,7 +492,9 @@ def bot_status() -> Dict[str, Any]:
         ),
         "pause_mode": safety_mode,
         "trading_state": safety_mode if safety_mode in (
-            LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED) else "ACTIVE",
+            LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING) else "ACTIVE",
+        **({"pause_reason": database.get_state(SIZING_PAUSE_REASON_KEY)}
+           if safety_mode == PAUSED_SIZING else {}),
         "grid_levels": len(orders),
         "exact_grid_recenter_supported": True,
         "lower_bound": float(min(prices)) if prices else None,
@@ -747,6 +753,10 @@ class InsufficientGridCapital(TradingHalt):
     """A requested grid cannot be funded from the free Spot quote balance."""
 
 
+class GridSizingError(ValueError):
+    """A rounded grid order cannot satisfy the required minimum size."""
+
+
 class UncertainOrderError(TradingHalt):
     """The exchange may have accepted an order without returning its ID."""
 
@@ -942,7 +952,7 @@ class GridBot:
         self.stop_loss_distance: Optional[Decimal] = None
         self._post_only_rejected_in_cycle = False
         safety_mode = self.database.get_state(SAFETY_MODE_KEY)
-        if safety_mode not in (None, PAUSED_DOWNSIDE, PAUSED_MANUAL,
+        if safety_mode not in (None, PAUSED_DOWNSIDE, PAUSED_MANUAL, PAUSED_SIZING,
                                LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
             raise TradingHalt("Unknown saved safety mode; inspect local state.")
         self.is_paused = safety_mode is not None
@@ -1441,7 +1451,7 @@ class GridBot:
                     return self._restart_liquidated_run(
                         center, width_percent, lower, upper, requested_stop, candidate
                     )
-                if self.is_paused:
+                if self.is_paused and self.database.get_state(SAFETY_MODE_KEY) != PAUSED_SIZING:
                     raise TradingHalt("Release Safety Pause before re-anchoring the grid.")
                 if self.grid_needs_reset or self.database.get_state("grid_reset"):
                     raise TradingHalt("A grid reset is already in progress.")
@@ -1451,10 +1461,10 @@ class GridBot:
                     raise ValueError("New lower bound must exceed the pause trigger.")
                 candidate_buys, candidate_sells = configured_grid_levels(center, candidate)
                 self._validate_level_prices(center, candidate_buys, candidate_sells)
-                if allocated_capital_text is not None:
-                    self._validate_nominal_grid_sizes(
-                        candidate, center, candidate_buys, candidate_sells
-                    )
+                self._validate_nominal_grid_sizes(
+                    candidate, center, candidate_buys, candidate_sells,
+                    carry_amount=self._bot_base_exposure(),
+                )
                 price = self._ticker_price()
                 self.advance_trailing_stop(price)
                 if (requested_stop is not None and
@@ -1738,17 +1748,20 @@ class GridBot:
         self.levels, self.upper_levels = configured_grid_levels(self.anchor, self.config)
         if self.config.buy_grid_levels is not None:
             self._validate_level_prices(self.anchor, self.levels, self.upper_levels)
+        sizing_paused = self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING
         seed_quote = self._seed_quote()
         quote_per_level = self._lower_quote_per_level()
         seed_amount = self._amount(seed_quote / current_price)
-        self._check_order_size(current_price, seed_amount)
+        if not sizing_paused:
+            self._check_order_size(current_price, seed_amount)
         planned: List[Tuple[int, Decimal, Decimal]] = []
         for level, raw_price in enumerate(self.levels, start=1):
             price = self._price(raw_price)
             if price <= self.config.stop_loss_price:
                 continue
             amount = self._amount(quote_per_level / price)
-            self._check_order_size(price, amount)
+            if not sizing_paused:
+                self._check_order_size(price, amount)
             if price * amount > quote_per_level:
                 raise TradingHalt("A rounded grid order exceeds its quote allocation.")
             planned.append((level, price, amount))
@@ -1759,7 +1772,8 @@ class GridBot:
         upper_planned: List[Tuple[int, Decimal, Decimal]] = []
         for index, raw_price in enumerate(self.upper_levels, start=1):
             price = self._price(raw_price)
-            self._check_order_size(price, upper_amount)
+            if not sizing_paused:
+                self._check_order_size(price, upper_amount)
             upper_planned.append((-index, price, upper_amount))
 
         if persist and not saved:
@@ -1827,14 +1841,21 @@ class GridBot:
 
     def _check_order_size(self, price: Decimal, amount: Decimal) -> None:
         if price <= 0 or amount <= 0:
-            raise ValueError("Order price or amount rounded to zero.")
+            raise GridSizingError("Order price or amount rounded to zero.")
         limits = self.market.get("limits") or {}
         amount_min = (limits.get("amount") or {}).get("min")
         cost_min = (limits.get("cost") or {}).get("min")
         if amount_min is not None and amount < _order_decimal(amount_min):
-            raise ValueError("Order amount is below the market minimum.")
-        if cost_min is not None and price * amount < _order_decimal(cost_min):
-            raise ValueError("Order notional is below the market minimum.")
+            raise GridSizingError("Order amount is below the market minimum.")
+        notional = price * amount
+        if cost_min is not None and notional < _order_decimal(cost_min):
+            raise GridSizingError("Order notional is below the market minimum.")
+        if notional < MIN_GRID_ORDER_NOTIONAL:
+            raise GridSizingError(
+                f"Rounded order is {notional:.4f} USDT at {price} x {amount} BTC; "
+                f"each grid order must be at least {MIN_GRID_ORDER_NOTIONAL} USDT. "
+                "Increase allocated capital or explicitly choose fewer grid levels."
+            )
 
     def _validate_level_prices(
         self, center: Decimal, buys: List[Decimal], sells: List[Decimal],
@@ -1851,18 +1872,27 @@ class GridBot:
     def _validate_nominal_grid_sizes(
         self, config: GridConfig, center: Decimal,
         buys: List[Decimal], sells: List[Decimal],
+        *, carry_amount: Decimal = Decimal(0),
     ) -> None:
-        """Check new allocation against actual per-side exchange minimums before canceling."""
+        """Check rounded per-side orders before any existing order is canceled."""
         seed_quote = config.investment_quote * config.initial_inventory_percent / 100
-        self._check_order_size(center, self._amount(seed_quote / center))
+        if carry_amount <= 0:
+            self._check_order_size(center, self._amount(seed_quote / center))
         lower_quote = (config.investment_quote - seed_quote) / len(buys)
         for raw in buys:
             price = self._price(raw)
-            self._check_order_size(price, self._amount(lower_quote / price))
-        upper_total = self._amount(seed_quote / center)
+            buy_amount = self._amount(lower_quote / price)
+            self._check_order_size(price, buy_amount)
+            conservative_sell = self._amount(buy_amount * (1 - SELL_AMOUNT_BUFFER))
+            sell_target = self._price(raw / (1 - config.spacing_percent / 100))
+            self._check_order_size(sell_target, conservative_sell)
+        upper_total = carry_amount if carry_amount > 0 else self._amount(seed_quote / center)
         upper_amount = self._amount(upper_total * (1 - SELL_AMOUNT_BUFFER) / len(sells))
         for raw in sells:
-            self._check_order_size(self._price(raw), upper_amount)
+            price = self._price(raw)
+            self._check_order_size(price, upper_amount)
+            conservative_sell = self._amount(upper_amount * (1 - SELL_AMOUNT_BUFFER))
+            self._check_order_size(price, conservative_sell)
 
     def _fetch_order(self, row: Dict[str, Any]) -> Dict[str, Any]:
         carry_text = self.database.get_state("carry_inventory")
@@ -2350,7 +2380,14 @@ class GridBot:
                 raise TradingHalt("New grid anchor is at or below the hard stop.")
             if not new_config.lower_price < price < new_config.upper_price:
                 raise TradingHalt("Price left the requested bounds during reset.")
-            lowers, uppers = self._validate_reset_grid(new_config, anchor, carry_amount)
+            try:
+                lowers, uppers = self._validate_reset_grid(new_config, anchor, carry_amount)
+            except GridSizingError as error:
+                self._pause_for_order_sizing(error)
+                self.database.clear_state("grid_reset")
+                self.pending_grid_bounds = None
+                self.grid_needs_reset = False
+                return False
             baseline = self._free_balance(self.market["base"]) - carry_amount
             if baseline < 0:
                 raise TradingHalt("Carried BTC exceeds the account balance.")
@@ -2394,8 +2431,18 @@ class GridBot:
                     self.stop_loss_distance = anchor - new_config.stop_loss_price
         elif request["phase"] != "placing":
             raise TradingHalt("Unknown grid reset phase.")
+        if request.get("source") == "manual_recenter" and self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING:
+            self.database.clear_state(SAFETY_MODE_KEY)
+            self.database.clear_state(SIZING_PAUSE_REASON_KEY)
+            self.database.clear_state(SIZING_PAUSE_NOTICE_KEY)
+            self.is_paused = False
         for _ in range(3):
             self.run_cycle()
+            if self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING:
+                self.database.clear_state("grid_reset")
+                self.pending_grid_bounds = None
+                self.grid_needs_reset = False
+                return False
             if self._post_only_rejected_in_cycle:
                 return False
             latest = self.database.fetch_latest_orders_by_level()
@@ -2734,6 +2781,8 @@ class GridBot:
             mode = self.database.get_state(SAFETY_MODE_KEY)
             if mode in (LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
                 raise TradingHalt("Hard-stop liquidation has locked trading controls.")
+            if mode == PAUSED_SIZING:
+                raise TradingHalt("Order sizing pause requires a valid grid re-anchor.")
             if active:
                 if mode != PAUSED_MANUAL:
                     self.database.set_state(SAFETY_MODE_KEY, PAUSED_MANUAL)
@@ -2797,7 +2846,23 @@ class GridBot:
 
     def run_cycle(self) -> List[Tuple[str, Tuple[str, ...]]]:
         with self._cycle_lock:
-            return self._run_cycle_locked()
+            try:
+                return self._run_cycle_locked()
+            except GridSizingError as error:
+                self._pause_for_order_sizing(error)
+                return []
+
+    def _pause_for_order_sizing(self, error: GridSizingError) -> None:
+        """Keep the risk monitor alive while preventing an undersized grid."""
+        self.database.set_state(SAFETY_MODE_KEY, PAUSED_SIZING)
+        self.database.set_state(SIZING_PAUSE_REASON_KEY, str(error))
+        self.database.set_state(SIZING_PAUSE_NOTICE_KEY, "1")
+        self.database.clear_state(BREAKOUT_TIMER_KEY)
+        self.is_paused = True
+        LOGGER.critical("Grid order sizing pause: %s", error)
+        _, complete = self._cancel_buy_orders_for_pause()
+        if not complete:
+            LOGGER.error("Sizing pause BUY cancellations will retry next cycle.")
 
     def _run_cycle_locked(self) -> List[Tuple[str, Tuple[str, ...]]]:
         if not self.levels:
@@ -2814,7 +2879,7 @@ class GridBot:
             self._liquidate_locked(current_price)
             return []
         self._cancel_buys_below_stop()
-        if self._observe_upper_breakout(current_price):
+        if mode != PAUSED_SIZING and self._observe_upper_breakout(current_price):
             return []
         events: List[Tuple[str, Tuple[str, ...]]] = []
         if self.is_paused:
@@ -2835,6 +2900,9 @@ class GridBot:
             event = self._reconcile_order(row)
             if event:
                 events.append(event)
+
+        if self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING:
+            return events
 
         latest = self.database.fetch_latest_orders_by_level()
         seed_row = latest.get(0)
@@ -2914,6 +2982,16 @@ class GridBot:
         return events
 
     async def _notify_safety_state(self, notifier: TelegramNotifier) -> None:
+        if self.database.get_state(SIZING_PAUSE_NOTICE_KEY):
+            try:
+                await notifier.notify_sizing_pause(
+                    self.database.get_state(SIZING_PAUSE_REASON_KEY) or "Order below size floor."
+                )
+            except Exception as error:
+                LOGGER.warning("Grid sizing Telegram update failed: %s",
+                               type(error).__name__)
+            else:
+                self.database.clear_state(SIZING_PAUSE_NOTICE_KEY)
         if self.database.get_state(SAFETY_PAUSE_NOTICE_KEY):
             try:
                 await notifier.notify_safety_pause()
