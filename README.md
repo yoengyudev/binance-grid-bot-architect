@@ -2,7 +2,7 @@
 
 Grid Master is a human-directed BTC/USDT grid-trading system for **Binance Spot Testnet**. A Python engine manages orders and persistent risk state; a FastAPI service exposes telemetry and authenticated controls; a React dashboard presents the account, grid, and market data. Telegram is an outbound alert channel only.
 
-> **Scope:** The exchange client explicitly enables Binance Spot sandbox mode. This repository has not been validated for live Mainnet capital. The browser's prominent streaming price comes from Binance's **public Mainnet** WebSocket, while execution, ATR, order-book data, and wallet balances come from **Spot Testnet**. Use the Testnet data and backend validation for decisions about Testnet orders.
+> **Scope:** The exchange client explicitly enables Binance Spot sandbox mode. This repository has not been validated for live Mainnet capital. The browser's prominent streaming price, execution, ATR, order-book data, and wallet balances all come from **Spot Testnet**. The browser stream and backend ticker are separate observations and can briefly differ.
 
 ## Architecture at a glance
 
@@ -148,12 +148,12 @@ sudo .venv/bin/python diagnose_stop_event.py \
   --csv diagnostics/2026-09-30-hard-stop.csv --summary-only
 ```
 
-Omit `--summary-only` to print every row in timestamp order. The bot did **not** historically log every ticker poll; SQLite's `last_market_price` is overwritten. Public aggregate trades establish traded-price movements but are not a replay of the bot's own ticker responses. The dashboard header uses a separate Binance public **Mainnet** WebSocket, so it cannot verify a Testnet price wick.
+Omit `--summary-only` to print every row in timestamp order. The bot did **not** historically log every ticker poll; SQLite's `last_market_price` is overwritten. Public aggregate trades establish traded-price movements but are not a replay of the bot's own ticker responses. The dashboard header now uses a Binance Spot **Testnet** WebSocket, but its current price cannot reconstruct a past wick or prove which ticker value the bot received at that moment.
 
 ## Current limits and operational risks
 
 - The application is **Testnet-only** by configuration and exchange construction. A Mainnet rollout requires a separate review of exchange filters, liquidity, permissions, stop execution, and recovery under outages.
-- The public WebSocket price in the header and Testnet execution price can diverge. The backend also polls rather than receiving every tick, so stop and breakout decisions can lag fast markets.
+- The Testnet WebSocket price in the header and the backend's polled Testnet ticker can differ briefly because they are separate feeds. The backend does not receive every tick, so stop and breakout decisions can lag fast markets.
 - Post-Only limits may be rejected at the spread; a lane can remain temporarily empty until a later safe cycle. Exchange precision and balances can change between validation and submission.
 - The order-book ratio is a top-50 snapshot, susceptible to rapidly changing or canceled displayed liquidity. It is not a predictor of future fills.
 - Portfolio PnL is an estimate from bot-recorded lots and the last observed price. It is not exchange-wide equity, a tax ledger, or a guarantee of realized profit.
