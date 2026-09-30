@@ -914,6 +914,44 @@ class GridBotTests(unittest.TestCase):
             self.assertTrue(any(order["side"] == "buy" for order in
                                 exchange.fetch_open_orders("BTC/USDT")))
 
+    def test_prepare_factory_reset_cancels_bot_orders_and_stays_paused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.run_cycle()
+            bot.run_cycle()
+            tracked = bot.database.fetch_active_grids()
+            self.assertEqual({row["side"] for row in tracked}, {"BUY", "SELL"})
+            manual = exchange.create_order(
+                "BTC/USDT", "limit", "buy", 0.2, 50,
+                {"newClientOrderId": "manualreset123"},
+            )
+
+            result = bot.prepare_factory_reset()
+            self.assertEqual(result["mode"], grid_main.PAUSED_RESET)
+            self.assertEqual(result["remaining_exchange_orders"], 1)
+            self.assertGreater(result["bot_btc_held"], 0)
+            self.assertFalse(result["factory_reset_ready"])
+            self.assertEqual(bot.database.fetch_active_grids(), [])
+            self.assertEqual(
+                [order["id"] for order in exchange.fetch_open_orders("BTC/USDT")],
+                [manual["id"]],
+            )
+            self.assertNotIn(manual["clientOrderId"], exchange.cancel_calls)
+            with self.assertRaisesRegex(TradingHalt, "Orders are cleared for reset"):
+                bot.set_manual_pause(False)
+
+            bot.run_cycle()
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            reopened.run_cycle()
+            self.assertEqual(reopened.database.get_state("safety_mode"),
+                             grid_main.PAUSED_RESET)
+            self.assertEqual(
+                [order["id"] for order in exchange.fetch_open_orders("BTC/USDT")],
+                [manual["id"]],
+            )
+
     def test_manual_unpause_respects_downside_guard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")

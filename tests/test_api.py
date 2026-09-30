@@ -632,6 +632,43 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 grid_main.app.state.grid_bot = None
 
+    async def test_prepare_reset_requires_admin_and_calls_bot_cleanup(self) -> None:
+        cleanup = Mock(return_value={
+            "safety_pause": "Active", "mode": grid_main.PAUSED_RESET,
+            "remaining_exchange_orders": 0, "bot_btc_held": 0.00024,
+            "factory_reset_ready": False,
+        })
+        with patch.dict(os.environ, {
+            "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+            "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+        }):
+            grid_main.app.state.grid_bot = SimpleNamespace(prepare_factory_reset=cleanup)
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    origin = {"Origin": "http://localhost:5173"}
+                    denied = await client.post("/api/bot/prepare-reset", headers=origin)
+                    self.assertEqual(denied.status_code, 401)
+                    await client.post(
+                        "/api/auth/login",
+                        json={"password": "unique-private-admin-password"}, headers=origin,
+                    )
+                    foreign = await client.post(
+                        "/api/bot/prepare-reset",
+                        headers={"Origin": "https://other.test"},
+                    )
+                    self.assertEqual(foreign.status_code, 403)
+                    self.assertEqual(cleanup.call_count, 0)
+                    prepared = await client.post("/api/bot/prepare-reset", headers=origin)
+                    self.assertEqual(prepared.status_code, 200)
+                    self.assertEqual(prepared.json()["mode"], grid_main.PAUSED_RESET)
+                    self.assertEqual(prepared.headers["cache-control"], "no-store")
+                    cleanup.assert_called_once_with()
+            finally:
+                grid_main.app.state.grid_bot = None
+
     async def test_hard_stop_endpoint_raises_floor_without_grid_reset(self) -> None:
         bot = Mock()
         bot.set_stop_loss.return_value = Decimal("79500")

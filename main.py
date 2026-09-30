@@ -48,6 +48,7 @@ RESET_SPACING_PERCENT = Decimal("2.5")
 SAFETY_MODE_KEY = "safety_mode"
 PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
 PAUSED_MANUAL = "PAUSED_MANUAL"
+PAUSED_RESET = "PAUSED_RESET"
 PAUSED_SIZING = "PAUSED_SIZING"
 LIQUIDATING = "LIQUIDATING"
 LIQUIDATED = "LIQUIDATED"
@@ -492,7 +493,8 @@ def bot_status() -> Dict[str, Any]:
         ),
         "pause_mode": safety_mode,
         "trading_state": safety_mode if safety_mode in (
-            LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING) else "ACTIVE",
+            LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING,
+            PAUSED_RESET) else "ACTIVE",
         **({"pause_reason": database.get_state(SIZING_PAUSE_REASON_KEY)}
            if safety_mode == PAUSED_SIZING else {}),
         "grid_levels": len(orders),
@@ -608,6 +610,30 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
         LOGGER.exception("Manual safety pause could not finish.")
         raise HTTPException(status_code=502, detail="Exchange pause update failed; state remains paused.") from error
     return {"safety_pause": "Active" if mode else "Normal", "mode": mode}
+
+
+@app.post("/api/bot/prepare-reset")
+def prepare_bot_reset(response: Response,
+                      _: None = Depends(_require_dashboard_origin),
+                      __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """Pause placement and cancel/reconcile this bot's BUY and SELL orders."""
+    response.headers["Cache-Control"] = "no-store"
+    if app.state.standby:
+        raise HTTPException(status_code=409, detail="The bot is idle; no grid is active.")
+    bot = app.state.grid_bot
+    if bot is None:
+        raise HTTPException(status_code=503, detail="The trading bot is offline.")
+    try:
+        result = bot.prepare_factory_reset()
+    except TradingHalt as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
+        LOGGER.exception("Bot order cleanup for factory reset could not finish.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not verify order cleanup; the bot remains paused for reset.",
+        ) from error
+    return result
 
 
 @app.post("/api/bot/stop-loss")
@@ -952,7 +978,8 @@ class GridBot:
         self.stop_loss_distance: Optional[Decimal] = None
         self._post_only_rejected_in_cycle = False
         safety_mode = self.database.get_state(SAFETY_MODE_KEY)
-        if safety_mode not in (None, PAUSED_DOWNSIDE, PAUSED_MANUAL, PAUSED_SIZING,
+        if safety_mode not in (None, PAUSED_DOWNSIDE, PAUSED_MANUAL, PAUSED_RESET,
+                               PAUSED_SIZING,
                                LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
             raise TradingHalt("Unknown saved safety mode; inspect local state.")
         self.is_paused = safety_mode is not None
@@ -1072,7 +1099,8 @@ class GridBot:
                     raise TradingHalt("Cannot reset while a grid rebuild is in progress.")
                 if self._live_open_orders():
                     raise TradingHalt(
-                        "Cannot reset: Active orders exist. Please pause the bot first."
+                        "Cannot reset: Active orders exist. Clear bot orders for reset "
+                        "and resolve any other BTC/USDT orders first."
                     )
                 if self.database.fetch_active_grids():
                     raise TradingHalt(
@@ -1451,6 +1479,8 @@ class GridBot:
                     return self._restart_liquidated_run(
                         center, width_percent, lower, upper, requested_stop, candidate
                     )
+                if self.database.get_state(SAFETY_MODE_KEY) == PAUSED_RESET:
+                    raise TradingHalt("Orders are cleared for reset; complete the reset before re-anchoring.")
                 if self.is_paused and self.database.get_state(SAFETY_MODE_KEY) != PAUSED_SIZING:
                     raise TradingHalt("Release Safety Pause before re-anchoring the grid.")
                 if self.grid_needs_reset or self.database.get_state("grid_reset"):
@@ -2920,6 +2950,8 @@ class GridBot:
             mode = self.database.get_state(SAFETY_MODE_KEY)
             if mode in (LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
                 raise TradingHalt("Hard-stop liquidation has locked trading controls.")
+            if mode == PAUSED_RESET:
+                raise TradingHalt("Orders are cleared for reset; start a new run after reset.")
             if mode == PAUSED_SIZING:
                 raise TradingHalt("Order sizing pause requires a valid grid re-anchor.")
             if active:
@@ -2948,6 +2980,32 @@ class GridBot:
             self.database.clear_state(SAFETY_PAUSE_NOTICE_KEY)
             self.is_paused = False
             return None
+
+    def prepare_factory_reset(self) -> Dict[str, Any]:
+        """Persist a no-placement state before canceling both bot order sides."""
+        with self._cycle_lock:
+            if self.stop_controller.stop_requested.is_set() or self.grid_needs_reset:
+                raise TradingHalt("Bot is stopping or resetting its grid.")
+            mode = self.database.get_state(SAFETY_MODE_KEY)
+            if mode in (LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
+                raise TradingHalt("Hard-stop liquidation has locked trading controls.")
+            self.database.set_state(SAFETY_MODE_KEY, PAUSED_RESET)
+            self.database.clear_state(BREAKOUT_TIMER_KEY)
+            self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
+            self.database.clear_state(SAFETY_RESUME_NOTICE_KEY)
+            self.is_paused = True
+            _, complete = self._cancel_bot_orders()
+            if not complete or self.database.fetch_active_grids():
+                raise TradingHalt("Bot orders still need cancellation or reconciliation; retry.")
+            remaining = len(self._live_open_orders())
+            held = _portfolio_wallet(self.database)["btc_held"]
+            LOGGER.warning("Admin cleared bot BUY and SELL orders for factory reset.")
+            return {
+                "safety_pause": "Active", "mode": PAUSED_RESET,
+                "remaining_exchange_orders": remaining,
+                "bot_btc_held": held,
+                "factory_reset_ready": remaining == 0 and held == 0,
+            }
 
     def _cancel_buy_orders_for_pause(
         self,
@@ -3017,6 +3075,11 @@ class GridBot:
         if mode == LIQUIDATING or current_price < self.config.stop_loss_price:
             self._liquidate_locked(current_price)
             return []
+        if mode == PAUSED_RESET:
+            events, complete = self._cancel_bot_orders()
+            if not complete or self.database.fetch_active_grids():
+                LOGGER.warning("Bot order cleanup for factory reset will retry next cycle.")
+            return events
         self._cancel_buys_below_stop()
         if mode != PAUSED_SIZING and self._observe_upper_breakout(current_price):
             return []
