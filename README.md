@@ -24,13 +24,19 @@ The backend source is in this directory. The frontend is the sibling `web-dashbo
 
 ### Start and trade lifecycle
 
-1. **Standby:** With a fresh database, `main.py --standby` serves the API and market intelligence without placing a grid. Starting a grid requires an authenticated dashboard action. If a saved grid run exists, `--standby` resumes that run instead of silently replacing it.
-2. **Human approval:** The operator supplies center price, ceiling, hard stop, allocated USDT, and an **exact total** of BUY plus SELL levels. The API validates the live Testnet price, exchange precision, order size, and available capital before accepting the request.
+1. **Ready service:** `main.py --ready` serves the API and market intelligence with `engine_status=IDLE`, even if a saved grid exists. A service restart returns ordinary grid trading to IDLE and reconciles/cancels bot-owned open orders. An unresolved hard-stop liquidation remains a safety exception. The authenticated top-bar Master Switch is the only normal path from IDLE to RUNNING.
+2. **Human approval:** The operator supplies center price, ceiling, hard stop, allocated USDT, and an **exact total** of BUY plus SELL levels. The API validates the live Testnet price, exchange precision, order size, and available capital before accepting the request. In ready mode this saves a pending grid; it places no orders until the operator presses **START**.
 3. **Initial inventory:** The configured `initial_inventory_percent` (50% in the current configuration) funds a seed market BUY. Its BTC is divided among upper SELL limits. The remaining quote allocation funds lower BUY limits.
 4. **Geometric grid:** The engine calculates exact geometric price levels between the center and each bound. For an odd level count, the BUY side gets one extra level. Each limit order is sent **Post-Only** (`timeInForce: PO`) with a bot-specific client order ID. An order that would immediately take liquidity is logged and deferred to a later cycle.
 5. **Fill rotation:** A filled BUY creates a corresponding SELL sized from its executed BTC minus BTC-denominated commissions, rounded through CCXT's exchange precision, and checked against free bot-owned BTC. If execution details or free BTC have not caught up, placement waits for another cycle. A definitive insufficient-balance SELL rejection also leaves the lane available for retry. A filled SELL records realized trade profit and re-arms a BUY at the corresponding grid lane when conditions allow. The grid rotates through price levels; a completed sell does not permanently reduce its configured lane count.
 
 This is spread-capture grid trading, **not risk-free arbitrage**. Fees, gaps, inventory exposure, and adverse trends can exceed the spread earned by completed cycles. The order ledger and status card count currently active/open orders; that number can temporarily differ from the configured number of price levels during fills, pauses, Post-Only rejections, and reconciliation.
+
+### Master engine switch
+
+The authenticated `POST /api/engine/stop` persists `engine_status=IDLE` before canceling and reconciling **both BUY and SELL bot-owned grid orders**. It leaves unrelated account orders and bot-held BTC alone. The ready-mode loop skips all new grid placement while IDLE; the Testnet dashboard ticker and market-intelligence refresh continue. **IDLE also suspends automated trailing-stop enforcement.** Bot-held BTC remains exposed to price changes.
+
+`POST /api/engine/start` requires saved grid settings and revalidates market price, order state, exchange precision, quote balance, and carried BTC. After a stop it queues a carry-aware rebuild using the saved grid bounds and level counts; it does not sell retained BTC. A fresh grid needs settings saved first. A liquidation lock, unresolved trading fault, or incompatible safety pause blocks START. Both endpoints require the admin cookie and trusted dashboard origin. Manual Safety Pause remains a separate BUY-only risk control.
 
 ### ATR-assisted parameters
 
@@ -43,7 +49,7 @@ The backend fetches 15 one-hour Testnet candles and computes 14-period Average T
 | Initial hard stop | `C - 2.2A` |
 | Width per side | `(ceiling - C) / C × 100` |
 
-The proposed stop is therefore **0.2 ATR below the projected lower bound** at entry. The form previews the width, lower bound, stop distance, and estimated order size. Auto-Fill only populates fields; the operator must review them and explicitly click **Start Grid** or **Execute Re-anchor**. Manual values can create a wider gap, subject to backend validation, so the tight stop is a template rather than a global guarantee. ATR is descriptive market data, not an automatic trade signal.
+The proposed stop is therefore **0.2 ATR below the projected lower bound** at entry. The form previews the width, lower bound, stop distance, and estimated order size. Auto-Fill only populates fields; the operator must review them and explicitly save settings, then press **START**. Manual values can create a wider gap, subject to backend validation, so the tight stop is a template rather than a global guarantee. ATR is descriptive market data, not an automatic trade signal.
 
 ## Capital and order-risk controls
 
@@ -131,7 +137,7 @@ FastAPI serves a public, read-only `/api/bot/status`. Wallet balance, order ledg
 ## Running and verification
 
 1. Create a Python 3.12 virtual environment in the backend directory and install `requirements.txt`. Configure `.env` from `.env.example` with **Spot Testnet** API keys, Telegram token/chat ID, `BOT_ADMIN_PASSWORD`, and a random `BOT_JWT_SECRET` of at least 32 characters. Keep `.env` and `grid_bot.sqlite3` out of Git.
-2. Use `python main.py --check` for a non-trading grid preview, `python main.py --standby` for an idle API awaiting an explicit Start Grid on a fresh database, or `python main.py --execute` for a configured/saved trading run. `--monitor-only` serves a read-only API without the engine. Avoid running a second trading process against the same account and database.
+2. Use `python main.py --check` for a non-trading grid preview or `python main.py --ready` for the dashboard-controlled service. `--standby` and `--execute` remain legacy CLI modes; `--standby` automatically resumes a saved run and should not be used for the Master Switch deployment. `--monitor-only` serves a read-only API without the engine. Avoid running a second trading process against the same account and database.
 3. In the sibling frontend directory run `npm install` and `npm run dev`; open `http://localhost:5173`. Development API requests go to port 8000 on the same hostname. A production build uses same-origin `/api` and needs an HTTPS reverse proxy. The backend API binds to loopback by default; Docker Compose maps port 8000 to loopback on its host.
 4. Verify the backend with `python -m unittest discover -s tests -v`. Verify the frontend with `npm run lint` and `npm run build`.
 

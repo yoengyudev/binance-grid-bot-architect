@@ -46,6 +46,10 @@ SELL_AMOUNT_BUFFER = Decimal("0.002")
 MIN_GRID_ORDER_NOTIONAL = Decimal("7")
 RESET_SPACING_PERCENT = Decimal("2.5")
 SAFETY_MODE_KEY = "safety_mode"
+ENGINE_STATUS_KEY = "engine_status"
+ENGINE_IDLE = "IDLE"
+ENGINE_RUNNING = "RUNNING"
+ENGINE_FAULT_KEY = "engine_fault"
 PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
 PAUSED_MANUAL = "PAUSED_MANUAL"
 PAUSED_RESET = "PAUSED_RESET"
@@ -113,6 +117,7 @@ app.add_middleware(
 app.state.grid_bot = None
 app.state.monitor_only = False
 app.state.standby = False
+app.state.ready = False
 app.state.atr_snapshot = None
 app.state.order_book_snapshot = None
 app.state.preview_jwt_secret = secrets.token_urlsafe(48)
@@ -434,7 +439,8 @@ def bot_status() -> Dict[str, Any]:
         return {
             "status": "Online", "pair": bot.config.symbol,
             "safety_pause": "Idle", "pause_mode": None,
-            "trading_state": "IDLE", "grid_levels": 0,
+            "trading_state": "IDLE", "engine_status": ENGINE_IDLE,
+            "has_grid_run": False, "grid_levels": 0,
             "exact_grid_recenter_supported": True,
             "lower_bound": None, "upper_bound": None,
             "wallet": {"btc_held": 0.0, "average_cost": None,
@@ -450,7 +456,8 @@ def bot_status() -> Dict[str, Any]:
         return {
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Stopped", "pause_mode": None,
-            "trading_state": "STOPPED", "grid_levels": 0,
+            "trading_state": "STOPPED", "engine_status": ENGINE_IDLE,
+            "has_grid_run": False, "grid_levels": 0,
             "exact_grid_recenter_supported": False,
             "lower_bound": None, "upper_bound": None,
             "wallet": {"btc_held": 0.0, "average_cost": None,
@@ -467,6 +474,8 @@ def bot_status() -> Dict[str, Any]:
     ]
     prices = [Decimal(order["price"]) for order in orders]
     safety_mode = database.get_state(SAFETY_MODE_KEY)
+    engine_status = (database.get_state(ENGINE_STATUS_KEY) or
+                     (ENGINE_RUNNING if bot is not None else ENGINE_IDLE))
     atr = app.state.atr_snapshot if bot is not None else None
     order_book = app.state.order_book_snapshot if bot is not None else None
     stop_value = getattr(bot.config, "stop_loss_price", None) if bot is not None else None
@@ -492,9 +501,12 @@ def bot_status() -> Dict[str, Any]:
             else "Normal"
         ),
         "pause_mode": safety_mode,
+        "engine_status": engine_status,
+        "engine_fault": database.get_state(ENGINE_FAULT_KEY),
+        "has_grid_run": database.get_state("grid_run") is not None,
         "trading_state": safety_mode if safety_mode in (
             LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING,
-            PAUSED_RESET) else "ACTIVE",
+            PAUSED_RESET) else (ENGINE_IDLE if engine_status == ENGINE_IDLE else "ACTIVE"),
         **({"pause_reason": database.get_state(SIZING_PAUSE_REASON_KEY)}
            if safety_mode == PAUSED_SIZING else {}),
         "grid_levels": len(orders),
@@ -610,6 +622,44 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
         LOGGER.exception("Manual safety pause could not finish.")
         raise HTTPException(status_code=502, detail="Exchange pause update failed; state remains paused.") from error
     return {"safety_pause": "Active" if mode else "Normal", "mode": mode}
+
+
+@app.post("/api/engine/start")
+def start_engine(response: Response,
+                 _: None = Depends(_require_dashboard_origin),
+                 __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    bot = app.state.grid_bot
+    if not app.state.ready or bot is None:
+        raise HTTPException(status_code=503, detail="The ready-mode engine is offline.")
+    try:
+        result = bot.start_engine()
+    except InsufficientGridCapital as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except (TradingHalt, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
+        LOGGER.exception("Engine start validation failed.")
+        raise HTTPException(status_code=502, detail="Could not verify the grid before starting.") from error
+    app.state.standby = False
+    return result
+
+
+@app.post("/api/engine/stop")
+def stop_engine(response: Response,
+                _: None = Depends(_require_dashboard_origin),
+                __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    bot = app.state.grid_bot
+    if not app.state.ready or bot is None:
+        raise HTTPException(status_code=503, detail="The ready-mode engine is offline.")
+    try:
+        return bot.stop_engine()
+    except TradingHalt as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
+        LOGGER.exception("Engine stop could not verify bot order cancellation.")
+        raise HTTPException(status_code=502, detail="Engine is idle, but order cleanup needs verification.") from error
 
 
 @app.post("/api/bot/prepare-reset")
@@ -734,6 +784,8 @@ def recenter_grid(payload: RecenterRequest,
         except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
             LOGGER.exception("Initial grid request failed.")
             raise HTTPException(status_code=502, detail="Could not start the grid.") from error
+        if app.state.ready:
+            app.state.standby = False
         return {"status": "queued", "lower_bound": float(lower),
                 "upper_bound": float(upper)}
     if (stop_distance is not None and isinstance(bot, GridBot) and
@@ -1001,6 +1053,7 @@ class GridBot:
         )
         self.grid_needs_reset = pending is not None
         self.grid_activation_requested = False
+        self.ready_mode = False
 
     def request_initial_grid(self, center_text: str, width_text: str,
                              stop_distance_text: str, capital_text: str,
@@ -1116,6 +1169,8 @@ class GridBot:
                         "Cannot reset: Bot-owned BTC remains. Resolve it before wiping history."
                     )
                 self.database.factory_reset()
+                if self.ready_mode:
+                    self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
                 self.is_paused = True
                 self.grid_needs_reset = False
                 self.pending_grid_bounds = None
@@ -2428,6 +2483,8 @@ class GridBot:
 
     def _reset_grid_locked(self) -> bool:
         """Process the persisted reset before an ordinary trading cycle."""
+        if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_IDLE:
+            return False
         request_text = self.database.get_state("grid_reset")
         if request_text is None:
             self.pending_grid_bounds = None
@@ -3007,6 +3064,95 @@ class GridBot:
                 "factory_reset_ready": remaining == 0 and held == 0,
             }
 
+    def _load_market_for_engine_control(self) -> None:
+        if self.market:
+            return
+        self._call(self.exchange.load_markets)
+        self.market = self.exchange.market(self.config.symbol)
+        if not self.market.get("spot") or self.market.get("active") is False:
+            raise TradingHalt("Configured symbol is not an active Spot market.")
+
+    def reconcile_idle_orders(self) -> None:
+        """Retry a failed stop after a process restart without placing orders."""
+        with self._cycle_lock:
+            if self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE:
+                return
+            if self.database.get_state(SAFETY_MODE_KEY) in (
+                    LIQUIDATING, LIQUIDATION_HALTED):
+                return  # The separate liquidation state must be reviewed.
+            self._load_market_for_engine_control()
+            _, complete = self._cancel_bot_orders()
+            if not complete or self.database.fetch_active_grids():
+                raise TradingHalt("Idle bot orders still need reconciliation.")
+
+    def stop_engine(self) -> Dict[str, Any]:
+        """Persist IDLE before canceling and reconciling every bot-owned grid order."""
+        with self._cycle_lock:
+            if self.database.get_state(SAFETY_MODE_KEY) in (
+                    LIQUIDATING, LIQUIDATION_HALTED):
+                raise TradingHalt("Unresolved hard-stop liquidation cannot be interrupted.")
+            self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+            self._load_market_for_engine_control()
+            _, complete = self._cancel_bot_orders()
+            if self.grid_needs_reset:
+                pending_text = self.database.get_state("grid_reset")
+                if pending_text:
+                    pending = json.loads(pending_text)
+                    pending["phase"] = "canceling"
+                    self.database.set_state("grid_reset", json.dumps(pending, sort_keys=True))
+            if not complete or self.database.fetch_active_grids():
+                raise TradingHalt("Engine is idle, but bot order cancellation needs another attempt.")
+            LOGGER.warning("Admin stopped the trading engine and cleared bot grid orders.")
+            return {"engine_status": ENGINE_IDLE, "bot_orders_cleared": True,
+                    "remaining_exchange_orders": len(self._live_open_orders())}
+
+    def start_engine(self) -> Dict[str, Any]:
+        """Validate a saved grid and queue a carry-aware rebuild before trading."""
+        with self._cycle_lock:
+            if self.stop_controller.stop_requested.is_set():
+                raise TradingHalt("The trading process is stopping or faulted.")
+            if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_RUNNING:
+                return {"engine_status": ENGINE_RUNNING}
+            if not self.database.get_state("grid_run"):
+                raise TradingHalt("Configure a grid before starting the engine.")
+            if self.database.get_state("halt_reason"):
+                raise TradingHalt("A saved trading fault requires review before starting.")
+            mode = self.database.get_state(SAFETY_MODE_KEY)
+            if mode in (PAUSED_DOWNSIDE, PAUSED_MANUAL, PAUSED_RESET,
+                        PAUSED_SIZING, LIQUIDATING, LIQUIDATED,
+                        LIQUIDATION_HALTED):
+                raise TradingHalt(f"Cannot start while safety mode is {mode}.")
+            self._load_market_for_engine_control()
+            _, complete = self._cancel_bot_orders()
+            if not complete or self.database.fetch_active_grids():
+                raise TradingHalt("Bot orders need reconciliation before the engine starts.")
+            current, _, _ = self.prepare(persist=False)
+            if not self.config.lower_price < current < self.config.upper_price:
+                raise TradingHalt("Market price is outside the saved grid; re-anchor first.")
+            if current <= self.config.stop_loss_price:
+                raise TradingHalt("Market price is at or below the hard stop.")
+            if not self.grid_needs_reset:
+                carry_amount, _ = self._carry_inventory()
+                self._validate_reset_grid(self.config, current, carry_amount)
+                request = {
+                    "phase": "canceling", "source": "engine_resume",
+                    "lower": str(self.config.lower_price),
+                    "upper": str(self.config.upper_price),
+                    "spacing": str(self.config.spacing_percent),
+                    "investment_quote": str(self.config.investment_quote),
+                }
+                if self.config.buy_grid_levels is not None:
+                    request["buy_levels"] = self.config.buy_grid_levels
+                    request["sell_levels"] = self.config.sell_grid_levels
+                self.database.set_state("grid_reset", json.dumps(request, sort_keys=True))
+                self.pending_grid_bounds = (self.config.lower_price,
+                                            self.config.upper_price)
+                self.grid_needs_reset = True
+            self.database.clear_state(ENGINE_FAULT_KEY)
+            self.database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
+            LOGGER.warning("Admin started the trading engine with a saved grid.")
+            return {"engine_status": ENGINE_RUNNING}
+
     def _cancel_buy_orders_for_pause(
         self,
     ) -> Tuple[List[Tuple[str, Tuple[str, ...]]], bool]:
@@ -3043,6 +3189,8 @@ class GridBot:
 
     def run_cycle(self) -> List[Tuple[str, Tuple[str, ...]]]:
         with self._cycle_lock:
+            if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_IDLE:
+                return []
             try:
                 return self._run_cycle_locked()
             except GridSizingError as error:
@@ -3238,6 +3386,8 @@ class GridBot:
             self.database.clear_state(LIQUIDATION_NOTICE_KEY)
 
     async def run(self, notifier: TelegramNotifier) -> None:
+        if self.ready_mode and self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_RUNNING:
+            return
         initial_request_text = self.database.get_state("grid_reset")
         if initial_request_text and not self.database.fetch_all_orders():
             initial_request = json.loads(initial_request_text)
@@ -3270,6 +3420,9 @@ class GridBot:
             while True:
                 if self.stop_controller.stop_requested.is_set():
                     break
+                if (self.ready_mode and
+                        self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_RUNNING):
+                    return
                 try:
                     mode = self.database.get_state(SAFETY_MODE_KEY)
                     if mode in (LIQUIDATED, LIQUIDATION_HALTED):
@@ -3350,7 +3503,9 @@ class GridBot:
                     raise
                 await asyncio.to_thread(self.stop_controller.stop_requested.wait, delay)
         finally:
-            if not self.stop_controller.stop_requested.is_set() and not self.is_paused:
+            if (not self.stop_controller.stop_requested.is_set() and not self.is_paused
+                    and not (self.ready_mode and self.database.get_state(ENGINE_STATUS_KEY)
+                             == ENGINE_IDLE)):
                 await asyncio.to_thread(self.stop_controller.request_stop)
 
 
@@ -3415,9 +3570,12 @@ def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> Gri
     )
 
 
-async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
+async def _run_services(bot: GridBot, notifier: TelegramNotifier,
+                        *, ready: bool = False) -> None:
     """Run the local API and trading loop with outbound alerts only."""
     app.state.grid_bot = bot
+    app.state.ready = ready
+    app.state.standby = ready and bot.database.get_state("grid_run") is None
     app.state.atr_snapshot = None
     app.state.order_book_snapshot = None
     server = uvicorn.Server(uvicorn.Config(
@@ -3438,11 +3596,48 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
                 LOGGER.error("Status API stopped while the trading bot is running.")
 
     api_task = asyncio.create_task(serve_api(), name="status-api")
+    async def stop_if_api_exits() -> None:
+        await api_task
+        if ready and not server.should_exit:
+            bot.database.set_state(ENGINE_FAULT_KEY, "DashboardApiUnavailable")
+            try:
+                await asyncio.to_thread(bot.stop_engine)
+            except Exception:
+                LOGGER.exception("Could not verify bot order cleanup after API loss.")
+
+    api_watchdog = (asyncio.create_task(stop_if_api_exits(), name="api-watchdog")
+                    if ready else None)
     market_data_task = asyncio.create_task(
         _refresh_market_data(bot), name="market-intelligence"
     )
     try:
-        await bot.run(notifier)
+        if not ready:
+            await bot.run(notifier)
+        else:
+            while True:
+                if api_task.done():
+                    try:
+                        await asyncio.to_thread(bot.stop_engine)
+                    except Exception:
+                        LOGGER.exception("Could not verify bot order cleanup after API loss.")
+                    raise TradingHalt("Dashboard API stopped in ready mode.")
+                if bot.database.get_state(ENGINE_STATUS_KEY) == ENGINE_RUNNING:
+                    try:
+                        await bot.run(notifier)
+                        if bot.stop_controller.stop_requested.is_set():
+                            bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+                            bot.database.set_state(ENGINE_FAULT_KEY, "ProcessStopping")
+                    except Exception as error:
+                        LOGGER.exception("Trading engine faulted; dashboard stays online.")
+                        bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+                        bot.database.set_state(ENGINE_FAULT_KEY, type(error).__name__)
+                else:
+                    try:
+                        await asyncio.to_thread(bot.reconcile_idle_orders)
+                    except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
+                        LOGGER.warning("Idle order cleanup will retry: %s",
+                                       type(error).__name__)
+                    await asyncio.sleep(max(bot.config.poll_seconds, 5))
     finally:
         market_data_task.cancel()
         await asyncio.gather(market_data_task, return_exceptions=True)
@@ -3455,7 +3650,12 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier) -> None:
             api_task.cancel()
             await asyncio.gather(api_task, return_exceptions=True)
         finally:
+            if api_watchdog is not None:
+                api_watchdog.cancel()
+                await asyncio.gather(api_watchdog, return_exceptions=True)
             app.state.grid_bot = None
+            app.state.ready = False
+            app.state.standby = False
             app.state.atr_snapshot = None
             app.state.order_book_snapshot = None
 
@@ -3508,12 +3708,37 @@ def main() -> int:
                       help="Serve the dashboard API without starting the trading bot")
     mode.add_argument("--standby", action="store_true",
                       help="Start the bot idle with market data, without trading")
+    mode.add_argument("--ready", action="store_true",
+                      help="Serve the dashboard; trading starts only from the web UI")
     arguments = parser.parse_args()
     try:
         if arguments.monitor_only:
             app.state.grid_bot = None
             app.state.monitor_only = True
             uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+            return 0
+        if arguments.ready:
+            key, secret = _credentials()
+            exchange = create_exchange(key, secret)
+            database = GridDatabase()
+            existing_run = database.get_state("grid_run") is not None
+            if not existing_run and (any(database.get_state(key) is not None for key in (
+                    "grid_reset", "active_grid_config", SAFETY_MODE_KEY,
+                    LIQUIDATION_KEY, TRAILING_STOP_KEY)) or database.fetch_all_orders()):
+                raise TradingHalt("A saved bot state exists without a grid run; review it first.")
+            config = (_apply_active_grid_config(GridConfig.load(), database)
+                      if existing_run else GridConfig.load())
+            bot = GridBot(config, exchange, database)
+            bot.ready_mode = True
+            # A service restart never resumes ordinary grid trading by itself.
+            # An unfinished hard-stop liquidation remains a safety exception.
+            if database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
+                database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
+            else:
+                database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+            token, owner_chat_id = load_telegram_credentials()
+            asyncio.run(_run_services(bot, TelegramNotifier(token, owner_chat_id),
+                                      ready=True))
             return 0
         if arguments.standby:
             key, secret = _credentials()

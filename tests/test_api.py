@@ -171,7 +171,9 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(offline.json(), {
                     "status": "Offline", "pair": "BTC/USDT",
                     "safety_pause": "Normal", "pause_mode": None,
-                    "trading_state": "ACTIVE", "grid_levels": 0,
+                    "trading_state": "IDLE", "engine_status": "IDLE",
+                    "engine_fault": None, "has_grid_run": False,
+                    "grid_levels": 0,
                     "exact_grid_recenter_supported": True,
                     "lower_bound": None, "upper_bound": None,
                     "atr_value": None, "atr_percentage": None,
@@ -239,7 +241,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.json(), {
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "pause_mode": grid_main.PAUSED_DOWNSIDE,
-            "trading_state": "ACTIVE",
+            "trading_state": "ACTIVE", "engine_status": "RUNNING",
+            "engine_fault": None, "has_grid_run": False,
             "grid_levels": 2,
             "exact_grid_recenter_supported": True,
             "lower_bound": 81000.0, "upper_bound": 90000.0,
@@ -668,6 +671,48 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     cleanup.assert_called_once_with()
             finally:
                 grid_main.app.state.grid_bot = None
+
+    async def test_master_engine_routes_require_admin_and_trusted_origin(self) -> None:
+        bot = Mock()
+        bot.start_engine.return_value = {"engine_status": grid_main.ENGINE_RUNNING}
+        bot.stop_engine.return_value = {
+            "engine_status": grid_main.ENGINE_IDLE,
+            "bot_orders_cleared": True, "remaining_exchange_orders": 0,
+        }
+        grid_main.app.state.grid_bot = bot
+        grid_main.app.state.ready = True
+        try:
+            with patch.dict(os.environ, {
+                "BOT_ADMIN_PASSWORD": "unique-private-admin-password",
+                "BOT_JWT_SECRET": "a-random-private-signing-secret-32-chars",
+            }):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="https://testserver",
+                ) as client:
+                    origin = {"Origin": "http://localhost:5173"}
+                    denied = await client.post("/api/engine/start", headers=origin)
+                    self.assertEqual(denied.status_code, 401)
+                    await client.post(
+                        "/api/auth/login",
+                        json={"password": "unique-private-admin-password"}, headers=origin,
+                    )
+                    foreign = await client.post(
+                        "/api/engine/stop", headers={"Origin": "https://other.test"},
+                    )
+                    self.assertEqual(foreign.status_code, 403)
+                    bot.stop_engine.assert_not_called()
+                    started = await client.post("/api/engine/start", headers=origin)
+                    self.assertEqual(started.json(), {"engine_status": grid_main.ENGINE_RUNNING})
+                    self.assertEqual(started.headers["cache-control"], "no-store")
+                    stopped = await client.post("/api/engine/stop", headers=origin)
+                    self.assertTrue(stopped.json()["bot_orders_cleared"])
+                    bot.start_engine.assert_called_once_with()
+                    bot.stop_engine.assert_called_once_with()
+        finally:
+            grid_main.app.state.ready = False
+            grid_main.app.state.grid_bot = None
+            grid_main.app.state.standby = False
 
     async def test_hard_stop_endpoint_raises_floor_without_grid_reset(self) -> None:
         bot = Mock()

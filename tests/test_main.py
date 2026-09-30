@@ -277,6 +277,33 @@ class GridBotTests(unittest.TestCase):
                       redirect_stderr(StringIO())):
                     self.assertEqual(grid_main.main(), expected)
 
+    def test_ready_service_defaults_to_idle_even_with_saved_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
+                Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            )
+            database = GridDatabase(path)
+            database.set_state("grid_run", json.dumps({
+                "anchor": "100", "baseline_base": "1",
+                "fingerprint": config.fingerprint(),
+            }))
+            database.set_state(grid_main.ENGINE_STATUS_KEY, grid_main.ENGINE_RUNNING)
+            with (patch("sys.argv", ["main.py", "--ready"]),
+                  patch.object(grid_main, "_credentials", return_value=("key", "secret")),
+                  patch.object(grid_main, "create_exchange", return_value=FakeSpotExchange()),
+                  patch.object(grid_main, "GridDatabase", return_value=database),
+                  patch.object(grid_main.GridConfig, "load", return_value=config),
+                  patch.object(grid_main, "load_telegram_credentials",
+                               return_value=("token", 123)),
+                  patch.object(grid_main, "_run_services", new_callable=AsyncMock) as services):
+                self.assertEqual(grid_main.main(), 0)
+            self.assertEqual(database.get_state(grid_main.ENGINE_STATUS_KEY),
+                             grid_main.ENGINE_IDLE)
+            self.assertTrue(services.await_args.kwargs["ready"])
+            self.assertTrue(services.await_args.args[0].ready_mode)
+
     def make_bot(self, path: Path, *, width: Decimal = None):
         config = GridConfig(
             "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
@@ -951,6 +978,86 @@ class GridBotTests(unittest.TestCase):
                 [order["id"] for order in exchange.fetch_open_orders("BTC/USDT")],
                 [manual["id"]],
             )
+
+    def test_master_stop_and_start_rebuilds_without_touching_manual_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.ready_mode = True
+            bot.run_cycle()
+            bot.run_cycle()
+            self.assertEqual(
+                {row["side"] for row in bot.database.fetch_active_grids()},
+                {"BUY", "SELL"},
+            )
+            manual = exchange.create_order(
+                "BTC/USDT", "limit", "buy", 0.2, 50,
+                {"newClientOrderId": "manualmaster123"},
+            )
+            stopped = bot.stop_engine()
+            self.assertEqual(stopped["engine_status"], grid_main.ENGINE_IDLE)
+            self.assertEqual(bot.database.fetch_active_grids(), [])
+            self.assertEqual(
+                [order["id"] for order in exchange.fetch_open_orders("BTC/USDT")],
+                [manual["id"]],
+            )
+            self.assertEqual(bot.run_cycle(), [])
+            self.assertEqual(bot.database.get_state(grid_main.ENGINE_STATUS_KEY),
+                             grid_main.ENGINE_IDLE)
+
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.ready_mode = True
+            reopened.reconcile_idle_orders()
+            self.assertEqual(reopened.run_cycle(), [])
+            self.assertEqual(reopened.start_engine()["engine_status"],
+                             grid_main.ENGINE_RUNNING)
+            self.assertTrue(reopened.grid_needs_reset)
+            self.assertTrue(reopened.reset_grid())
+            self.assertGreater(len(reopened.database.fetch_active_grids()), 0)
+            self.assertIn(manual["id"], [order["id"] for order in
+                                         exchange.fetch_open_orders("BTC/USDT")])
+
+    def test_ready_mode_keeps_new_grid_idle_until_master_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            exchange = FakeSpotExchange()
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
+                Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            )
+            database = GridDatabase(path)
+            database.set_state(grid_main.ENGINE_STATUS_KEY, grid_main.ENGINE_IDLE)
+            bot = GridBot(config, exchange, database)
+            bot.ready_mode = True
+            with self.assertRaisesRegex(TradingHalt, "Configure a grid"):
+                bot.start_engine()
+            bot.request_initial_grid("100", "20", "30", "1000", 10)
+            self.assertEqual(bot.run_cycle(), [])
+            asyncio.run(bot.run(AsyncMock()))
+            self.assertEqual(exchange.orders, {})
+            self.assertEqual(bot.start_engine()["engine_status"],
+                             grid_main.ENGINE_RUNNING)
+            self.assertTrue(bot.reset_grid())
+            self.assertGreater(len(bot.database.fetch_active_grids()), 0)
+
+    def test_master_stop_stays_idle_when_exchange_cancellation_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.ready_mode = True
+            bot.run_cycle()
+            bot.run_cycle()
+            original = exchange.fetch_open_orders
+            exchange.fetch_open_orders = lambda _symbol: (_ for _ in ()).throw(
+                ccxt.NetworkError("Simulated timeout")
+            )
+            with self.assertRaises(ccxt.NetworkError):
+                bot.stop_engine()
+            self.assertEqual(bot.database.get_state(grid_main.ENGINE_STATUS_KEY),
+                             grid_main.ENGINE_IDLE)
+            self.assertEqual(bot.run_cycle(), [])
+            exchange.fetch_open_orders = original
+            bot.reconcile_idle_orders()
+            self.assertEqual(bot.database.fetch_active_grids(), [])
 
     def test_manual_unpause_respects_downside_guard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
