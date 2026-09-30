@@ -1008,6 +1008,10 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 grid_main._portfolio_wallet(database),
                 grid_main._unavailable_wallet(),
             )
+            database.set_state("halt_reason", grid_main.MANUAL_ACCOUNT_EXIT_REASON)
+            self.assertEqual(grid_main._portfolio_wallet(database), {
+                "btc_held": 0.0, "average_cost": None, "unrealized_pnl": 0.0,
+            })
 
     async def test_api_and_trading_loop_run_concurrently(self) -> None:
         api_started = asyncio.Event()

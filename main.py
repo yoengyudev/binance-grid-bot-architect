@@ -50,6 +50,7 @@ ENGINE_STATUS_KEY = "engine_status"
 ENGINE_IDLE = "IDLE"
 ENGINE_RUNNING = "RUNNING"
 ENGINE_FAULT_KEY = "engine_fault"
+MANUAL_ACCOUNT_EXIT_REASON = "manual_full_account_exit"
 PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
 PAUSED_MANUAL = "PAUSED_MANUAL"
 PAUSED_RESET = "PAUSED_RESET"
@@ -260,6 +261,10 @@ def _unavailable_wallet() -> Dict[str, Optional[float]]:
 def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
     """Value the current run's remaining BTC lots from persisted fill snapshots."""
     try:
+        if database.get_state("halt_reason") == MANUAL_ACCOUNT_EXIT_REASON:
+            # An administrator sold the entire Spot BTC balance outside the grid.
+            # Preserve historical fills while clearing current exposure.
+            return {"btc_held": 0.0, "average_cost": None, "unrealized_pnl": 0.0}
         liquidation = database.get_state(LIQUIDATION_KEY)
         if liquidation:
             state = json.loads(liquidation)
@@ -474,6 +479,8 @@ def bot_status() -> Dict[str, Any]:
     ]
     prices = [Decimal(order["price"]) for order in orders]
     safety_mode = database.get_state(SAFETY_MODE_KEY)
+    manual_account_exit = (database.get_state("halt_reason") ==
+                           MANUAL_ACCOUNT_EXIT_REASON)
     engine_status = (database.get_state(ENGINE_STATUS_KEY) or
                      (ENGINE_RUNNING if bot is not None else ENGINE_IDLE))
     atr = app.state.atr_snapshot if bot is not None else None
@@ -504,7 +511,7 @@ def bot_status() -> Dict[str, Any]:
         "engine_status": engine_status,
         "engine_fault": database.get_state(ENGINE_FAULT_KEY),
         "has_grid_run": database.get_state("grid_run") is not None,
-        "trading_state": safety_mode if safety_mode in (
+        "trading_state": "ACCOUNT_CLEARED" if manual_account_exit else safety_mode if safety_mode in (
             LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING,
             PAUSED_RESET) else (ENGINE_IDLE if engine_status == ENGINE_IDLE else "ACTIVE"),
         **({"pause_reason": database.get_state(SIZING_PAUSE_REASON_KEY)}
