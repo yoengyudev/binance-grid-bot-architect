@@ -8,7 +8,7 @@ from decimal import Decimal, ROUND_DOWN
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import ccxt
 
@@ -313,6 +313,28 @@ class GridBotTests(unittest.TestCase):
         bot = GridBot(config, exchange, GridDatabase(path))
         bot.prepare(persist=True)
         return bot, exchange
+
+    def test_carried_inventory_never_uses_local_id_for_exchange_trade_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            carry_id = "carry-test-local-id"
+            bot.database.insert_order(
+                carry_id, 0, "BUY", "100", "0.500", order_type="MARKET",
+            )
+            bot.database.mark_order_filled(carry_id)
+            bot.database.set_state("carry_inventory", json.dumps({
+                "order_id": carry_id, "cost": "50",
+            }))
+            exchange.has = {"fetchOrderTrades": True}
+            exchange.fetch_order_trades = Mock(
+                side_effect=AssertionError("Synthetic carry queried on Binance")
+            )
+            row = bot.database.get_order(carry_id)
+            self.assertEqual(
+                bot._net_buy_fill_base(row, bot._fetch_order(row)), Decimal("0.500")
+            )
+            self.assertEqual(bot._seed_upper_sell_amount(row), Decimal("0.500"))
+            exchange.fetch_order_trades.assert_not_called()
 
     def fill_hard_stop_limit(self, bot: GridBot, exchange: FakeSpotExchange) -> None:
         state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))

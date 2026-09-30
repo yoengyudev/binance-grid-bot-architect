@@ -2199,7 +2199,14 @@ class GridBot:
         base = self.market["base"]
         snapshot_text = self.database.get_state(FILL_SNAPSHOT_PREFIX + row["order_id"])
         snapshot = json.loads(snapshot_text) if snapshot_text else {}
-        if (snapshot.get("fee_source") == "trades" and
+        carry_text = self.database.get_state("carry_inventory")
+        carry = json.loads(carry_text) if carry_text else {}
+        if (carry.get("order_id") == row["order_id"] and
+                not row.get("client_order_id")):
+            # This row already represents net BTC carried from earlier fills.
+            # Its carry-* ID is local and must never be sent to Binance as orderId.
+            base_fee = Decimal(0)
+        elif (snapshot.get("fee_source") == "trades" and
                 Decimal(snapshot["filled_base"]) == filled):
             base_fee = Decimal(snapshot["base_fee"])
         elif getattr(self.exchange, "has", {}).get("fetchOrderTrades"):
