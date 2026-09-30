@@ -42,6 +42,7 @@ class FakeSpotExchange:
         self.market_sell_no_id_after_accept = False
         self.market_sell_insufficient = False
         self.market_sell_crash_after_accept = False
+        self.limit_sell_calls = 0
 
     def load_markets(self) -> None:
         pass
@@ -185,6 +186,47 @@ class FakeSpotExchange:
             response.pop("id")
         return response
 
+    def create_limit_sell_order(self, symbol: str, amount: float, price: float,
+                                params: dict = None) -> dict:
+        self.limit_sell_calls += 1
+        if self.market_sell_network_errors:
+            self.market_sell_network_errors -= 1
+            raise ccxt.NetworkError("Simulated temporary network failure")
+        if self.market_sell_exchange_errors:
+            self.market_sell_exchange_errors -= 1
+            raise ccxt.ExchangeError("Simulated temporary exchange failure")
+        if self.market_sell_rate_limits:
+            self.market_sell_rate_limits -= 1
+            raise ccxt.RateLimitExceeded("Simulated rate limit")
+        if self.market_sell_insufficient:
+            raise ccxt.InsufficientFunds("Simulated insufficient BTC")
+        if self.market_sell_timeout == "before":
+            self.market_sell_timeout = None
+            raise ccxt.RequestTimeout("Simulated request timeout")
+        response = self.create_order(symbol, "limit", "sell", amount, price, params or {})
+        if self.market_sell_partial_once:
+            self.market_sell_partial_once = False
+            self.fill(response["clientOrderId"])
+            quantity = Decimal(str(amount))
+            sold = (quantity / 2).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+            unsold = quantity - sold
+            self.base_free += unsold
+            self.quote_free -= unsold * Decimal(str(price))
+            self.orders[response["clientOrderId"]].update(
+                status="canceled", filled=str(sold), cost=str(sold * Decimal(str(price)))
+            )
+            response = dict(self.orders[response["clientOrderId"]])
+        if self.market_sell_crash_after_accept:
+            self.market_sell_crash_after_accept = False
+            raise KeyboardInterrupt("Simulated process interruption after acceptance")
+        if self.market_sell_timeout == "after":
+            self.market_sell_timeout = None
+            raise ccxt.RequestTimeout("Simulated response timeout")
+        if self.market_sell_no_id_after_accept:
+            self.market_sell_no_id_after_accept = False
+            response.pop("id")
+        return response
+
     def fill(self, client_id: str) -> None:
         order = self.orders[client_id]
         order["status"] = "closed"
@@ -244,6 +286,15 @@ class GridBotTests(unittest.TestCase):
         bot = GridBot(config, exchange, GridDatabase(path))
         bot.prepare(persist=True)
         return bot, exchange
+
+    def fill_hard_stop_limit(self, bot: GridBot, exchange: FakeSpotExchange) -> None:
+        state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
+        self.assertEqual(state["phase"], "confirming")
+        order = exchange.orders[state["client_order_id"]]
+        self.assertEqual(order["type"], "limit")
+        self.assertEqual(order["params"]["timeInForce"], "GTC")
+        exchange.fill(state["client_order_id"])
+        bot.run_cycle()
 
     def test_factory_reset_erases_history_and_keeps_trading_halted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -543,8 +594,11 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("79")
             reopened.run_cycle()
             self.assertEqual(reopened.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATING)
+            self.fill_hard_stop_limit(reopened, exchange)
+            self.assertEqual(reopened.database.get_state(grid_main.SAFETY_MODE_KEY),
                              grid_main.LIQUIDATED)
-            self.assertEqual(exchange.market_sell_calls, 1)
+            self.assertEqual(exchange.limit_sell_calls, 1)
 
     def test_trailing_stop_cancels_unsafe_buys_without_resetting_breakout_clock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -778,6 +832,24 @@ class GridBotTests(unittest.TestCase):
 
             bot.run_cycle()
             self.assertTrue(bot.is_paused)
+            self.assertEqual(bot.database.get_state("safety_mode"), grid_main.LIQUIDATING)
+            sale = [row for row in exchange.orders.values()
+                    if row["type"] == "limit" and row["side"] == "sell"
+                    and row["clientOrderId"].startswith(bot.order_client_prefix)
+                    and row["status"] == "open"][0]
+            self.assertEqual(Decimal(sale["price"]), Decimal("69.96"))
+            self.assertEqual(exchange.market_sell_calls, 0)
+            self.assertEqual(exchange.limit_sell_calls, 1)
+            self.assertLessEqual(Decimal(sale["amount"]), held_btc)
+            self.assertEqual(exchange.base_free, Decimal("1") + held_btc -
+                             Decimal(sale["amount"]))
+            self.assertEqual({order["id"] for order in
+                              exchange.fetch_open_orders("BTC/USDT")},
+                             {manual["id"], sale["id"]})
+            before = len(exchange.orders)
+            bot.run_cycle()
+            self.assertEqual(len(exchange.orders), before)
+            self.fill_hard_stop_limit(bot, exchange)
             self.assertEqual(bot.database.get_state("safety_mode"), grid_main.LIQUIDATED)
             self.assertEqual(bot.database.get_state("halt_reason"), "hard_stop_liquidated")
             self.assertFalse(bot.stop_controller.stop_requested.is_set())
@@ -786,12 +858,6 @@ class GridBotTests(unittest.TestCase):
                 [order["id"] for order in exchange.fetch_open_orders("BTC/USDT")],
                 [manual["id"]],
             )
-            self.assertEqual(exchange.market_sell_calls, 1)
-            sale = [row for row in exchange.orders.values()
-                    if row["type"] == "market" and row["side"] == "sell"][0]
-            self.assertLessEqual(Decimal(sale["amount"]), held_btc)
-            self.assertEqual(exchange.base_free, Decimal("1") + held_btc -
-                             Decimal(sale["amount"]))
             notifier = SimpleNamespace(notify_hard_stop=AsyncMock())
             asyncio.run(bot._notify_liquidation(notifier))
             notifier.notify_hard_stop.assert_awaited_once_with(True)
@@ -859,7 +925,7 @@ class GridBotTests(unittest.TestCase):
             self.assertTrue(bot.is_paused)
             bot.run_cycle()
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
-                             grid_main.LIQUIDATED)
+                             grid_main.LIQUIDATING)
 
     def test_hard_stop_includes_partially_filled_buy_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -873,6 +939,7 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("69")
 
             bot.run_cycle()
+            self.fill_hard_stop_limit(bot, exchange)
 
             state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
@@ -890,10 +957,10 @@ class GridBotTests(unittest.TestCase):
             bot.run_cycle()
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
                              grid_main.LIQUIDATION_HALTED)
-            self.assertEqual(exchange.market_sell_calls, 1)
+            self.assertEqual(exchange.limit_sell_calls, 1)
             self.assertEqual(exchange.fetch_open_orders("BTC/USDT"), [])
             bot.run_cycle()
-            self.assertEqual(exchange.market_sell_calls, 1)
+            self.assertEqual(exchange.limit_sell_calls, 1)
             notifier = SimpleNamespace(notify_hard_stop=AsyncMock())
             asyncio.run(bot._notify_liquidation(notifier))
             notifier.notify_hard_stop.assert_awaited_once_with(False)
@@ -908,11 +975,12 @@ class GridBotTests(unittest.TestCase):
                 exchange.price = Decimal("69")
                 with patch.object(grid_main.time, "sleep"):
                     bot.run_cycle()
-                self.assertEqual(exchange.market_sell_calls, expected_calls)
+                self.assertEqual(exchange.limit_sell_calls, expected_calls)
                 self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
-                                 grid_main.LIQUIDATED)
+                                 grid_main.LIQUIDATING)
                 self.assertEqual(len([row for row in exchange.orders.values()
-                                      if row["type"] == "market" and row["side"] == "sell"]), 1)
+                                      if row["type"] == "limit" and row["side"] == "sell"
+                                      and row["status"] == "open"]), 1)
 
     def test_hard_stop_retries_temporary_sell_failures_until_confirmed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -924,11 +992,12 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("69")
             with patch.object(grid_main.time, "sleep") as delay:
                 bot.run_cycle()
-            self.assertEqual(exchange.market_sell_calls, 3)
+            self.assertEqual(exchange.limit_sell_calls, 3)
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
-                             grid_main.LIQUIDATED)
+                             grid_main.LIQUIDATING)
             self.assertEqual(len([row for row in exchange.orders.values()
-                                  if row["type"] == "market" and row["side"] == "sell"]), 1)
+                                  if row["type"] == "limit" and row["side"] == "sell"
+                                  and row["status"] == "open"]), 1)
             self.assertTrue(any(call.args == (2,) for call in delay.call_args_list))
 
     def test_hard_stop_reconciles_missing_exchange_id_without_second_sale(self) -> None:
@@ -940,9 +1009,9 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("69")
             with patch.object(grid_main.time, "sleep"):
                 bot.run_cycle()
-            self.assertEqual(exchange.market_sell_calls, 1)
+            self.assertEqual(exchange.limit_sell_calls, 1)
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
-                             grid_main.LIQUIDATED)
+                             grid_main.LIQUIDATING)
 
     def test_hard_stop_backs_off_after_rate_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -955,7 +1024,7 @@ class GridBotTests(unittest.TestCase):
                 bot.run_cycle()
             self.assertIn((60,), [call.args for call in delay.call_args_list])
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
-                             grid_main.LIQUIDATED)
+                             grid_main.LIQUIDATING)
 
     def test_hard_stop_sells_remaining_btc_after_partial_terminal_fill(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -966,8 +1035,10 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("69")
             with patch.object(grid_main.time, "sleep"):
                 bot.run_cycle()
+            bot.run_cycle()  # Reconcile the canceled partial fill and submit the remainder.
+            self.fill_hard_stop_limit(bot, exchange)
             state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
-            self.assertEqual(exchange.market_sell_calls, 2)
+            self.assertEqual(exchange.limit_sell_calls, 2)
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
                              grid_main.LIQUIDATED)
             self.assertLessEqual(
@@ -1020,9 +1091,11 @@ class GridBotTests(unittest.TestCase):
                 exchange.price = Decimal("69")
                 bot.run_cycle()
             sales = [order for order in exchange.orders.values()
-                     if order["type"] == "market" and order["side"] == "sell"]
+                     if order["type"] == "limit" and order["side"] == "sell"
+                     and order["status"] == "open"]
             self.assertEqual(len(sales), 1)
             self.assertEqual(Decimal(sales[0]["amount"]), Decimal("2.5"))
+            self.fill_hard_stop_limit(bot, exchange)
             state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
             self.assertEqual(state["phase"], "failed")
             self.assertEqual(Decimal(state["sold_base"]), Decimal("2.5"))
@@ -1030,7 +1103,7 @@ class GridBotTests(unittest.TestCase):
                              grid_main.LIQUIDATION_HALTED)
             self.assertEqual(Decimal(state["unavailable_base"]), Decimal("2.5"))
 
-    def test_hard_stop_closes_genuine_dust_without_market_sell(self) -> None:
+    def test_hard_stop_closes_genuine_dust_without_limit_sell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
             client_id = bot.order_client_prefix + "b" * 20
@@ -1051,7 +1124,7 @@ class GridBotTests(unittest.TestCase):
                              grid_main.LIQUIDATED)
             self.assertEqual(state["residual_base"], "0")
             self.assertEqual(Decimal(state["dust_base"]), Decimal("0.1"))
-            self.assertEqual(exchange.market_sell_calls, 0)
+            self.assertEqual(exchange.limit_sell_calls, 0)
             self.assertTrue(any("Sellable inventory is below Binance dust/notional"
                                 in line for line in captured.output))
 
@@ -1074,19 +1147,21 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("69")
             with patch.object(grid_main.time, "sleep"):
                 bot.run_cycle()
+                state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
+                exchange.fill(state["client_order_id"])
+                bot.run_cycle()
             state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
                              grid_main.LIQUIDATED)
             self.assertEqual(Decimal(state["sold_base"]), Decimal("5"))
-            self.assertEqual(exchange.market_sell_calls, 1)
+            self.assertEqual(exchange.limit_sell_calls, 1)
 
-    def test_hard_stop_applies_market_filters_and_requires_valid_balance(self) -> None:
+    def test_hard_stop_applies_limit_filters_and_requires_valid_balance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
             bot.market["info"] = {"filters": [
-                {"filterType": "MARKET_LOT_SIZE", "minQty": "0.5", "stepSize": "0.1"},
-                {"filterType": "NOTIONAL", "minNotional": "50",
-                 "applyMinToMarket": True},
+                {"filterType": "LOT_SIZE", "minQty": "0.5", "stepSize": "0.1"},
+                {"filterType": "NOTIONAL", "minNotional": "50"},
             ]}
             self.assertEqual(bot._sellable_hard_stop_amount(
                 Decimal("0.6"), Decimal("69")), Decimal(0))
@@ -1108,7 +1183,7 @@ class GridBotTests(unittest.TestCase):
                     bot.run_cycle()
                 self.assertGreater(len(exchange.cancel_calls), 0)
                 self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
-                                 grid_main.LIQUIDATED)
+                                 grid_main.LIQUIDATING)
 
     def test_hard_stop_reconciles_order_filled_during_targeted_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1119,8 +1194,8 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("69")
             bot.run_cycle()
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
-                             grid_main.LIQUIDATED)
-            self.assertEqual(exchange.market_sell_calls, 1)
+                             grid_main.LIQUIDATING)
+            self.assertEqual(exchange.limit_sell_calls, 1)
 
     def test_grid_order_ids_are_tagged_and_fit_binance_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1203,7 +1278,8 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("69")
             bot.run_cycle()
             self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
-                             grid_main.LIQUIDATED)
+                             grid_main.LIQUIDATING)
+            self.fill_hard_stop_limit(bot, exchange)
             self.assertIsNone(bot.database.get_state("grid_reset"))
             self.assertFalse(bot.grid_needs_reset)
 
@@ -1217,13 +1293,47 @@ class GridBotTests(unittest.TestCase):
             exchange.price = Decimal("69")
             with self.assertRaises(KeyboardInterrupt):
                 bot.run_cycle()
-            self.assertEqual(exchange.market_sell_calls, 1)
+            self.assertEqual(exchange.limit_sell_calls, 1)
             reopened = GridBot(bot.config, exchange, GridDatabase(path))
             reopened.prepare(persist=False)
             reopened.run_cycle()
-            self.assertEqual(exchange.market_sell_calls, 1)
+            self.assertEqual(exchange.limit_sell_calls, 1)
+            state = json.loads(reopened.database.get_state(grid_main.LIQUIDATION_KEY))
+            exchange.fill(state["client_order_id"])
+            reopened.run_cycle()
             self.assertEqual(reopened.database.get_state(grid_main.SAFETY_MODE_KEY),
                              grid_main.LIQUIDATED)
+
+    def test_hard_stop_open_limit_survives_restart_without_new_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.run_cycle()
+            bot.run_cycle()
+            exchange.price = Decimal("69")
+            bot.run_cycle()
+            state = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
+            sale_id = state["client_order_id"]
+            self.assertEqual(state["phase"], "confirming")
+            self.assertEqual(bot.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATING)
+
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.prepare(persist=False)
+            for _ in range(3):
+                reopened.run_cycle()
+            self.assertEqual(exchange.limit_sell_calls, 1)
+            self.assertEqual(exchange.orders[sale_id]["status"], "open")
+            self.assertEqual(reopened.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATING)
+            with self.assertRaises(TradingHalt):
+                reopened.request_manual_recenter("102", "20", "30")
+
+            exchange.fill(sale_id)
+            reopened.run_cycle()
+            self.assertEqual(reopened.database.get_state(grid_main.SAFETY_MODE_KEY),
+                             grid_main.LIQUIDATED)
+            self.assertEqual(exchange.limit_sell_calls, 1)
 
     def test_admin_recenter_resets_completed_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1233,6 +1343,7 @@ class GridBotTests(unittest.TestCase):
             bot.run_cycle()
             exchange.price = Decimal("69")
             bot.run_cycle()
+            self.fill_hard_stop_limit(bot, exchange)
             with self.assertRaises(TradingHalt):
                 bot.set_manual_pause(False)
             exchange.price = Decimal("100")

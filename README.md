@@ -78,10 +78,10 @@ When the bot's polled Testnet ticker falls **strictly below** the dynamic hard s
 
 1. Cancel and verify all **bot-owned** open BUY and SELL orders for the pair.
 2. Reconcile bot-tracked BTC lots against the exchange's freshly fetched **free BTC**. Never submit more than `min(tracked BTC, free BTC)`.
-3. Check precision, lot size, and market notional. Market-sell tradable bot BTC; record unsellable dust separately in the liquidation audit state.
-4. Confirm sell execution with exchange order IDs and fill quantities before marking the run `LIQUIDATED`. Transient exchange/network errors retry with delay and reconciliation; rate-limit errors use a longer delay. Permanent or unverifiable conditions enter `HALTED` for manual review rather than silently claiming success.
+3. Check precision, limit-order lot size, and notional. Submit a GTC limit SELL for tradable bot BTC at 99.95% of the triggered hard-stop price, rounded to exchange price precision. Record unsellable dust separately in the liquidation audit state.
+4. Keep the bot locked in `LIQUIDATING` while the limit is open, including after a process restart. Confirm fills with the exchange order ID and quantity before marking the run `LIQUIDATED`. If a partially filled limit is canceled or expires, reconcile the fill and submit a new limit for the sellable remainder. Transient exchange/network errors retry with delay and reconciliation; rate-limit errors use a longer delay. Permanent or unverifiable conditions enter `HALTED` for manual review rather than silently claiming success.
 
-After liquidation, trading remains locked until an authenticated new-grid reset. **The stop is software-polled, not a native exchange stop order:** an offline VM, stale ticker, exchange outage, or fast market gap can delay execution, and the market sell can slip below the floor. Dust may remain in the Spot wallet even when active bot inventory is closed.
+After liquidation, trading remains locked until an authenticated new-grid reset. **The stop is software-polled, not a native exchange stop order:** an offline VM, stale ticker, exchange outage, or fast market gap can delay execution. The limit caps the minimum sale price but may remain unfilled indefinitely if the market stays below it, leaving BTC exposed while the bot is locked in `LIQUIDATING`. Dust may remain in the Spot wallet even when active bot inventory is closed.
 
 ## Upward breakout and “Infinity Grid” behavior
 

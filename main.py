@@ -2630,7 +2630,7 @@ class GridBot:
                     self._available_base_for_liquidation() !=
                     Decimal(state["pre_submit_base_free"])):
                 raise TradingHalt(
-                    "Market-sell outcome is uncertain; inspect the client order ID "
+                    "Limit-sell outcome is uncertain; inspect the client order ID "
                     "and BTC balance before any further sale."
                 )
         remaining = Decimal(state["held_base"]) - Decimal(state.get("sold_base", "0"))
@@ -2648,16 +2648,17 @@ class GridBot:
         self._save_liquidation(state)  # Durable intent before the network request.
         try:
             response = self._call(
-                self.exchange.create_market_sell_order,
+                self.exchange.create_limit_sell_order,
                 self.config.symbol, float(Decimal(state["sell_amount"])),
-                {"newClientOrderId": client_id},
+                float(Decimal(state["limit_price"])),
+                {"newClientOrderId": client_id, "timeInForce": "GTC"},
             )
         except (ccxt.NetworkError, ccxt.ExchangeError):
             self._save_liquidation(state)
             raise
         if not isinstance(response, dict) or not response.get("id"):
             raise ccxt.ExchangeNotAvailable(
-                "Market SELL returned no exchange ID; verifying its client ID."
+                "Limit SELL returned no exchange ID; verifying its client ID."
             )
         state["exchange_order_id"] = str(response["id"])
         state["phase"] = "confirming"
@@ -2670,8 +2671,8 @@ class GridBot:
         if residual < 0:
             raise TradingHalt("Hard-stop SELL exceeded bot-tracked BTC.")
         if residual > 0 and self._sellable_hard_stop_amount(
-                residual, self._ticker_price()) > 0:
-            raise TradingHalt("Market SELL left tradable bot BTC; manual review required.")
+                residual, Decimal(state["limit_price"])) > 0:
+            raise TradingHalt("Limit SELL left tradable bot BTC; manual review required.")
         # Keep the unsold dust in the audit record while closing active inventory.
         state.update(phase="complete", sold_base=str(sold),
                      residual_base="0", dust_base=str(residual),
@@ -2693,7 +2694,7 @@ class GridBot:
         )
 
     def _sellable_hard_stop_amount(self, held: Decimal, price: Decimal) -> Decimal:
-        """Apply market-order lot and notional filters before submitting a SELL."""
+        """Apply limit-order lot and notional filters before submitting a SELL."""
         if held < 0:
             raise TradingHalt("Bot BTC exposure cannot be negative.")
         if held == 0:
@@ -2703,9 +2704,9 @@ class GridBot:
             try:
                 parsed = _order_decimal(value)
             except (InvalidOperation, TypeError, ValueError) as error:
-                raise TradingHalt("Exchange market minimum is invalid.") from error
+                raise TradingHalt("Exchange limit minimum is invalid.") from error
             if not parsed.is_finite() or parsed < 0:
-                raise TradingHalt("Exchange market minimum is invalid.")
+                raise TradingHalt("Exchange limit minimum is invalid.")
             return parsed
 
         try:
@@ -2727,14 +2728,14 @@ class GridBot:
             if not isinstance(rule, dict):
                 continue
             kind = rule.get("filterType")
-            if kind == "MARKET_LOT_SIZE":
+            if kind == "LOT_SIZE":
                 amount_min = max(amount_min, minimum(rule.get("minQty")))
                 step = minimum(rule.get("stepSize"))
                 if step > 0:
                     amount = self._amount((amount // step) * step)
-            elif kind == "MIN_NOTIONAL" and rule.get("applyToMarket") in (True, "true"):
+            elif kind == "MIN_NOTIONAL":
                 cost_min = max(cost_min, minimum(rule.get("minNotional")))
-            elif kind == "NOTIONAL" and rule.get("applyMinToMarket") in (True, "true"):
+            elif kind == "NOTIONAL":
                 cost_min = max(cost_min, minimum(rule.get("minNotional")))
         if amount < amount_min or price * amount < cost_min:
             return Decimal(0)
@@ -2760,7 +2761,7 @@ class GridBot:
         if tracked < 0:
             raise TradingHalt("Liquidation ledger has negative remaining BTC.")
         available = self._available_base_for_liquidation()
-        price = self._ticker_price()
+        price = Decimal(state["limit_price"])
         safe_amount = min(tracked, available)
         amount = self._sellable_hard_stop_amount(safe_amount, price)
         if amount <= 0 and tracked > 0:
@@ -2850,6 +2851,8 @@ class GridBot:
         state_text = self.database.get_state(LIQUIDATION_KEY)
         state = json.loads(state_text) if state_text else {
             "phase": "canceling", "trigger_price": str(price),
+            "limit_price": str(self._price(self.config.stop_loss_price *
+                                           Decimal("0.9995"))),
         }
         if state_text is None:
             self._save_liquidation(state)
@@ -2874,6 +2877,10 @@ class GridBot:
             retry_delay = 2
             try:
                 if self._liquidation_step(state):
+                    return
+                if state["phase"] == "confirming":
+                    # A GTC limit may remain on the book indefinitely. Keep the
+                    # run locked, but let the trading loop poll it without a busy wait.
                     return
             except permanent_errors as error:
                 self._fail_liquidation(state, error)
@@ -3213,6 +3220,10 @@ class GridBot:
                         price = await asyncio.to_thread(self._ticker_price)
                         await asyncio.to_thread(self.liquidate, price)
                         await self._notify_liquidation(notifier)
+                        await asyncio.to_thread(
+                            self.stop_controller.stop_requested.wait,
+                            self.config.poll_seconds,
+                        )
                         continue
                     if self.grid_needs_reset:
                         price = await asyncio.to_thread(self._ticker_price)
