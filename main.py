@@ -1917,7 +1917,10 @@ class GridBot:
         self._save_fill_snapshot(row["order_id"], order)
         return order
 
-    def _save_fill_snapshot(self, order_id: str, order: Dict[str, Any]) -> None:
+    def _save_fill_snapshot(
+        self, order_id: str, order: Dict[str, Any],
+        *, verified_fees: Optional[Tuple[Decimal, Decimal]] = None,
+    ) -> None:
         """Cache exchange-confirmed fills for read-only portfolio calculations."""
         try:
             if order.get("filled") is None:
@@ -1931,17 +1934,47 @@ class GridBot:
                 if execution_price is None:
                     return
                 quote_cost = filled * Decimal(str(execution_price))
+            key = FILL_SNAPSHOT_PREFIX + order_id
+            previous_text = self.database.get_state(key)
+            previous = json.loads(previous_text) if previous_text else {}
+            if verified_fees is not None:
+                base_fee, quote_fee = verified_fees
+                fee_source = "trades"
+            elif (previous.get("fee_source") == "trades" and
+                  previous.get("filled_base") == str(filled)):
+                base_fee = Decimal(previous["base_fee"])
+                quote_fee = Decimal(previous["quote_fee"])
+                fee_source = "trades"
+            else:
+                base_fee = _fees_in_asset(order, self.market["base"])
+                quote_fee = _fees_in_asset(order, self.market["quote"])
+                fee_source = "order"
             snapshot = json.dumps({
                 "filled_base": str(filled),
                 "filled_quote": str(quote_cost),
-                "base_fee": str(_fees_in_asset(order, self.market["base"])),
-                "quote_fee": str(_fees_in_asset(order, self.market["quote"])),
+                "base_fee": str(base_fee),
+                "quote_fee": str(quote_fee),
+                "fee_source": fee_source,
             }, sort_keys=True)
-            key = FILL_SNAPSHOT_PREFIX + order_id
-            if self.database.get_state(key) != snapshot:
+            if previous_text != snapshot:
                 self.database.set_state(key, snapshot)
         except (KeyError, TypeError, ValueError, InvalidOperation):
             LOGGER.warning("Fill snapshot unavailable for order %s.", order_id)
+
+    def _buy_fee_in_asset(
+        self, row: Dict[str, Any], buy: Dict[str, Any], asset: str,
+    ) -> Decimal:
+        """Prefer verified per-trade commission over an order with missing fees."""
+        snapshot_text = self.database.get_state(FILL_SNAPSHOT_PREFIX + row["order_id"])
+        if snapshot_text:
+            snapshot = json.loads(snapshot_text)
+            if (snapshot.get("fee_source") == "trades" and
+                    Decimal(snapshot["filled_base"]) == _order_decimal(buy.get("filled"))):
+                if asset == self.market["base"]:
+                    return Decimal(snapshot["base_fee"])
+                if asset == self.market["quote"]:
+                    return Decimal(snapshot["quote_fee"])
+        return _fees_in_asset(buy, asset)
 
     def _backfill_portfolio_snapshots(self) -> None:
         """Read old completed orders once so existing runs have a cost basis."""
@@ -2017,6 +2050,23 @@ class GridBot:
                     side, amount, price, level,
                 )
                 return None
+            except ccxt.InsufficientFunds as error:
+                if order_type != "LIMIT":
+                    raise UncertainOrderError(
+                        f"Order {client_id} may have been accepted; inspect it before restarting."
+                    ) from error
+                # A definite balance rejection did not create an exchange
+                # order. Keep the lane ready for a fresh balance check next cycle.
+                self.database.discard_rejected_post_only_order(client_id)
+                self._post_only_rejected_in_cycle = True
+                LOGGER.warning(
+                    "Spot Testnet rejected %s %s at %s for insufficient free %s "
+                    "(grid level %s); retrying after balance reconciliation.",
+                    side, amount, price,
+                    self.market["base"] if side == "SELL" else self.market["quote"],
+                    level,
+                )
+                return None
             except Exception as error:
                 raise UncertainOrderError(
                     f"Order {client_id} may have been accepted; inspect it before restarting."
@@ -2049,6 +2099,77 @@ class GridBot:
             Decimal(0), self._free_balance(self.market["base"]) - self.baseline_base
         )
 
+    def _net_buy_fill_base(self, row: Dict[str, Any], buy: Dict[str, Any]) -> Optional[Decimal]:
+        """Use the BUY's executed BTC less its actual BTC-denominated commission."""
+        filled = _order_decimal(buy.get("filled"))
+        if not filled.is_finite() or filled <= 0:
+            raise TradingHalt("Filled buy has no valid executed BTC amount.")
+        base = self.market["base"]
+        snapshot_text = self.database.get_state(FILL_SNAPSHOT_PREFIX + row["order_id"])
+        snapshot = json.loads(snapshot_text) if snapshot_text else {}
+        if (snapshot.get("fee_source") == "trades" and
+                Decimal(snapshot["filled_base"]) == filled):
+            base_fee = Decimal(snapshot["base_fee"])
+        elif getattr(self.exchange, "has", {}).get("fetchOrderTrades"):
+            exchange_id = row.get("exchange_order_id") or buy.get("id")
+            if not exchange_id:
+                raise TradingHalt("Filled buy has no exchange ID for commission lookup.")
+            trades = self._call(
+                self.exchange.fetch_order_trades, str(exchange_id), self.config.symbol
+            )
+            if not isinstance(trades, list):
+                raise TradingHalt("Exchange returned invalid BUY execution details.")
+            executed = base_fee = quote_fee = Decimal(0)
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    raise TradingHalt("Exchange returned an invalid BUY execution.")
+                trade_order = trade.get("order")
+                if trade_order is not None and str(trade_order) != str(exchange_id):
+                    raise TradingHalt("BUY execution belongs to another order.")
+                info = trade.get("info") or {}
+                if not isinstance(info, dict):
+                    raise TradingHalt("BUY execution has invalid exchange details.")
+                # Binance's raw strings retain the full commission and fill
+                # precision even when CCXT's unified fields are floats.
+                quantity = _order_decimal(info.get("qty", trade.get("amount")))
+                if not quantity.is_finite() or quantity <= 0:
+                    raise TradingHalt("BUY execution has an invalid amount.")
+                if "commission" in info and "commissionAsset" in info:
+                    commission = (_order_decimal(info["commission"])
+                                  if info["commissionAsset"] == base else Decimal(0))
+                    quote_commission = (_order_decimal(info["commission"])
+                                        if info["commissionAsset"] == self.market["quote"]
+                                        else Decimal(0))
+                elif trade.get("fee") or trade.get("fees"):
+                    commission = _fees_in_asset(trade, base)
+                    quote_commission = _fees_in_asset(trade, self.market["quote"])
+                else:
+                    LOGGER.info("BUY commission is not available yet for %s.", row["order_id"])
+                    return None
+                if (not commission.is_finite() or commission < 0 or
+                        not quote_commission.is_finite() or quote_commission < 0):
+                    raise TradingHalt("BUY execution has an invalid commission.")
+                executed += quantity
+                base_fee += commission
+                quote_fee += quote_commission
+            if executed == 0 or (executed < filled and
+                                  self._amount(executed) < self._amount(filled)):
+                LOGGER.info("Waiting for all BUY executions for %s.", row["order_id"])
+                return None
+            if executed > filled and self._amount(executed) > self._amount(filled):
+                raise TradingHalt("BUY executions exceed the confirmed filled amount.")
+            self._save_fill_snapshot(
+                row["order_id"], buy, verified_fees=(base_fee, quote_fee)
+            )
+        else:
+            # Older test doubles and exchanges without trade detail retain the
+            # conservative reserve; Binance Spot exposes per-order trades.
+            base_fee = max(_fees_in_asset(buy, base), filled * SELL_AMOUNT_BUFFER)
+        net_base = filled - base_fee
+        if not net_base.is_finite() or net_base <= 0 or net_base > filled:
+            raise TradingHalt("BUY commission leaves no valid BTC for a SELL.")
+        return net_base
+
     def _place_seed_buy(self, current_price: Decimal) -> None:
         quote_cost = self._seed_quote()
         amount = self._amount(quote_cost / current_price)
@@ -2063,6 +2184,8 @@ class GridBot:
 
     def _place_seed_upper_sell(self, level: int, seed_row: Dict[str, Any]) -> None:
         amount = self._seed_upper_sell_amount(seed_row)
+        if amount is None:
+            return
         price = self._price(self.upper_levels[-level - 1])
         self._check_order_size(price, amount)
         if self._free_bot_base() < amount:
@@ -2073,15 +2196,12 @@ class GridBot:
                 parent_order_id=seed_row["order_id"],
             )
 
-    def _seed_upper_sell_amount(self, seed_row: Dict[str, Any]) -> Decimal:
+    def _seed_upper_sell_amount(self, seed_row: Dict[str, Any]) -> Optional[Decimal]:
         seed = self._fetch_order(seed_row)
-        filled = _order_decimal(seed.get("filled"))
-        if filled <= 0:
-            raise TradingHalt("Seed buy has no executed amount.")
-        base_fee = _fees_in_asset(seed, self.market["base"])
-        allocated_base = min(
-            filled - base_fee, filled * (1 - SELL_AMOUNT_BUFFER)
-        ) / Decimal(len(self.upper_levels))
+        net_base = self._net_buy_fill_base(seed_row, seed)
+        if net_base is None:
+            return None
+        allocated_base = net_base / Decimal(len(self.upper_levels))
         return self._amount(allocated_base)
 
     def _place_buy(self, level: int, parent_order_id: Optional[str]) -> None:
@@ -2100,19 +2220,24 @@ class GridBot:
         if price <= self.config.stop_loss_price:
             return  # Never create a BUY at or beneath the liquidation floor.
         self._check_order_size(price, amount)
-        if self._free_balance(self.market["quote"]) < price * amount:
-            raise TradingHalt("Insufficient free quote balance for the next grid buy.")
+        available_quote = self._free_balance(self.market["quote"])
+        if available_quote < price * amount:
+            LOGGER.info(
+                "Waiting for free %s before BUY at level %s: need %s, free %s.",
+                self.market["quote"], level, price * amount, available_quote,
+            )
+            return
         if not self.stop_controller.stop_requested.is_set():
             self._submit_order(level, "BUY", price, amount, parent_order_id=parent_order_id)
 
     def _place_sell(self, row: Dict[str, Any]) -> None:
         buy = self._fetch_order(row)
-        filled = _order_decimal(buy.get("filled"))
-        if filled <= 0:
-            raise TradingHalt("Filled buy has no executed amount.")
-        base_fee = _fees_in_asset(buy, self.market["base"])
-        conservative_base = min(filled - base_fee, filled * (1 - SELL_AMOUNT_BUFFER))
-        amount = self._amount(conservative_base)
+        net_base = self._net_buy_fill_base(row, buy)
+        if net_base is None:
+            return  # Wait for Binance's per-trade commissions to become available.
+        amount = self._amount(net_base)
+        if amount > net_base:
+            raise TradingHalt("Exchange precision rounded a SELL above net received BTC.")
         if row["level"] > 0:
             ratio = Decimal(1) - self.config.spacing_percent / Decimal(100)
             target = self.levels[row["level"] - 1] / ratio
@@ -2121,9 +2246,14 @@ class GridBot:
         price = self._price(target)
         if price > self.config.upper_price:
             raise TradingHalt("Planned sell is above the upper grid bound.")
-        self._check_order_size(price, amount)
-        if self._free_bot_base() < amount:
+        free_bot_base = self._free_bot_base()
+        if amount > free_bot_base:
+            LOGGER.info(
+                "Waiting for free bot BTC before SELL at level %s: need %s, free %s.",
+                row["level"], amount, free_bot_base,
+            )
             return  # Recheck after the account balance catches up with the fill.
+        self._check_order_size(price, amount)
         if not self.stop_controller.stop_requested.is_set():
             self._submit_order(
                 row["level"], "SELL", price, amount,
@@ -2143,7 +2273,7 @@ class GridBot:
             raise TradingHalt("Filled trade has no executed amount.")
         buy_price = _order_decimal(buy.get("average") or buy.get("price"))
         sell_price = _order_decimal(sell.get("average") or sell.get("price"))
-        net_base = buy_filled - _fees_in_asset(buy, self.market["base"])
+        net_base = buy_filled - self._buy_fee_in_asset(parent, buy, self.market["base"])
         if net_base <= 0 or sell_filled > net_base:
             raise TradingHalt("Sell amount exceeds the tracked buy's net base amount.")
         allocation = sell_filled / net_base
@@ -2151,7 +2281,7 @@ class GridBot:
         sell_cost = _order_decimal(sell.get("cost"), str(sell_price * sell_filled))
         profit = (
             sell_cost - _fees_in_asset(sell, self.market["quote"])
-            - allocation * (buy_cost + _fees_in_asset(buy, self.market["quote"]))
+            - allocation * (buy_cost + self._buy_fee_in_asset(parent, buy, self.market["quote"]))
         )
         self.database.record_trade(
             buy_price, sell_price, profit, sell_order_id=row["order_id"]
@@ -2173,7 +2303,7 @@ class GridBot:
             filled = _order_decimal(order.get("filled"))
             if row["side"] == "BUY":
                 net_base += min(
-                    filled - _fees_in_asset(order, self.market["base"]),
+                    filled - self._buy_fee_in_asset(row, order, self.market["base"]),
                     filled * (1 - SELL_AMOUNT_BUFFER),
                 )
             else:
@@ -2207,7 +2337,7 @@ class GridBot:
             filled = _order_decimal(buy.get("filled"))
             if filled <= 0:
                 continue
-            net = filled - _fees_in_asset(buy, self.market["base"])
+            net = filled - self._buy_fee_in_asset(row, buy, self.market["base"])
             remaining = net - sold_by_buy.get(row["order_id"], Decimal(0))
             if remaining < 0:
                 raise TradingHalt("Sold BTC exceeds a tracked buy lot.")
@@ -2215,7 +2345,7 @@ class GridBot:
                 continue
             spent = _order_decimal(buy.get("cost"), str(filled *
                                    _order_decimal(buy.get("average") or buy.get("price"))))
-            spent += _fees_in_asset(buy, self.market["quote"])
+            spent += self._buy_fee_in_asset(row, buy, self.market["quote"])
             amount += remaining
             cost += spent * remaining / net
         if amount > 0 and cost <= 0:
@@ -2937,6 +3067,8 @@ class GridBot:
         if all(level not in latest for level in
                range(-1, -len(self.upper_levels) - 1, -1)):
             sell_amount = self._seed_upper_sell_amount(seed_row)
+            if sell_amount is None:
+                return events
             required_base = sell_amount * len(self.upper_levels)
             for raw in self.upper_levels:
                 self._check_order_size(self._price(raw), sell_amount)

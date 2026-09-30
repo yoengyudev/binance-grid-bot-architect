@@ -608,6 +608,90 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(len(bot.database.fetch_trade_history()), 1)
             self.assertEqual(bot.database.get_state("grid_run") is not None, True)
 
+    def test_filled_buy_sell_uses_net_execution_after_btc_commission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            buy = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.fill(buy["client_order_id"])
+            filled = Decimal(buy["amount"])
+            fee = filled * Decimal("0.001")
+            exchange.base_free -= fee
+            free_before_sell = exchange.base_free - bot.baseline_base
+            exchange.has = {"fetchOrderTrades": True}
+            trade = {
+                "order": buy["exchange_order_id"],
+                "amount": str(filled),
+                "fee": {"currency": "BTC", "cost": "0"},
+                "info": {"qty": str(filled), "commission": str(fee),
+                         "commissionAsset": "BTC"},
+            }
+            with patch.object(exchange, "fetch_order_trades", return_value=[trade], create=True) as executions:
+                bot.run_cycle()
+
+            sell = bot.database.fetch_latest_orders_by_level()[1]
+            expected = Decimal(exchange.amount_to_precision("BTC/USDT", str(filled - fee)))
+            self.assertEqual(sell["side"], "SELL")
+            self.assertEqual(Decimal(sell["amount"]), expected)
+            self.assertLessEqual(expected, free_before_sell)
+            executions.assert_called_with(buy["exchange_order_id"], "BTC/USDT")
+            bot._fetch_order(buy)
+            snapshot = json.loads(bot.database.get_state(
+                grid_main.FILL_SNAPSHOT_PREFIX + buy["order_id"]
+            ))
+            self.assertEqual(snapshot["base_fee"], str(fee))
+            self.assertEqual(snapshot["fee_source"], "trades")
+
+    def test_filled_buy_waits_for_commission_and_free_btc_before_sell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            buy = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.fill(buy["client_order_id"])
+            filled = Decimal(buy["amount"])
+            fee = filled * Decimal("0.001")
+            exchange.base_free -= fee
+            actual_free = exchange.base_free
+            exchange.has = {"fetchOrderTrades": True}
+            trade = {
+                "order": buy["exchange_order_id"],
+                "amount": str(filled),
+                "fee": {"currency": "BTC", "cost": str(fee)},
+            }
+            with patch.object(exchange, "fetch_order_trades", side_effect=[[], [trade], [trade]], create=True):
+                bot.run_cycle()
+                self.assertEqual(bot.database.fetch_latest_orders_by_level()[1]["side"], "BUY")
+                exchange.base_free -= Decimal("0.02")
+                bot.run_cycle()
+                self.assertEqual(bot.database.fetch_latest_orders_by_level()[1]["side"], "BUY")
+                exchange.base_free = actual_free
+                bot.run_cycle()
+            self.assertEqual(bot.database.fetch_latest_orders_by_level()[1]["side"], "SELL")
+
+    def test_definite_sell_balance_rejection_keeps_filled_buy_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            buy = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.fill(buy["client_order_id"])
+            create_order = exchange.create_order
+
+            def reject_once(symbol, order_type, side, amount, price, params):
+                if side == "sell":
+                    raise ccxt.InsufficientFunds("Simulated free BTC lag")
+                return create_order(symbol, order_type, side, amount, price, params)
+
+            with patch.object(exchange, "create_order", side_effect=reject_once):
+                bot.run_cycle()
+            self.assertEqual(bot.database.fetch_latest_orders_by_level()[1]["side"], "BUY")
+            self.assertFalse(any(row["side"] == "SELL" and row["level"] == 1
+                                 for row in bot.database.fetch_active_grids()))
+            bot.run_cycle()
+            self.assertEqual(bot.database.fetch_latest_orders_by_level()[1]["side"], "SELL")
+
     def test_upper_sell_rearms_buy_then_sell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
@@ -627,6 +711,32 @@ class GridBotTests(unittest.TestCase):
             next_sell = bot.database.fetch_latest_orders_by_level()[-1]
             self.assertEqual(next_sell["side"], "SELL")
             self.assertEqual(Decimal(next_sell["price"]), Decimal("110.00"))
+
+    def test_replenishment_buy_waits_for_quote_and_retries_definite_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            upper_sell = bot.database.fetch_latest_orders_by_level()[-1]
+            exchange.fill(upper_sell["client_order_id"])
+            available_quote = exchange.quote_free
+            exchange.quote_free = Decimal(0)
+            bot.run_cycle()
+            self.assertEqual(bot.database.fetch_latest_orders_by_level()[-1]["side"], "SELL")
+            exchange.quote_free = available_quote
+            create_order = exchange.create_order
+
+            def reject_buy(symbol, order_type, side, amount, price, params):
+                if side == "buy":
+                    raise ccxt.InsufficientFunds("Simulated quote balance race")
+                return create_order(symbol, order_type, side, amount, price, params)
+
+            with patch.object(exchange, "create_order", side_effect=reject_buy):
+                bot.run_cycle()
+            self.assertEqual(bot.database.fetch_latest_orders_by_level()[-1]["side"], "SELL")
+            bot.run_cycle()
+            self.assertEqual(bot.database.fetch_latest_orders_by_level()[-1]["side"], "BUY")
+            self.assertEqual(len(bot.database.fetch_trade_history()), 1)
 
     def test_hard_stop_cancels_only_bot_orders_and_sells_only_bot_btc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
