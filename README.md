@@ -137,6 +137,19 @@ FastAPI serves a public, read-only `/api/bot/status`. Wallet balance, order ledg
 
 The existing EC2 setup can run under `systemd`; see `deploy/systemd/`. An optional container path is described in [DOCKER.md](DOCKER.md). Keep exactly one trading runner active. SQLite and `.env` are operational state, not disposable build artifacts.
 
+### Diagnose a hard-stop event
+
+Run the read-only `diagnose_stop_event.py` on the VM with journal access. Times must include `Z` or a UTC offset. It combines the bot's logged trigger with all public Binance **Spot Testnet** aggregate trades in a short window, paginating beyond the API's 1,000-trade response limit:
+
+```bash
+sudo .venv/bin/python diagnose_stop_event.py \
+  --start 2026-09-30T07:19:00Z --end 2026-09-30T07:21:00Z \
+  --floor 81948.20 --testnet-trades \
+  --csv diagnostics/2026-09-30-hard-stop.csv --summary-only
+```
+
+Omit `--summary-only` to print every row in timestamp order. The bot did **not** historically log every ticker poll; SQLite's `last_market_price` is overwritten. Public aggregate trades establish traded-price movements but are not a replay of the bot's own ticker responses. The dashboard header uses a separate Binance public **Mainnet** WebSocket, so it cannot verify a Testnet price wick.
+
 ## Current limits and operational risks
 
 - The application is **Testnet-only** by configuration and exchange construction. A Mainnet rollout requires a separate review of exchange filters, liquidity, permissions, stop execution, and recovery under outages.
