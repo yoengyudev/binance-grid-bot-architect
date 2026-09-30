@@ -643,6 +643,28 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(snapshot["base_fee"], str(fee))
             self.assertEqual(snapshot["fee_source"], "trades")
 
+    def test_exact_grid_filled_buy_sells_at_adjacent_level(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("90"), Decimal("101"),
+                Decimal("10"), Decimal("50"), Decimal("85"), 2,
+                buy_grid_levels=2, sell_grid_levels=2,
+            )
+            exchange = FakeSpotExchange()
+            bot = GridBot(config, exchange, GridDatabase(Path(directory) / "grid.sqlite3"))
+            bot.prepare(persist=True)
+            bot.run_cycle()
+            bot.run_cycle()
+            buy = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.fill(buy["client_order_id"])
+
+            bot.run_cycle()
+
+            sell = bot.database.fetch_latest_orders_by_level()[1]
+            self.assertEqual(sell["side"], "SELL")
+            self.assertEqual(Decimal(sell["price"]), bot._price(bot.anchor))
+            self.assertLessEqual(Decimal(sell["price"]), bot.config.upper_price)
+
     def test_filled_buy_waits_for_commission_and_free_btc_before_sell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")

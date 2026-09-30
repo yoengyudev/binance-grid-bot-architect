@@ -2239,8 +2239,10 @@ class GridBot:
         if amount > net_base:
             raise TradingHalt("Exchange precision rounded a SELL above net received BTC.")
         if row["level"] > 0:
-            ratio = Decimal(1) - self.config.spacing_percent / Decimal(100)
-            target = self.levels[row["level"] - 1] / ratio
+            # Exact-level grids derive their own geometric spacing; the legacy
+            # configured percentage is not the distance to the next SELL.
+            target = (self.anchor if row["level"] == 1
+                      else self.levels[row["level"] - 2])
         else:
             target = self.upper_levels[-row["level"] - 1]
         price = self._price(target)
