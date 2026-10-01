@@ -43,6 +43,7 @@ MAX_LEVELS = 50
 ORDER_CLIENT_PREFIX = "gridbot"
 ORDER_CLIENT_PREFIX_KEY = "order_client_prefix"
 SELL_AMOUNT_BUFFER = Decimal("0.002")
+SPOT_FEE_RATE = Decimal("0.001")  # Standard 0.1% per execution side.
 MIN_GRID_ORDER_NOTIONAL = Decimal("7")
 RESET_SPACING_PERCENT = Decimal("2.5")
 SAFETY_MODE_KEY = "safety_mode"
@@ -268,6 +269,13 @@ def _unavailable_wallet() -> Dict[str, Optional[float]]:
     return {"btc_held": None, "average_cost": None, "unrealized_pnl": None}
 
 
+def _realized_pnl_payload(database: Optional[GridDatabase]) -> Dict[str, Optional[float]]:
+    if database is None:
+        return {"today": None, "seven_day": None, "total": None}
+    totals = database.realized_pnl_summary()
+    return {key: float(totals[key]) for key in ("today", "seven_day", "total")}
+
+
 def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
     """Value the current run's remaining BTC lots from persisted fill snapshots."""
     try:
@@ -464,6 +472,7 @@ def bot_status() -> Dict[str, Any]:
             "lower_bound": None, "upper_bound": None,
             "wallet": {"btc_held": 0.0, "average_cost": None,
                        "unrealized_pnl": 0.0},
+            "realized_pnl": _realized_pnl_payload(bot.database),
             "atr_value": atr["atr_value"] if atr is not None else None,
             "atr_percentage": atr["atr_percentage"] if atr is not None else None,
             "bid_volume": order_book["bid_volume"] if order_book is not None else None,
@@ -482,6 +491,7 @@ def bot_status() -> Dict[str, Any]:
             "lower_bound": None, "upper_bound": None,
             "wallet": {"btc_held": 0.0, "average_cost": None,
                        "unrealized_pnl": 0.0},
+            "realized_pnl": _realized_pnl_payload(None),
             "atr_value": None, "atr_percentage": None,
             "bid_volume": None, "ask_volume": None,
             "imbalance_ratio": None,
@@ -569,6 +579,7 @@ def bot_status() -> Dict[str, Any]:
         "upper_bound": float(max(prices)) if prices else None,
         "wallet": _portfolio_wallet(database) if bot is not None
                   else _unavailable_wallet(),
+        "realized_pnl": _realized_pnl_payload(database),
         "atr_value": atr["atr_value"] if atr is not None else None,
         "atr_percentage": atr["atr_percentage"] if atr is not None else None,
         "bid_volume": order_book["bid_volume"] if order_book is not None else None,
@@ -1063,6 +1074,20 @@ def _fees_in_asset(order: Dict[str, Any], asset: str) -> Decimal:
         (_order_decimal(fee.get("cost")) for fee in fees if fee.get("currency") == asset),
         Decimal(0),
     )
+
+
+def _pnl_fee_in_quote(
+    order: Dict[str, Any], base: str, quote: str, notional: Decimal,
+    base_fee: Decimal, quote_fee: Decimal,
+) -> Tuple[Decimal, bool]:
+    """Use exchange fees when valued in the traded pair; otherwise estimate 0.1%."""
+    fees = order.get("fees") or ([order["fee"]] if order.get("fee") else [])
+    if fees and all(fee.get("currency") in (base, quote) for fee in fees):
+        # Base fees are already reflected in the net BTC cost-basis allocation.
+        return quote_fee, True
+    if base_fee or quote_fee:
+        return quote_fee, True
+    return notional * SPOT_FEE_RATE, False
 
 
 class GridBot:
@@ -2561,17 +2586,36 @@ class GridBot:
         buy_price = _order_decimal(buy.get("average") or buy.get("price"))
         sell_price = _order_decimal(sell.get("average") or sell.get("price"))
         net_base = buy_filled - self._buy_fee_in_asset(parent, buy, self.market["base"])
-        if net_base <= 0 or sell_filled > net_base:
+        sell_base_fee = _fees_in_asset(sell, self.market["base"])
+        consumed_base = sell_filled + sell_base_fee
+        if net_base <= 0 or consumed_base > net_base:
             raise TradingHalt("Sell amount exceeds the tracked buy's net base amount.")
-        allocation = sell_filled / net_base
+        allocation = consumed_base / net_base
         buy_cost = _order_decimal(buy.get("cost"), str(buy_price * buy_filled))
         sell_cost = _order_decimal(sell.get("cost"), str(sell_price * sell_filled))
+        buy_base_fee = self._buy_fee_in_asset(parent, buy, self.market["base"])
+        buy_quote_fee = self._buy_fee_in_asset(parent, buy, self.market["quote"])
+        carry_text = self.database.get_state("carry_inventory")
+        carry = json.loads(carry_text) if carry_text else {}
+        if carry.get("order_id") == parent_id and not parent.get("client_order_id"):
+            buy_fee, buy_fee_actual = Decimal(0), True  # Rolled-up cost basis.
+        else:
+            buy_fee, buy_fee_actual = _pnl_fee_in_quote(
+                buy, self.market["base"], self.market["quote"],
+                allocation * buy_cost, buy_base_fee, allocation * buy_quote_fee,
+            )
+        sell_fee, sell_fee_actual = _pnl_fee_in_quote(
+            sell, self.market["base"], self.market["quote"],
+            sell_cost, sell_base_fee, _fees_in_asset(sell, self.market["quote"]),
+        )
         profit = (
-            sell_cost - _fees_in_asset(sell, self.market["quote"])
-            - allocation * (buy_cost + self._buy_fee_in_asset(parent, buy, self.market["quote"]))
+            sell_cost - sell_fee - allocation * buy_cost - buy_fee
         )
         self.database.record_trade(
-            buy_price, sell_price, profit, sell_order_id=row["order_id"]
+            buy_price, sell_price, profit, sell_order_id=row["order_id"],
+            buy_order_id=parent_id, sold_base=sell_filled,
+            fee_basis=("exchange" if buy_fee_actual and sell_fee_actual else
+                       "estimated" if not buy_fee_actual and not sell_fee_actual else "mixed"),
         )
 
     def _bot_base_exposure(self) -> Decimal:
@@ -2609,7 +2653,8 @@ class GridBot:
             sell = self._fetch_order(row)
             parent = row["parent_order_id"]
             sold = _order_decimal(sell.get("filled"))
-            sold_by_buy[parent] = sold_by_buy.get(parent, Decimal(0)) + sold
+            sold_by_buy[parent] = (sold_by_buy.get(parent, Decimal(0)) + sold +
+                                   _fees_in_asset(sell, self.market["base"]))
             if sold > 0:
                 self._record_filled_sell(row)
         amount = cost = Decimal(0)
@@ -3157,10 +3202,17 @@ class GridBot:
                 if sold > 0 and proceeds > 0:
                     basis = (Decimal(state["cost_basis_quote"]) * sold /
                              Decimal(state["held_base"]))
-                    profit = proceeds - _fees_in_asset(order, self.market["quote"]) - basis
+                    sell_fee, sell_fee_actual = _pnl_fee_in_quote(
+                        order, self.market["base"], self.market["quote"],
+                        proceeds, _fees_in_asset(order, self.market["base"]),
+                        _fees_in_asset(order, self.market["quote"]),
+                    )
+                    profit = proceeds - sell_fee - basis
                     self.database.record_trade(
                         basis / sold, proceeds / sold, profit,
                         sell_order_id=state["client_order_id"],
+                        sold_base=sold,
+                        fee_basis="mixed" if sell_fee_actual else "estimated",
                     )
                 total_proceeds = Decimal(state.get("proceeds_quote", "0")) + proceeds
                 state.update(confirmed_order_id=state["client_order_id"],

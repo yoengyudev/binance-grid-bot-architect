@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
@@ -121,9 +122,16 @@ class GridDatabase:
             }
             if "sell_order_id" not in trade_columns:
                 connection.execute("ALTER TABLE trade_history ADD COLUMN sell_order_id TEXT")
+            for name in ("buy_order_id", "sold_base", "fee_basis"):
+                if name not in trade_columns:
+                    connection.execute(f"ALTER TABLE trade_history ADD COLUMN {name} TEXT")
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_history_sell_order "
                 "ON trade_history (sell_order_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trade_history_timestamp "
+                "ON trade_history (timestamp)"
             )
             connection.execute(
                 """
@@ -495,12 +503,20 @@ class GridDatabase:
         profit: NumberValue,
         *,
         sell_order_id: Optional[str] = None,
+        buy_order_id: Optional[str] = None,
+        sold_base: Optional[NumberValue] = None,
+        fee_basis: Optional[str] = None,
     ) -> int:
         """Store caller-calculated realized profit, which may be negative."""
+        if fee_basis not in (None, "exchange", "estimated", "mixed"):
+            raise ValueError("Trade fee basis must identify exchange or estimated fees.")
         values = (
             _decimal_text(buy_price),
             _decimal_text(sell_price),
             _decimal_text(profit, positive=False),
+            buy_order_id,
+            _decimal_text(sold_base) if sold_base is not None else None,
+            fee_basis,
         )
         with self._connection() as connection:
             if sell_order_id is not None:
@@ -512,8 +528,10 @@ class GridDatabase:
                     return existing["id"]
             connection.execute(
                 """
-                INSERT INTO trade_history (buy_price, sell_price, profit, sell_order_id)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO trade_history
+                    (buy_price, sell_price, profit, buy_order_id, sold_base,
+                     fee_basis, sell_order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sell_order_id) DO NOTHING
                 """,
                 (*values, sell_order_id),
@@ -532,3 +550,28 @@ class GridDatabase:
                 "SELECT * FROM trade_history ORDER BY id"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def realized_pnl_summary(self, now: Optional[datetime] = None) -> Dict[str, Decimal]:
+        """Sum recorded net profits in UTC without SQLite floating-point rounding."""
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            raise ValueError("P&L summary requires a timezone-aware timestamp.")
+        current = current.astimezone(timezone.utc)
+        today_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = current - timedelta(days=7)
+        totals = {"today": Decimal(0), "seven_day": Decimal(0),
+                  "total": Decimal(0)}
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT profit, timestamp FROM trade_history"
+            ).fetchall()
+        for row in rows:
+            profit = Decimal(row["profit"])
+            recorded = datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00"))
+            recorded = recorded.astimezone(timezone.utc)
+            totals["total"] += profit
+            if today_start <= recorded <= current:
+                totals["today"] += profit
+            if week_start <= recorded <= current:
+                totals["seven_day"] += profit
+        return totals

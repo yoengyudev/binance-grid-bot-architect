@@ -817,6 +817,57 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(len(bot.database.fetch_trade_history()), 1)
             self.assertEqual(bot.database.get_state("grid_run") is not None, True)
 
+    def test_realized_pnl_deducts_standard_fees_when_exchange_omits_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            buy = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.fill(buy["client_order_id"])
+            bot.run_cycle()
+            sell = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.fill(sell["client_order_id"])
+            bot.run_cycle()
+            recorded = bot.database.fetch_trade_history()[0]
+            buy_order = exchange.orders[buy["client_order_id"]]
+            sell_order = exchange.orders[sell["client_order_id"]]
+            fraction = Decimal(sell_order["filled"]) / Decimal(buy_order["filled"])
+            buy_cost = Decimal(buy_order["cost"]) * fraction
+            sell_cost = Decimal(sell_order["cost"])
+            expected = (sell_cost - buy_cost -
+                        (sell_cost + buy_cost) * Decimal("0.001"))
+            self.assertEqual(Decimal(recorded["profit"]), expected)
+            self.assertEqual(recorded["buy_order_id"], buy["order_id"])
+            self.assertEqual(recorded["sold_base"], sell_order["filled"])
+            self.assertEqual(recorded["fee_basis"], "estimated")
+            self.assertEqual(bot.database.realized_pnl_summary()["total"], expected)
+
+    def test_realized_pnl_uses_reported_fees_without_estimate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            buy = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.orders[buy["client_order_id"]]["fees"] = [
+                {"currency": "USDT", "cost": "0.2"},
+            ]
+            exchange.fill(buy["client_order_id"])
+            bot.run_cycle()
+            sell = bot.database.fetch_latest_orders_by_level()[1]
+            exchange.orders[sell["client_order_id"]]["fees"] = [
+                {"currency": "USDT", "cost": "0.3"},
+            ]
+            exchange.fill(sell["client_order_id"])
+            bot.run_cycle()
+            recorded = bot.database.fetch_trade_history()[0]
+            buy_order = exchange.orders[buy["client_order_id"]]
+            sell_order = exchange.orders[sell["client_order_id"]]
+            fraction = Decimal(sell_order["filled"]) / Decimal(buy_order["filled"])
+            expected = (Decimal(sell_order["cost"]) - Decimal("0.3") -
+                        fraction * (Decimal(buy_order["cost"]) + Decimal("0.2")))
+            self.assertAlmostEqual(Decimal(recorded["profit"]), expected, places=20)
+            self.assertEqual(recorded["fee_basis"], "exchange")
+
     def test_filled_buy_sell_uses_net_execution_after_btc_commission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
@@ -1005,6 +1056,14 @@ class GridBotTests(unittest.TestCase):
             bot.run_cycle()
             self.assertEqual(len(exchange.orders), before)
             self.assert_hard_stop_market_filled(bot, exchange)
+            liquidation = json.loads(bot.database.get_state(grid_main.LIQUIDATION_KEY))
+            sale_cost = Decimal(exchange.orders[liquidation["client_order_id"]]["cost"])
+            realized = bot.database.fetch_trade_history()[0]
+            self.assertEqual(
+                Decimal(realized["profit"]),
+                sale_cost - Decimal(liquidation["cost_basis_quote"])
+                - sale_cost * Decimal("0.001"),
+            )
             self.assertEqual(bot.database.get_state("safety_mode"), grid_main.LIQUIDATED)
             self.assertEqual(bot.database.get_state("halt_reason"), "hard_stop_liquidated")
             self.assertFalse(bot.stop_controller.stop_requested.is_set())

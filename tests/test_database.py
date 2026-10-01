@@ -1,12 +1,78 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from database import GridDatabase
 
 
 class GridDatabaseTests(unittest.TestCase):
+    def test_realized_pnl_uses_utc_windows_and_deduplicates_sell_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            database.record_trade("100", "110", "8.79", sell_order_id="today-win",
+                                  buy_order_id="buy-1", sold_base="1",
+                                  fee_basis="estimated")
+            database.record_trade("100", "90", "-10.19", sell_order_id="today-loss")
+            database.record_trade("100", "105", "4.79", sell_order_id="week")
+            database.record_trade("100", "120", "19.79", sell_order_id="old")
+            self.assertEqual(
+                database.record_trade("100", "999", "999", sell_order_id="today-win"),
+                database.fetch_trade_history()[0]["id"],
+            )
+            with database._connection() as connection:
+                connection.execute(
+                    "UPDATE trade_history SET timestamp = ? WHERE sell_order_id = ?",
+                    ("2026-10-01T01:00:00.000Z", "today-win"),
+                )
+                connection.execute(
+                    "UPDATE trade_history SET timestamp = ? WHERE sell_order_id = ?",
+                    ("2026-10-01T03:00:00.000Z", "today-loss"),
+                )
+                connection.execute(
+                    "UPDATE trade_history SET timestamp = ? WHERE sell_order_id = ?",
+                    ("2026-09-27T00:00:00.000Z", "week"),
+                )
+                connection.execute(
+                    "UPDATE trade_history SET timestamp = ? WHERE sell_order_id = ?",
+                    ("2026-09-01T00:00:00.000Z", "old"),
+                )
+            totals = database.realized_pnl_summary(
+                datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+            )
+            self.assertEqual(totals, {
+                "today": Decimal("-1.40"),
+                "seven_day": Decimal("3.39"),
+                "total": Decimal("23.18"),
+            })
+            trade = database.fetch_trade_history()[0]
+            self.assertEqual(trade["buy_order_id"], "buy-1")
+            self.assertEqual(trade["sold_base"], "1")
+            self.assertEqual(trade["fee_basis"], "estimated")
+
+    def test_existing_trade_history_migrates_without_losing_profit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "legacy.sqlite3"
+            with closing(sqlite3.connect(path)) as connection:
+                with connection:
+                    connection.execute(
+                        "CREATE TABLE trade_history (id INTEGER PRIMARY KEY, "
+                        "buy_price TEXT NOT NULL, sell_price TEXT NOT NULL, "
+                        "profit TEXT NOT NULL, timestamp TEXT NOT NULL)"
+                    )
+                    connection.execute(
+                        "INSERT INTO trade_history VALUES "
+                        "(1, '100', '110', '9', '2026-10-01T00:00:00.000Z')"
+                    )
+            database = GridDatabase(path)
+            self.assertEqual(database.fetch_trade_history()[0]["profit"], "9")
+            self.assertEqual(database.realized_pnl_summary(
+                datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+            )["total"], Decimal("9"))
+
     def test_order_and_trade_state_survive_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "grid.sqlite3"

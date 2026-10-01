@@ -22,6 +22,27 @@ from database import GridDatabase
 
 
 class StatusApiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_status_exposes_recorded_realized_pnl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database.record_trade("100", "110", "9.79", sell_order_id="sell-1")
+            grid_main.app.state.grid_bot = SimpleNamespace(
+                config=SimpleNamespace(symbol="BTC/USDT", stop_loss_price=70000),
+                database=database,
+            )
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_main.app),
+                    base_url="http://testserver",
+                ) as client:
+                    response = await client.get("/api/bot/status")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["realized_pnl"], {
+                    "today": 9.79, "seven_day": 9.79, "total": 9.79,
+                })
+            finally:
+                grid_main.app.state.grid_bot = None
+
     async def test_live_order_ledger_requires_admin_and_uses_saved_fill_price(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = GridDatabase(Path(directory) / "grid.sqlite3")
@@ -66,6 +87,9 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         standby_bot = Mock()
         standby_bot.config.symbol = "BTC/USDT"
         standby_bot.database.get_state.return_value = None
+        standby_bot.database.realized_pnl_summary.return_value = {
+            "today": Decimal(0), "seven_day": Decimal(0), "total": Decimal(0),
+        }
         standby_bot.request_initial_grid.return_value = (Decimal("80"), Decimal("120"))
         grid_main.app.state.grid_bot = standby_bot
         grid_main.app.state.standby = True
@@ -125,6 +149,9 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.json()["status"], "Online")
             self.assertEqual(response.json()["trading_state"], "STOPPED")
             self.assertEqual(response.json()["grid_levels"], 0)
+            self.assertEqual(response.json()["realized_pnl"], {
+                "today": None, "seven_day": None, "total": None,
+            })
             self.assertFalse(response.json()["exact_grid_recenter_supported"])
         finally:
             grid_main.app.state.monitor_only = False
@@ -189,6 +216,9 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "wallet": {
                         "btc_held": None, "average_cost": None,
                         "unrealized_pnl": None,
+                    },
+                    "realized_pnl": {
+                        "today": 0.0, "seven_day": 0.0, "total": 0.0,
                     },
                 })
                 database.require_order_cleanup("Cancellation could not be verified.")
@@ -286,6 +316,9 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "wallet": {
                 "btc_held": 0.02, "average_cost": 81000.0,
                 "unrealized_pnl": 80.0,
+            },
+            "realized_pnl": {
+                "today": 0.0, "seven_day": 0.0, "total": 0.0,
             },
         })
         self.assertEqual(resumed.json()["safety_pause"], "Normal")
