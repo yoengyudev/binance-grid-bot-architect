@@ -705,9 +705,28 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     started = await client.post("/api/engine/start", headers=origin)
                     self.assertEqual(started.json(), {"engine_status": grid_main.ENGINE_RUNNING})
                     self.assertEqual(started.headers["cache-control"], "no-store")
+                    covered = await client.post(
+                        "/api/engine/start", headers=origin,
+                        json={"auto_cover_inventory": True},
+                    )
+                    self.assertEqual(covered.status_code, 200)
+                    bot.start_engine.side_effect = grid_main.TradingHalt(
+                        "State reconciliation failed; manual intervention is required."
+                    )
+                    conflict = await client.post("/api/engine/start", headers=origin)
+                    self.assertEqual(conflict.status_code, 409)
+                    self.assertIn("manual intervention", conflict.json()["detail"])
                     stopped = await client.post("/api/engine/stop", headers=origin)
                     self.assertTrue(stopped.json()["bot_orders_cleared"])
-                    bot.start_engine.assert_called_once_with()
+                    self.assertEqual(bot.start_engine.call_count, 3)
+                    self.assertEqual(
+                        bot.start_engine.call_args_list[0].kwargs,
+                        {"auto_cover_inventory": False},
+                    )
+                    self.assertEqual(
+                        bot.start_engine.call_args_list[1].kwargs,
+                        {"auto_cover_inventory": True},
+                    )
                     bot.stop_engine.assert_called_once_with()
         finally:
             grid_main.app.state.ready = False

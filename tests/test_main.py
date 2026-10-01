@@ -304,12 +304,14 @@ class GridBotTests(unittest.TestCase):
             self.assertTrue(services.await_args.kwargs["ready"])
             self.assertTrue(services.await_args.args[0].ready_mode)
 
-    def make_bot(self, path: Path, *, width: Decimal = None):
+    def make_bot(self, path: Path, *, width: Decimal = None,
+                 initial_base: Decimal = Decimal("1")):
         config = GridConfig(
             "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
             Decimal("10"), Decimal("50"), Decimal("70"), 2, width,
         )
         exchange = FakeSpotExchange()
+        exchange.base_free = initial_base
         bot = GridBot(config, exchange, GridDatabase(path))
         bot.prepare(persist=True)
         return bot, exchange
@@ -1004,7 +1006,7 @@ class GridBotTests(unittest.TestCase):
     def test_master_stop_and_start_rebuilds_without_touching_manual_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "grid.sqlite3"
-            bot, exchange = self.make_bot(path)
+            bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
             bot.ready_mode = True
             bot.run_cycle()
             bot.run_cycle()
@@ -1031,18 +1033,69 @@ class GridBotTests(unittest.TestCase):
             reopened.ready_mode = True
             reopened.reconcile_idle_orders()
             self.assertEqual(reopened.run_cycle(), [])
-            self.assertEqual(reopened.start_engine()["engine_status"],
+            with self.assertRaisesRegex(TradingHalt, "Unhedged"):
+                reopened.start_engine()
+            prior_order_ids = set(exchange.orders)
+            self.assertEqual(reopened.start_engine(
+                auto_cover_inventory=True)["engine_status"],
                              grid_main.ENGINE_RUNNING)
             self.assertTrue(reopened.grid_needs_reset)
             self.assertTrue(reopened.reset_grid())
+            placed = [order for client_id, order in exchange.orders.items()
+                      if client_id not in prior_order_ids]
+            self.assertEqual(placed[0]["side"], "sell")
+            self.assertEqual(Decimal(placed[0]["price"]), bot.config.upper_price)
+            self.assertLess(
+                min(i for i, order in enumerate(placed) if order["side"] == "sell"),
+                min(i for i, order in enumerate(placed) if order["side"] == "buy"),
+            )
             self.assertGreater(len(reopened.database.fetch_active_grids()), 0)
             self.assertIn(manual["id"], [order["id"] for order in
                                          exchange.fetch_open_orders("BTC/USDT")])
+
+    def test_restart_reconciles_matching_grid_without_new_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
+            bot.run_cycle()
+            bot.run_cycle()
+            original_ids = set(exchange.orders)
+            reopened = GridBot(bot.config, exchange, GridDatabase(path))
+            reopened.ready_mode = True
+            reopened.database.set_state(grid_main.ENGINE_STATUS_KEY,
+                                        grid_main.ENGINE_IDLE)
+            state = reopened._reconcile_state()
+            self.assertTrue(state["resumable"])
+            self.assertEqual(len(reopened.reconciled_orders),
+                             len(reopened.database.fetch_active_grids()))
+            self.assertEqual(reopened.start_engine()["engine_status"],
+                             grid_main.ENGINE_RUNNING)
+            self.assertFalse(reopened.grid_needs_reset)
+            reopened.run_cycle()
+            self.assertEqual(set(exchange.orders), original_ids)
+
+    def test_reconciliation_conflict_forces_idle_and_explains_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
+            bot.run_cycle()
+            bot.run_cycle()
+            active = bot.database.fetch_active_grids()[0]
+            exchange.orders[active["client_order_id"]]["price"] = "999"
+            bot.database.set_state(grid_main.ENGINE_STATUS_KEY,
+                                   grid_main.ENGINE_RUNNING)
+            with self.assertRaisesRegex(TradingHalt, "Manual intervention"):
+                bot._reconcile_state()
+            self.assertEqual(bot.database.get_state(grid_main.ENGINE_STATUS_KEY),
+                             grid_main.ENGINE_IDLE)
+            self.assertIn("price conflicts", bot.database.get_state(
+                grid_main.ENGINE_FAULT_KEY))
 
     def test_ready_mode_keeps_new_grid_idle_until_master_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "grid.sqlite3"
             exchange = FakeSpotExchange()
+            exchange.base_free = Decimal("0")
             config = GridConfig(
                 "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
                 Decimal("10"), Decimal("50"), Decimal("70"), 2,

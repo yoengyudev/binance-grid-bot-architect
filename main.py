@@ -50,6 +50,8 @@ ENGINE_STATUS_KEY = "engine_status"
 ENGINE_IDLE = "IDLE"
 ENGINE_RUNNING = "RUNNING"
 ENGINE_FAULT_KEY = "engine_fault"
+ENGINE_STOP_CLEANUP_KEY = "engine_stop_cleanup_pending"
+RECONCILE_COVER_KEY = "reconcile_cover_inventory"
 MANUAL_ACCOUNT_EXIT_REASON = "manual_full_account_exit"
 PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
 PAUSED_MANUAL = "PAUSED_MANUAL"
@@ -130,6 +132,10 @@ class LoginRequest(BaseModel):
 
 class PauseRequest(BaseModel):
     active: StrictBool
+
+
+class EngineStartRequest(BaseModel):
+    auto_cover_inventory: StrictBool = False
 
 
 class StopLossRequest(BaseModel):
@@ -633,6 +639,7 @@ def set_bot_pause(payload: PauseRequest, _: None = Depends(_require_dashboard_or
 
 @app.post("/api/engine/start")
 def start_engine(response: Response,
+                 payload: Optional[EngineStartRequest] = None,
                  _: None = Depends(_require_dashboard_origin),
                  __: str = Depends(get_current_user)) -> Dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
@@ -640,7 +647,9 @@ def start_engine(response: Response,
     if not app.state.ready or bot is None:
         raise HTTPException(status_code=503, detail="The ready-mode engine is offline.")
     try:
-        result = bot.start_engine()
+        result = bot.start_engine(
+            auto_cover_inventory=(payload.auto_cover_inventory if payload else False)
+        )
     except InsufficientGridCapital as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except (TradingHalt, ValueError) as error:
@@ -1061,6 +1070,123 @@ class GridBot:
         self.grid_needs_reset = pending is not None
         self.grid_activation_requested = False
         self.ready_mode = False
+        self.reconciled_orders: Dict[str, Dict[str, Any]] = {}
+
+    def _reconcile_state(self) -> Dict[str, Any]:
+        """Verify the Testnet order book and wallet before ordinary trading resumes.
+
+        SQLite remains the order ledger. Memory holds only a verified snapshot;
+        every normal trading cycle still fetches live order status by saved ID.
+        """
+        with self._cycle_lock:
+            if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
+                return {"resumable": False, "unhedged_btc": Decimal(0)}
+            try:
+                self._load_market_for_engine_control()
+                live = self._live_open_orders()
+                balances = self.wallet_balances()
+                base = self.market["base"]
+                free = balances[base]["free"]
+                if free is None:
+                    raise TradingHalt("Binance did not return a free BTC balance.")
+                tracked = self.database.fetch_active_grids()
+                if tracked and not self.database.get_state("grid_run"):
+                    raise TradingHalt("Open grid rows exist without a saved grid run.")
+                by_client: Dict[str, Dict[str, Any]] = {}
+                by_exchange: Dict[str, Dict[str, Any]] = {}
+                for order in live:
+                    if not isinstance(order, dict) or order.get("id") is None:
+                        raise TradingHalt("Binance returned an invalid open order.")
+                    exchange_id = str(order["id"])
+                    client_id = self._client_order_id(order)
+                    if exchange_id in by_exchange or (client_id and client_id in by_client):
+                        raise TradingHalt("Binance returned duplicate open order IDs.")
+                    by_exchange[exchange_id] = order
+                    if client_id:
+                        by_client[client_id] = order
+
+                restored: Dict[str, Dict[str, Any]] = {}
+                for row in tracked:
+                    client_id = row.get("client_order_id")
+                    exchange_id = row.get("exchange_order_id")
+                    by_cid = by_client.get(str(client_id)) if client_id else None
+                    by_eid = by_exchange.get(str(exchange_id)) if exchange_id else None
+                    if by_cid is not None and by_eid is not None and by_cid is not by_eid:
+                        raise TradingHalt("Saved client and exchange order IDs disagree.")
+                    order = by_cid or by_eid
+                    if order is None:
+                        # A fill may have won the restart race. Verify its final
+                        # state by exact saved ID before removing it from OPEN.
+                        self._reconcile_order(row)
+                        if self.database.get_order(row["order_id"])["status"] in (
+                                "OPEN", "PARTIALLY_FILLED"):
+                            raise TradingHalt("A tracked open order is absent from Binance.")
+                        continue
+                    if (client_id and self._client_order_id(order) != str(client_id)) or (
+                            exchange_id and str(order["id"]) != str(exchange_id)):
+                        raise TradingHalt("A saved order ID conflicts with Binance.")
+                    exchange_type = str(order.get("type", "")).upper()
+                    if exchange_type == "LIMIT_MAKER":
+                        exchange_type = "LIMIT"
+                    if (str(order.get("side", "")).upper() != row["side"] or
+                            exchange_type != row["order_type"] or
+                            str(order.get("status", "open")).lower() != "open"):
+                        raise TradingHalt("A saved order side, type, or status conflicts with Binance.")
+                    amount = _order_decimal(order.get("amount"))
+                    price = _order_decimal(order.get("price"))
+                    if (not amount.is_finite() or amount != Decimal(row["amount"]) or
+                            row["order_type"] == "LIMIT" and
+                            (not price.is_finite() or price != Decimal(row["price"]))):
+                        raise TradingHalt("A saved order amount or price conflicts with Binance.")
+                    if exchange_id is None:
+                        self.database.set_exchange_order_id(row["order_id"],
+                                                            str(order["id"]))
+                    restored[row["order_id"]] = order
+
+                for order in live:
+                    client_id = self._client_order_id(order)
+                    if (client_id and client_id.startswith(self.order_client_prefix) and
+                            order not in restored.values()):
+                        raise TradingHalt("A bot-owned Binance order is missing from SQLite.")
+                locked = balances[base]["used"]
+                if locked is not None:
+                    bot_sell_remaining = sum((
+                        _order_decimal(order.get("remaining"),
+                                       str(order.get("amount") or "0"))
+                        for order in restored.values()
+                        if str(order.get("side", "")).lower() == "sell"
+                    ), Decimal(0))
+                    if bot_sell_remaining > locked:
+                        raise TradingHalt(
+                            "Binance locked BTC is below the saved SELL order total."
+                        )
+                self.reconciled_orders = restored
+                # Only a sellable free balance is actionable. Binance can leave
+                # precision dust after a filled SELL.
+                unhedged = Decimal(0)
+                if free > 0:
+                    price = self._ticker_price()
+                    if self._sellable_hard_stop_amount(free, price) > 0:
+                        unhedged = free
+                        LOGGER.critical(
+                            "Unhedged %s BTC in Testnet Spot wallet; START needs "
+                            "manual clearance or explicit auto_cover_inventory.", free,
+                        )
+                return {"resumable": bool(restored), "unhedged_btc": unhedged,
+                        "covered_btc": bot_sell_remaining if locked is not None else sum((
+                            _order_decimal(order.get("remaining"),
+                                           str(order.get("amount") or "0"))
+                            for order in restored.values()
+                            if str(order.get("side", "")).lower() == "sell"
+                        ), Decimal(0))}
+            except Exception as error:
+                message = ("State reconciliation failed: " + str(error) +
+                           " Manual intervention is required.")
+                self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+                self.database.set_state(ENGINE_FAULT_KEY, message)
+                self.reconciled_orders = {}
+                LOGGER.critical(message, exc_info=True)
+                raise TradingHalt(message) from error
 
     def request_initial_grid(self, center_text: str, width_text: str,
                              stop_distance_text: str, capital_text: str,
@@ -2285,7 +2411,9 @@ class GridBot:
         amount = self._seed_upper_sell_amount(seed_row)
         if amount is None:
             return
-        price = self._price(self.upper_levels[-level - 1])
+        target = (self.config.upper_price if self.database.get_state(RECONCILE_COVER_KEY)
+                  else self.upper_levels[-level - 1])
+        price = self._price(target)
         self._check_order_size(price, amount)
         if self._free_bot_base() < amount:
             return  # Account balance can lag a newly filled market buy.
@@ -2344,6 +2472,8 @@ class GridBot:
                       else self.levels[row["level"] - 2])
         else:
             target = self.upper_levels[-row["level"] - 1]
+        if self.database.get_state(RECONCILE_COVER_KEY):
+            target = self.config.upper_price
         price = self._price(target)
         if price > self.config.upper_price:
             raise TradingHalt("Planned sell is above the upper grid bound.")
@@ -3089,7 +3219,8 @@ class GridBot:
     def reconcile_idle_orders(self) -> None:
         """Retry a failed stop after a process restart without placing orders."""
         with self._cycle_lock:
-            if self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE:
+            if (self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE or
+                    self.database.get_state(ENGINE_STOP_CLEANUP_KEY) != "1"):
                 return
             if self.database.get_state(SAFETY_MODE_KEY) in (
                     LIQUIDATING, LIQUIDATION_HALTED):
@@ -3098,6 +3229,7 @@ class GridBot:
             _, complete = self._cancel_bot_orders()
             if not complete or self.database.fetch_active_grids():
                 raise TradingHalt("Idle bot orders still need reconciliation.")
+            self.database.clear_state(ENGINE_STOP_CLEANUP_KEY)
 
     def stop_engine(self) -> Dict[str, Any]:
         """Persist IDLE before canceling and reconciling every bot-owned grid order."""
@@ -3106,6 +3238,7 @@ class GridBot:
                     LIQUIDATING, LIQUIDATION_HALTED):
                 raise TradingHalt("Unresolved hard-stop liquidation cannot be interrupted.")
             self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+            self.database.set_state(ENGINE_STOP_CLEANUP_KEY, "1")
             self._load_market_for_engine_control()
             _, complete = self._cancel_bot_orders()
             if self.grid_needs_reset:
@@ -3116,17 +3249,25 @@ class GridBot:
                     self.database.set_state("grid_reset", json.dumps(pending, sort_keys=True))
             if not complete or self.database.fetch_active_grids():
                 raise TradingHalt("Engine is idle, but bot order cancellation needs another attempt.")
+            self.database.clear_state(ENGINE_STOP_CLEANUP_KEY)
+            self.database.clear_state(RECONCILE_COVER_KEY)
             LOGGER.warning("Admin stopped the trading engine and cleared bot grid orders.")
             return {"engine_status": ENGINE_IDLE, "bot_orders_cleared": True,
                     "remaining_exchange_orders": len(self._live_open_orders())}
 
-    def start_engine(self) -> Dict[str, Any]:
-        """Validate a saved grid and queue a carry-aware rebuild before trading."""
+    def start_engine(self, *, auto_cover_inventory: bool = False) -> Dict[str, Any]:
+        """Reconcile first; resume matched orders or queue a guarded rebuild."""
         with self._cycle_lock:
+            state = self._reconcile_state()
             if self.stop_controller.stop_requested.is_set():
                 raise TradingHalt("The trading process is stopping or faulted.")
             if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_RUNNING:
+                if state["unhedged_btc"]:
+                    self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+                    raise TradingHalt("Free BTC lacks SELL protection; engine is idle.")
                 return {"engine_status": ENGINE_RUNNING}
+            if self.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
+                raise TradingHalt("A prior STOP still needs order cleanup.")
             if not self.database.get_state("grid_run"):
                 raise TradingHalt("Configure a grid before starting the engine.")
             if self.database.get_state("halt_reason"):
@@ -3136,16 +3277,24 @@ class GridBot:
                         PAUSED_SIZING, LIQUIDATING, LIQUIDATED,
                         LIQUIDATION_HALTED):
                 raise TradingHalt(f"Cannot start while safety mode is {mode}.")
-            self._load_market_for_engine_control()
-            _, complete = self._cancel_bot_orders()
-            if not complete or self.database.fetch_active_grids():
-                raise TradingHalt("Bot orders need reconciliation before the engine starts.")
+            unhedged = state["unhedged_btc"]
+            if unhedged:
+                if not auto_cover_inventory:
+                    raise TradingHalt(
+                        f"Unhedged {unhedged} BTC: clear it manually or restart "
+                        "with auto_cover_inventory=true to place SELL protection first."
+                    )
+                carried, _ = self._carry_inventory(require_available=False)
+                if carried < unhedged * (1 - SELL_AMOUNT_BUFFER):
+                    raise TradingHalt(
+                        "BTC has no complete bot cost-basis history; clear it manually."
+                    )
             current, _, _ = self.prepare(persist=False)
             if not self.config.lower_price < current < self.config.upper_price:
                 raise TradingHalt("Market price is outside the saved grid; re-anchor first.")
             if current <= self.config.stop_loss_price:
                 raise TradingHalt("Market price is at or below the hard stop.")
-            if not self.grid_needs_reset:
+            if not state["resumable"] and not self.grid_needs_reset:
                 carry_amount, _ = self._carry_inventory()
                 self._validate_reset_grid(self.config, current, carry_amount)
                 request = {
@@ -3162,6 +3311,9 @@ class GridBot:
                 self.pending_grid_bounds = (self.config.lower_price,
                                             self.config.upper_price)
                 self.grid_needs_reset = True
+            if unhedged:
+                needed = state["covered_btc"] + unhedged * (1 - SELL_AMOUNT_BUFFER)
+                self.database.set_state(RECONCILE_COVER_KEY, str(needed))
             self.database.clear_state(ENGINE_FAULT_KEY)
             self.database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
             LOGGER.warning("Admin started the trading engine with a saved grid.")
@@ -3270,7 +3422,23 @@ class GridBot:
 
         latest = self.database.fetch_latest_orders_by_level()
         seed_row = latest.get(0)
+        cover_text = self.database.get_state(RECONCILE_COVER_KEY)
+        if cover_text:
+            required = Decimal(cover_text)
+            covered = sum((
+                _order_decimal(order.get("remaining"), str(order.get("amount") or "0"))
+                for order in self._live_open_orders()
+                if str(order.get("side", "")).lower() == "sell" and
+                self._is_bot_order(order)
+            ), Decimal(0))
+            free_base = self._free_balance(self.market["base"])
+            if (covered >= required or
+                    self._sellable_hard_stop_amount(free_base, current_price) == 0):
+                self.database.clear_state(RECONCILE_COVER_KEY)
+                cover_text = None
         if seed_row is None:
+            if cover_text:
+                raise TradingHalt("Inventory cover has no saved seed lot; manual review required.")
             if not self.is_paused:
                 self._check_grid_buy_capital(
                     self.config, self.levels, self.config.stop_loss_price,
@@ -3285,7 +3453,7 @@ class GridBot:
 
         latest = self.database.fetch_latest_orders_by_level()
         in_bounds = (
-            not self.is_paused and
+            not self.is_paused and not cover_text and
             self.config.lower_price <= current_price <= self.config.upper_price
         )
         if in_bounds and all(
@@ -3587,6 +3755,13 @@ def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> Gri
 async def _run_services(bot: GridBot, notifier: TelegramNotifier,
                         *, ready: bool = False) -> None:
     """Run the local API and trading loop with outbound alerts only."""
+    if ready:
+        try:
+            await asyncio.to_thread(bot._reconcile_state)
+        except TradingHalt:
+            # Keep the dashboard available so its engine_fault explains why
+            # START is locked. Reconciliation has already persisted IDLE.
+            pass
     app.state.grid_bot = bot
     app.state.ready = ready
     app.state.standby = ready and bot.database.get_state("grid_run") is None
@@ -3745,7 +3920,7 @@ def main() -> int:
             bot = GridBot(config, exchange, database)
             bot.ready_mode = True
             # A service restart never resumes ordinary grid trading by itself.
-            # An unfinished hard-stop liquidation remains a safety exception.
+            # START can adopt verified exchange orders after reconciliation.
             if database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
                 database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
             else:
