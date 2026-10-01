@@ -1,15 +1,43 @@
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier
 
 from database import GridDatabase
 
 
 class GridDatabaseTests(unittest.TestCase):
+    def test_runner_lease_fences_competing_connections_and_expired_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "grid.sqlite3"
+            first, second = GridDatabase(path), GridDatabase(path)
+            gate = Barrier(2)
+
+            def compete(database, token):
+                gate.wait()
+                return database.acquire_runner_lease(token, now_ms=1_000)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                one = pool.submit(compete, first, "runner-one")
+                two = pool.submit(compete, second, "runner-two")
+                epochs = [one.result(), two.result()]
+            self.assertEqual(sorted(epoch for epoch in epochs if epoch is not None), [1])
+            winner, loser = ((first, second) if epochs[0] else (second, first))
+            winner_token, loser_token = (("runner-one", "runner-two") if epochs[0]
+                                         else ("runner-two", "runner-one"))
+            self.assertIsNone(loser.acquire_runner_lease(loser_token, now_ms=1_001))
+            self.assertTrue(winner.renew_runner_lease(winner_token, 1, now_ms=2_000))
+            self.assertEqual(loser.acquire_runner_lease(loser_token, now_ms=33_000), 2)
+            self.assertFalse(winner.renew_runner_lease(winner_token, 1, now_ms=33_000))
+            self.assertFalse(winner.release_runner_lease(winner_token, 1))
+            self.assertTrue(loser.runner_lease_valid(loser_token, 2, now_ms=33_000))
+            self.assertTrue(loser.release_runner_lease(loser_token, 2))
+
     def test_realized_pnl_uses_utc_windows_and_deduplicates_sell_orders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")

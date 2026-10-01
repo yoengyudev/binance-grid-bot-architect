@@ -46,7 +46,12 @@ def create_exchange(api_key: str = "", api_secret: str = "") -> ccxt.binance:
             "secret": api_secret,
             "enableRateLimit": True,
             "timeout": 10000,
-            "options": {"defaultType": "spot"},
+            "options": {
+                "defaultType": "spot",
+                # The 5-minute account-wide audit deliberately uses Binance's
+                # higher-weight no-symbol open-orders endpoint.
+                "fetchOpenOrders": {"warnWithoutSymbol": False},
+            },
         }
     )
     exchange.set_sandbox_mode(True)

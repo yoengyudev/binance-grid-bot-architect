@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import time
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -138,6 +139,16 @@ class GridDatabase:
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runner_lease (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    owner_token TEXT NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    expires_at_ms INTEGER NOT NULL
                 )
                 """
             )
@@ -325,6 +336,88 @@ class GridDatabase:
                 "SELECT value FROM bot_state WHERE key = ?", (key,)
             ).fetchone()
         return row["value"] if row is not None else None
+
+    def get_or_create_state(self, key: str, value: str) -> str:
+        """Initialize a shared state key once across competing processes."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO NOTHING", (key, value),
+            )
+            row = connection.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (key,),
+            ).fetchone()
+        return row["value"]
+
+    @staticmethod
+    def _lease_time_ms(now_ms: Optional[int]) -> int:
+        return time.time_ns() // 1_000_000 if now_ms is None else now_ms
+
+    def acquire_runner_lease(
+        self, owner_token: str, *, ttl_seconds: int = 30,
+        now_ms: Optional[int] = None,
+    ) -> Optional[int]:
+        """Atomically acquire the singleton runner lease; return its fencing epoch."""
+        if not owner_token or ttl_seconds <= 0:
+            raise ValueError("Runner lease requires an owner and positive TTL.")
+        now = self._lease_time_ms(now_ms)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT owner_token, epoch, expires_at_ms FROM runner_lease WHERE id = 1"
+            ).fetchone()
+            if row is not None and row["expires_at_ms"] > now:
+                if row["owner_token"] != owner_token:
+                    return None
+                epoch = row["epoch"]
+            else:
+                epoch = (row["epoch"] if row is not None else 0) + 1
+            connection.execute(
+                "INSERT INTO runner_lease (id, owner_token, epoch, expires_at_ms) "
+                "VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "owner_token = excluded.owner_token, epoch = excluded.epoch, "
+                "expires_at_ms = excluded.expires_at_ms",
+                (owner_token, epoch, now + ttl_seconds * 1000),
+            )
+            return epoch
+
+    def renew_runner_lease(
+        self, owner_token: str, epoch: int, *, ttl_seconds: int = 30,
+        now_ms: Optional[int] = None,
+    ) -> bool:
+        """A stale or expired owner cannot renew its fencing epoch."""
+        if ttl_seconds <= 0:
+            raise ValueError("Runner lease TTL must be positive.")
+        now = self._lease_time_ms(now_ms)
+        with self._connection() as connection:
+            changed = connection.execute(
+                "UPDATE runner_lease SET expires_at_ms = ? WHERE id = 1 "
+                "AND owner_token = ? AND epoch = ? AND expires_at_ms > ?",
+                (now + ttl_seconds * 1000, owner_token, epoch, now),
+            ).rowcount
+        return changed == 1
+
+    def runner_lease_valid(
+        self, owner_token: str, epoch: int, *, now_ms: Optional[int] = None,
+    ) -> bool:
+        now = self._lease_time_ms(now_ms)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM runner_lease WHERE id = 1 AND owner_token = ? "
+                "AND epoch = ? AND expires_at_ms > ?",
+                (owner_token, epoch, now),
+            ).fetchone()
+        return row is not None
+
+    def release_runner_lease(self, owner_token: str, epoch: int) -> bool:
+        """Release only the currently owned generation, never a successor's lease."""
+        with self._connection() as connection:
+            changed = connection.execute(
+                "DELETE FROM runner_lease WHERE id = 1 AND owner_token = ? AND epoch = ?",
+                (owner_token, epoch),
+            ).rowcount
+        return changed == 1
 
     def set_state(self, key: str, value: str) -> None:
         with self._connection() as connection:

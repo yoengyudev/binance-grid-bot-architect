@@ -97,6 +97,7 @@ class FakeSpotExchange:
         self.orders[client_id] = {
             "id": order_id,
             "clientOrderId": client_id,
+            "symbol": _symbol,
             "side": side,
             "type": order_type,
             "amount": str(quantity),
@@ -143,9 +144,10 @@ class FakeSpotExchange:
             raise ccxt.RequestTimeout("Simulated cancel response timeout")
         return result
 
-    def fetch_open_orders(self, _symbol: str) -> list:
+    def fetch_open_orders(self, _symbol: str = None) -> list:
         return [dict(order) for order in self.orders.values()
-                if order["status"] == "open"]
+                if order["status"] == "open" and
+                (_symbol is None or order.get("symbol") in (None, _symbol))]
 
     def create_market_sell_order(self, symbol: str, amount: float,
                                  params: dict = None) -> dict:
@@ -278,7 +280,7 @@ class GridBotTests(unittest.TestCase):
                       redirect_stderr(StringIO())):
                     self.assertEqual(grid_main.main(), expected)
 
-    def test_ready_service_defaults_to_idle_even_with_saved_grid(self) -> None:
+    def test_ready_entry_defers_idle_mutation_until_lease_is_acquired(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "grid.sqlite3"
             config = GridConfig(
@@ -301,8 +303,8 @@ class GridBotTests(unittest.TestCase):
                   patch.object(grid_main, "_run_services", new_callable=AsyncMock) as services):
                 self.assertEqual(grid_main.main(), 0)
             self.assertEqual(database.get_state(grid_main.ENGINE_STATUS_KEY),
-                             grid_main.ENGINE_IDLE)
-            self.assertEqual(database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY), "1")
+                             grid_main.ENGINE_RUNNING)
+            self.assertIsNone(database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY))
             self.assertTrue(services.await_args.kwargs["ready"])
             self.assertTrue(services.await_args.args[0].ready_mode)
 
@@ -326,6 +328,118 @@ class GridBotTests(unittest.TestCase):
             self.assertIsNone(database.get_state(grid_main.ORDER_CLEANUP_ALARM_KEY))
             self.assertEqual(database.fetch_active_grids(), [])
             self.assertEqual(exchange.fetch_open_orders("BTC/USDT"), [])
+
+    def test_second_ready_service_refuses_before_changing_engine_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            owner, exchange = self.make_bot(path)
+            owner.acquire_runner_lease()
+            contender = GridBot(owner.config, exchange, GridDatabase(path))
+            contender.ready_mode = True
+            owner.database.set_state(grid_main.ENGINE_STATUS_KEY,
+                                     grid_main.ENGINE_RUNNING)
+            try:
+                with self.assertRaisesRegex(grid_main.RunnerLeaseLost,
+                                            "Another process holds"):
+                    asyncio.run(grid_main._run_services(contender, object(), ready=True))
+                self.assertEqual(owner.database.get_state(grid_main.ENGINE_STATUS_KEY),
+                                 grid_main.ENGINE_RUNNING)
+                self.assertIsNone(owner.database.get_state(
+                    grid_main.ENGINE_STOP_CLEANUP_KEY))
+            finally:
+                owner.release_runner_lease()
+
+    def test_boot_reconciliation_propagates_lost_runner_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.ready_mode = True
+            with (patch.object(bot, "_reconcile_state",
+                               side_effect=grid_main.RunnerLeaseLost("lease lost")),
+                  patch.object(bot, "reconcile_idle_orders") as cleanup):
+                with self.assertRaisesRegex(grid_main.RunnerLeaseLost, "lease lost"):
+                    asyncio.run(grid_main._reconcile_service_boot(bot, ready=True))
+            cleanup.assert_not_called()
+            self.assertEqual(exchange.orders, {})
+
+    def test_runtime_full_book_audit_cancels_untracked_bot_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            ghost_id = bot.order_client_prefix + "orphan"
+            exchange.create_order(
+                "BTC/USDT", "limit", "buy", 0.2, 50,
+                {"newClientOrderId": ghost_id},
+            )
+            bot._last_full_book_audit = grid_main.time.monotonic() - 301
+            with self.assertRaisesRegex(TradingHalt, "ghost orders"):
+                bot.run_cycle()
+            self.assertEqual(exchange.orders[ghost_id]["status"], "canceled")
+            self.assertIn(ghost_id, exchange.cancel_calls)
+            self.assertIn(ghost_id, bot.database.get_state(
+                grid_main.GHOST_ORDER_ALARM_KEY))
+
+    def test_full_book_audit_catches_old_bot_prefix_on_another_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot.run_cycle()
+            bot.run_cycle()
+            ghost_id = bot.order_client_prefix + "otherpair"
+            ghost = exchange.create_order(
+                "ETH/USDT", "limit", "sell", 0.2, 200,
+                {"newClientOrderId": ghost_id},
+            )
+            bot._last_full_book_audit = grid_main.time.monotonic() - 301
+            with patch.object(exchange, "cancel_order", wraps=exchange.cancel_order) as cancel:
+                with self.assertRaisesRegex(TradingHalt, "ghost orders"):
+                    bot.run_cycle()
+            cancel.assert_any_call(ghost["id"], "ETH/USDT")
+            self.assertEqual(exchange.orders[ghost_id]["status"], "canceled")
+
+    def test_failed_cross_pair_ghost_cleanup_keeps_durable_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            ghost_id = bot.order_client_prefix + "otherpair"
+            exchange.create_order(
+                "ETH/USDT", "limit", "sell", 0.2, 200,
+                {"newClientOrderId": ghost_id},
+            )
+            bot.database.require_order_cleanup("Restart cleanup")
+            with patch.object(exchange, "cancel_order",
+                              side_effect=ccxt.NetworkError("offline")):
+                with self.assertRaisesRegex(TradingHalt, "Cancellation unverified"):
+                    bot.reconcile_idle_orders()
+            self.assertEqual(bot.database.get_state(
+                grid_main.ENGINE_STOP_CLEANUP_KEY), "1")
+            self.assertIn(ghost_id, bot.database.get_state(
+                grid_main.GHOST_ORDER_ALARM_KEY))
+            self.assertEqual(exchange.orders[ghost_id]["status"], "open")
+
+    def test_lost_runner_lease_blocks_next_trading_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.acquire_runner_lease()
+            bot.database.release_runner_lease(bot._runner_token, bot._runner_epoch)
+            successor = GridDatabase(path)
+            self.assertIsNotNone(successor.acquire_runner_lease("successor"))
+            with self.assertRaisesRegex(grid_main.RunnerLeaseLost, "lease was lost"):
+                bot.run_cycle()
+            self.assertEqual(exchange.orders, {})
+
+    def test_lost_runner_lease_blocks_stop_controller_exchange_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path)
+            bot.acquire_runner_lease()
+            bot.run_cycle()
+            bot.run_cycle()
+            self.assertTrue(exchange.fetch_open_orders("BTC/USDT"))
+            bot.database.release_runner_lease(bot._runner_token, bot._runner_epoch)
+            self.assertIsNotNone(GridDatabase(path).acquire_runner_lease("successor"))
+            result = bot.stop_controller.cancel_tracked_orders()
+            self.assertGreater(result.unresolved, 0)
+            self.assertEqual(exchange.cancel_calls, [])
 
     def test_ready_boot_preserves_halted_completed_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -389,7 +503,7 @@ class GridBotTests(unittest.TestCase):
                 self.assertEqual(grid_main.main(), 0)
             self.assertTrue(services.await_args.kwargs["ready"])
             self.assertTrue(services.await_args.args[0].ready_mode)
-            self.assertEqual(database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY), "1")
+            self.assertIsNone(database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY))
 
     def test_direct_boot_rejects_exchange_order_missing_from_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

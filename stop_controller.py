@@ -27,6 +27,7 @@ class StopController:
         database: GridDatabase,
         symbol: str,
         exchange_lock: Optional[Any] = None,
+        exchange_guard: Optional[Callable[[], None]] = None,
     ) -> None:
         self.exchange = exchange
         self.database = database
@@ -34,9 +35,12 @@ class StopController:
         self.stop_requested = Event()
         self._lock = Lock()
         self.exchange_lock = exchange_lock or RLock()
+        self.exchange_guard = exchange_guard
 
     def _exchange_call(self, method: Any, *args: Any) -> Any:
         with self.exchange_lock:
+            if self.exchange_guard is not None:
+                self.exchange_guard()
             return method(*args)
 
     def request_stop(self) -> StopResult:

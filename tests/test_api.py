@@ -204,6 +204,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "trading_state": "IDLE", "engine_status": "IDLE",
                     "engine_fault": None, "pending_grid": None,
                     "order_cleanup_required": False, "unresolved_order_alarm": None,
+                    "ghost_order_alarm": None,
                     "has_grid_run": False,
                     "grid_levels": 0,
                     "exact_grid_recenter_supported": True,
@@ -304,6 +305,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "trading_state": "ACTIVE", "engine_status": "RUNNING",
             "engine_fault": None, "pending_grid": None,
             "order_cleanup_required": False, "unresolved_order_alarm": None,
+            "ghost_order_alarm": None,
             "has_grid_run": False,
             "grid_levels": 2,
             "exact_grid_recenter_supported": True,
@@ -1115,6 +1117,17 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.01)
 
         class FakeBot:
+            _runner_lease_lost = False
+
+            def acquire_runner_lease(self):
+                pass
+
+            def renew_runner_lease(self):
+                return True
+
+            def release_runner_lease(self):
+                pass
+
             def _reconcile_state(self):
                 return {"resumable": False, "unhedged_btc": Decimal(0)}
 
@@ -1143,6 +1156,16 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeBot:
             ran = False
+            _runner_lease_lost = False
+
+            def acquire_runner_lease(self):
+                pass
+
+            def renew_runner_lease(self):
+                return True
+
+            def release_runner_lease(self):
+                pass
 
             def _reconcile_state(self):
                 return {"resumable": False, "unhedged_btc": Decimal(0)}

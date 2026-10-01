@@ -65,6 +65,10 @@ LIQUIDATED = "LIQUIDATED"
 LIQUIDATION_HALTED = "HALTED"
 LIQUIDATION_KEY = "hard_stop_liquidation"
 LIQUIDATION_ALARM_KEY = "hard_stop_alarm"
+GHOST_ORDER_ALARM_KEY = "ghost_order_alarm"
+RUNNER_LEASE_TTL_SECONDS = 30
+RUNNER_LEASE_RENEW_SECONDS = 5
+FULL_BOOK_AUDIT_SECONDS = 300
 RISK_OVERRIDE_DENIED = (
     "Risk Override Denied: The requested hard stop is lower than the active "
     "trailing floor. The stop loss can only move up."
@@ -467,6 +471,7 @@ def bot_status() -> Dict[str, Any]:
                              bot.database.get_state(ORDER_CLEANUP_ALARM_KEY)),
             "order_cleanup_required": bot.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1",
             "unresolved_order_alarm": bot.database.get_state(ORDER_CLEANUP_ALARM_KEY),
+            "ghost_order_alarm": bot.database.get_state(GHOST_ORDER_ALARM_KEY),
             "has_grid_run": False, "grid_levels": 0,
             "exact_grid_recenter_supported": True,
             "lower_bound": None, "upper_bound": None,
@@ -486,6 +491,7 @@ def bot_status() -> Dict[str, Any]:
             "safety_pause": "Stopped", "pause_mode": None,
             "trading_state": "STOPPED", "engine_status": ENGINE_IDLE,
             "order_cleanup_required": False, "unresolved_order_alarm": None,
+            "ghost_order_alarm": None,
             "has_grid_run": False, "grid_levels": 0,
             "exact_grid_recenter_supported": False,
             "lower_bound": None, "upper_bound": None,
@@ -566,6 +572,7 @@ def bot_status() -> Dict[str, Any]:
                          database.get_state(LIQUIDATION_ALARM_KEY)),
         "order_cleanup_required": database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1",
         "unresolved_order_alarm": database.get_state(ORDER_CLEANUP_ALARM_KEY),
+        "ghost_order_alarm": database.get_state(GHOST_ORDER_ALARM_KEY),
         "pending_grid": pending_grid,
         "has_grid_run": database.get_state("grid_run") is not None,
         "trading_state": "ACCOUNT_CLEARED" if manual_account_exit else safety_mode if safety_mode in (
@@ -912,6 +919,10 @@ class LiquidationPending(RuntimeError):
     """BTC is still exposed; retry reconciliation without declaring success."""
 
 
+class RunnerLeaseLost(TradingHalt):
+    """This process no longer owns the durable trading fence."""
+
+
 def _decimal(value: Any, name: str) -> Decimal:
     if isinstance(value, bool) or value is None:
         raise ValueError(f"Set grid.{name} to a positive number in config.json.")
@@ -1091,14 +1102,14 @@ def _pnl_fee_in_quote(
 
 
 class GridBot:
-    def __init__(self, config: GridConfig, exchange: Any, database: GridDatabase) -> None:
+    def __init__(self, config: GridConfig, exchange: Any, database: GridDatabase,
+                 *, runner_token: Optional[str] = None) -> None:
         self.config = config
         self.exchange = exchange
         self.database = database
-        order_prefix = self.database.get_state(ORDER_CLIENT_PREFIX_KEY)
-        if order_prefix is None:
-            order_prefix = ORDER_CLIENT_PREFIX + uuid.uuid4().hex[:8]
-            self.database.set_state(ORDER_CLIENT_PREFIX_KEY, order_prefix)
+        order_prefix = self.database.get_or_create_state(
+            ORDER_CLIENT_PREFIX_KEY, ORDER_CLIENT_PREFIX + uuid.uuid4().hex[:8]
+        )
         if (not order_prefix.startswith(ORDER_CLIENT_PREFIX) or
                 len(order_prefix) != len(ORDER_CLIENT_PREFIX) + 8 or
                 not order_prefix.isalnum()):
@@ -1106,7 +1117,8 @@ class GridBot:
         self.order_client_prefix = order_prefix
         self.exchange_lock = RLock()
         self.stop_controller = StopController(
-            exchange, database, config.symbol, self.exchange_lock
+            exchange, database, config.symbol, self.exchange_lock,
+            exchange_guard=self.assert_runner_lease,
         )
         self.market: Dict[str, Any] = {}
         self.anchor: Optional[Decimal] = None
@@ -1142,6 +1154,50 @@ class GridBot:
         self.grid_activation_requested = False
         self.ready_mode = False
         self.reconciled_orders: Dict[str, Dict[str, Any]] = {}
+        self._runner_token = runner_token or uuid.uuid4().hex
+        self._runner_epoch: Optional[int] = None
+        self._lease_required = False
+        self._runner_lease_lost = False
+        self._last_full_book_audit = 0.0
+
+    def acquire_runner_lease(self) -> None:
+        epoch = self.database.acquire_runner_lease(
+            self._runner_token, ttl_seconds=RUNNER_LEASE_TTL_SECONDS
+        )
+        if epoch is None:
+            raise RunnerLeaseLost("Another process holds the trading runner lease.")
+        if self._runner_epoch is not None and epoch != self._runner_epoch:
+            self._runner_lease_lost = True
+            raise RunnerLeaseLost("The trading runner lease expired before renewal.")
+        self._runner_epoch = epoch
+        self._lease_required = True
+
+    def renew_runner_lease(self) -> bool:
+        if self._runner_epoch is None or self._runner_lease_lost:
+            return False
+        renewed = self.database.renew_runner_lease(
+            self._runner_token, self._runner_epoch,
+            ttl_seconds=RUNNER_LEASE_TTL_SECONDS,
+        )
+        if not renewed:
+            self._runner_lease_lost = True
+            self.stop_controller.stop_requested.set()
+        return renewed
+
+    def assert_runner_lease(self) -> None:
+        if not self._lease_required:
+            return  # Standalone read-only helpers and existing test harnesses.
+        if (self._runner_lease_lost or self._runner_epoch is None or
+                not self.database.runner_lease_valid(
+                    self._runner_token, self._runner_epoch)):
+            self._runner_lease_lost = True
+            self.stop_controller.stop_requested.set()
+            raise RunnerLeaseLost("Trading runner lease was lost; refusing exchange actions.")
+
+    def release_runner_lease(self) -> None:
+        if self._runner_epoch is not None:
+            self.database.release_runner_lease(self._runner_token, self._runner_epoch)
+            self._runner_epoch = None
 
     def _reconcile_state(self) -> Dict[str, Any]:
         """Verify the Testnet order book and wallet before ordinary trading resumes.
@@ -1150,17 +1206,21 @@ class GridBot:
         every normal trading cycle still fetches live order status by saved ID.
         """
         with self._cycle_lock:
+            self.assert_runner_lease()
             if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
                 return {"resumable": False, "unhedged_btc": Decimal(0)}
             try:
                 self._load_market_for_engine_control()
-                live = self._live_open_orders()
+                account_live = self._full_account_open_orders()
+                tracked = self.database.fetch_active_grids()
+                self._audit_open_order_drift(account_live, tracked)
+                live = [order for order in account_live if
+                        order.get("symbol") in (None, self.config.symbol)]
                 balances = self.wallet_balances()
                 base = self.market["base"]
                 free = balances[base]["free"]
                 if free is None:
                     raise TradingHalt("Binance did not return a free BTC balance.")
-                tracked = self.database.fetch_active_grids()
                 if tracked and not self.database.get_state("grid_run"):
                     raise TradingHalt("Open grid rows exist without a saved grid run.")
                 by_client: Dict[str, Dict[str, Any]] = {}
@@ -1214,11 +1274,6 @@ class GridBot:
                                                             str(order["id"]))
                     restored[row["order_id"]] = order
 
-                for order in live:
-                    client_id = self._client_order_id(order)
-                    if (client_id and client_id.startswith(self.order_client_prefix) and
-                            order not in restored.values()):
-                        raise TradingHalt("A bot-owned Binance order is missing from SQLite.")
                 locked = balances[base]["used"]
                 if locked is not None:
                     bot_sell_remaining = sum((
@@ -1250,6 +1305,8 @@ class GridBot:
                             for order in restored.values()
                             if str(order.get("side", "")).lower() == "sell"
                         ), Decimal(0))}
+            except RunnerLeaseLost:
+                raise
             except Exception as error:
                 message = ("State reconciliation failed: " + str(error) +
                            " Manual intervention is required.")
@@ -1286,6 +1343,7 @@ class GridBot:
             sell_grid_levels=grid_levels // 2,
         )
         with self._cycle_lock:
+            self.assert_runner_lease()
             if (self.grid_activation_requested or
                     self.database.get_state("grid_run") is not None or
                     self.database.get_state("grid_reset") is not None or
@@ -1348,6 +1406,7 @@ class GridBot:
     def factory_reset(self) -> None:
         """Stop trading and clear history only after a fail-closed safety check."""
         with self._cycle_lock:
+            self.assert_runner_lease()
             with self._grid_lock:
                 mode = self.database.get_state(SAFETY_MODE_KEY)
                 if mode in (LIQUIDATING, LIQUIDATION_HALTED):
@@ -1473,6 +1532,86 @@ class GridBot:
             raise TradingHalt("Exchange returned an invalid open-order list.")
         return orders
 
+    def _full_account_open_orders(self) -> List[Dict[str, Any]]:
+        orders = self._call(self.exchange.fetch_open_orders)
+        if not isinstance(orders, list):
+            raise TradingHalt("Binance returned an invalid account open-order list.")
+        return orders
+
+    def _audit_open_order_drift(
+        self, live: List[Dict[str, Any]], tracked: List[Dict[str, Any]],
+    ) -> None:
+        """Cancel a bot-tagged open order absent from the active SQLite ledger."""
+        ghosts: List[Dict[str, Any]] = []
+        for order in live:
+            if not isinstance(order, dict):
+                raise TradingHalt("Binance returned an invalid open order.")
+            client_id = self._client_order_id(order)
+            if not client_id or not client_id.startswith(self.order_client_prefix):
+                continue
+            exchange_id = order.get("id")
+            if any(
+                row.get("client_order_id") == client_id and
+                order.get("symbol") in (None, self.config.symbol) and
+                (row.get("exchange_order_id") is None or
+                 str(row["exchange_order_id"]) == str(exchange_id))
+                for row in tracked
+            ):
+                continue
+            ghosts.append(order)
+        if not ghosts:
+            return
+        ids = ", ".join(self._client_order_id(order) or "unknown" for order in ghosts)
+        message = f"Bot-owned Binance ghost orders absent from active SQLite: {ids}."
+        self.database.set_state(GHOST_ORDER_ALARM_KEY, message)
+        LOGGER.critical("%s Canceling them and halting for reconciliation.", message)
+        unresolved = []
+        for order in ghosts:
+            exchange_id = order.get("id")
+            if exchange_id is None:
+                unresolved.append(self._client_order_id(order) or "unknown")
+                continue
+            try:
+                self._call(self.exchange.cancel_order, str(exchange_id),
+                           order.get("symbol") or self.config.symbol)
+            except RunnerLeaseLost:
+                raise
+            except ccxt.OrderNotFound:
+                pass  # A fill or another cancellation may have won the race.
+            except Exception as error:
+                LOGGER.error("Ghost order %s cancellation failed: %s",
+                             exchange_id, type(error).__name__)
+                unresolved.append(self._client_order_id(order) or str(exchange_id))
+        try:
+            remaining = self._full_account_open_orders()
+            open_ids = {self._client_order_id(order) for order in remaining}
+            unresolved.extend(
+                self._client_order_id(order) or "unknown" for order in ghosts
+                if self._client_order_id(order) in open_ids
+            )
+        except RunnerLeaseLost:
+            raise
+        except Exception as error:
+            LOGGER.error("Ghost order verification failed: %s", type(error).__name__)
+            unresolved.append("exchange verification")
+        if unresolved:
+            raise TradingHalt(message + " Cancellation unverified: " +
+                              ", ".join(sorted(set(unresolved))))
+        raise TradingHalt(message + " Cancellation verified; review fills before restart.")
+
+    def _audit_full_book_if_due(self) -> None:
+        """Scan all account Spot open orders, not saved IDs or one symbol only."""
+        if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
+            return  # The liquidation state machine owns its in-flight market order.
+        now = time.monotonic()
+        if self._last_full_book_audit and (
+                now - self._last_full_book_audit < FULL_BOOK_AUDIT_SECONDS):
+            return
+        self.assert_runner_lease()
+        live = self._full_account_open_orders()
+        self._audit_open_order_drift(live, self.database.fetch_active_grids())
+        self._last_full_book_audit = now
+
     @staticmethod
     def _client_order_id(order: Dict[str, Any]) -> Optional[str]:
         info = order.get("info")
@@ -1506,6 +1645,7 @@ class GridBot:
         limit_only: bool = False,
     ) -> Tuple[List[Tuple[str, Tuple[str, ...]]], bool]:
         """Cancel only this bot's live orders and verify tracked SQLite rows."""
+        self.assert_runner_lease()
         with self.stop_controller._lock:
             tracked = self.database.fetch_active_grids()
             known_orders = self.database.fetch_all_orders()
@@ -1624,6 +1764,7 @@ class GridBot:
         except ValueError as error:
             raise ValueError("Enter a valid positive stop-loss price.") from error
         with self._cycle_lock, self._grid_lock:
+            self.assert_runner_lease()
             if self.database.get_state(SAFETY_MODE_KEY) in (
                     LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
                 raise TradingHalt("Hard-stop liquidation has locked grid settings.")
@@ -1730,6 +1871,7 @@ class GridBot:
             if requested_stop >= lower:
                 raise ValueError("Pause trigger must be below the projected lower bound.")
         with self._cycle_lock:
+            self.assert_runner_lease()
             with self._grid_lock:
                 if self.stop_controller.stop_requested.is_set():
                     raise TradingHalt("Bot is stopping; grid was not changed.")
@@ -1929,7 +2071,9 @@ class GridBot:
         return False
 
     def _call(self, method: Any, *args: Any) -> Any:
+        self.assert_runner_lease()
         with self.exchange_lock:
+            self.assert_runner_lease()
             return method(*args)
 
     def _ticker_price(self) -> Decimal:
@@ -1942,6 +2086,7 @@ class GridBot:
     def advance_trailing_stop(self, price: Decimal) -> None:
         """Persist a new high and raised liquidation floor as one grid update."""
         with self._cycle_lock, self._grid_lock:
+            self.assert_runner_lease()
             if self.high_water_mark is None or self.stop_loss_distance is None:
                 raise TradingHalt("Trailing stop was not initialized.")
             if price <= self.high_water_mark:
@@ -2316,6 +2461,7 @@ class GridBot:
     ) -> Optional[str]:
         client_id = self.order_client_prefix + uuid.uuid4().hex[:20]
         with self.exchange_lock:
+            self.assert_runner_lease()
             liquidation = order_type == "MARKET" and side == "SELL" and level == -1
             if self.stop_controller.stop_requested.is_set() and not liquidation:
                 raise TradingHalt("Stop was requested before order submission.")
@@ -2325,6 +2471,7 @@ class GridBot:
                 order_type=order_type,
             )
             try:
+                self.assert_runner_lease()
                 params = {"newClientOrderId": client_id}
                 if order_type == "LIMIT":
                     params["timeInForce"] = "PO"
@@ -2724,6 +2871,7 @@ class GridBot:
 
     def reset_grid(self) -> bool:
         with self._cycle_lock:
+            self.assert_runner_lease()
             return self._reset_grid_locked()
 
     def _reset_grid_locked(self) -> bool:
@@ -3312,11 +3460,13 @@ class GridBot:
 
     def liquidate(self, price: Decimal) -> None:
         with self._cycle_lock:
+            self.assert_runner_lease()
             self._liquidate_locked(price)
 
     def set_manual_pause(self, active: bool) -> Optional[str]:
         """Persist a manual pause and use the existing targeted BUY cancellation."""
         with self._cycle_lock:
+            self.assert_runner_lease()
             if self.stop_controller.stop_requested.is_set() or self.grid_needs_reset:
                 raise TradingHalt("Bot is stopping or resetting its grid.")
             mode = self.database.get_state(SAFETY_MODE_KEY)
@@ -3356,6 +3506,7 @@ class GridBot:
     def prepare_factory_reset(self) -> Dict[str, Any]:
         """Persist a no-placement state before canceling both bot order sides."""
         with self._cycle_lock:
+            self.assert_runner_lease()
             if self.stop_controller.stop_requested.is_set() or self.grid_needs_reset:
                 raise TradingHalt("Bot is stopping or resetting its grid.")
             mode = self.database.get_state(SAFETY_MODE_KEY)
@@ -3390,6 +3541,7 @@ class GridBot:
     def reconcile_idle_orders(self) -> None:
         """Retry cleanup until the bot-owned Binance book and ledger are flat."""
         with self._cycle_lock:
+            self.assert_runner_lease()
             if (self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE or
                     self.database.get_state(ENGINE_STOP_CLEANUP_KEY) != "1"):
                 return
@@ -3399,7 +3551,10 @@ class GridBot:
             self._load_market_for_engine_control()
             _, complete = self._cancel_bot_orders()
             known_orders = self.database.fetch_all_orders()
-            exchange_orders = self._live_open_orders()
+            exchange_orders = self._full_account_open_orders()
+            self._audit_open_order_drift(
+                exchange_orders, self.database.fetch_active_grids()
+            )
             if (not complete or self.database.fetch_active_grids() or
                     any(self._is_bot_order(order, known_orders)
                         for order in exchange_orders)):
@@ -3409,6 +3564,7 @@ class GridBot:
     def halt_after_fault(self, reason: str) -> bool:
         """Stop placement, persist the alarm, and verify exchange cleanup."""
         with self._cycle_lock:
+            self.assert_runner_lease()
             result = self.stop_controller.request_stop()
             if result.unresolved:
                 LOGGER.error("Fault stop left %s tracked orders unresolved.",
@@ -3423,6 +3579,7 @@ class GridBot:
     def stop_engine(self) -> Dict[str, Any]:
         """Persist IDLE before canceling and reconciling every bot-owned grid order."""
         with self._cycle_lock:
+            self.assert_runner_lease()
             mode = self.database.get_state(SAFETY_MODE_KEY)
             if mode in (
                     LIQUIDATING, LIQUIDATION_HALTED):
@@ -3448,6 +3605,7 @@ class GridBot:
                      pending_grid_token: Optional[str] = None) -> Dict[str, Any]:
         """Reconcile first; resume matched orders or queue a guarded rebuild."""
         with self._cycle_lock:
+            self.assert_runner_lease()
             if self.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
                 raise TradingHalt("A prior stop still needs Binance order cleanup.")
             state = self._reconcile_state()
@@ -3564,9 +3722,11 @@ class GridBot:
 
     def run_cycle(self) -> List[Tuple[str, Tuple[str, ...]]]:
         with self._cycle_lock:
+            self.assert_runner_lease()
             if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_IDLE:
                 return []
             try:
+                self._audit_full_book_if_due()
                 return self._run_cycle_locked()
             except GridSizingError as error:
                 self._pause_for_order_sizing(error)
@@ -3780,6 +3940,7 @@ class GridBot:
             self.database.clear_state(LIQUIDATION_NOTICE_KEY)
 
     async def run(self, notifier: TelegramNotifier) -> None:
+        self.assert_runner_lease()
         if self.ready_mode and self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_RUNNING:
             return
         initial_request_text = self.database.get_state("grid_reset")
@@ -3812,12 +3973,14 @@ class GridBot:
                     LOGGER.warning("Startup alert failed: %s", type(error).__name__)
             backoff = 1
             while True:
+                self.assert_runner_lease()
                 if self.stop_controller.stop_requested.is_set():
                     break
                 if (self.ready_mode and
                         self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_RUNNING):
                     return
                 try:
+                    await asyncio.to_thread(self._audit_full_book_if_due)
                     mode = self.database.get_state(SAFETY_MODE_KEY)
                     if mode in (LIQUIDATED, LIQUIDATION_HALTED):
                         await self._notify_liquidation(notifier)
@@ -3895,6 +4058,8 @@ class GridBot:
                         await self._notify_safety_state(notifier)
                     delay = min(backoff, 60)
                     backoff = min(backoff * 2, 60)
+                except RunnerLeaseLost:
+                    raise
                 except Exception as error:
                     if self.grid_needs_reset:
                         self.database.set_state("halt_reason", "grid_reset_failed")
@@ -3978,8 +4143,17 @@ def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> Gri
 async def _reconcile_service_boot(bot: GridBot, *, ready: bool) -> None:
     """Verify the exchange before either service mode can run a trading loop."""
     if ready:
+        bot.assert_runner_lease()
+        if bot.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
+            bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
+        else:
+            bot.database.require_order_cleanup(
+                "Ready-mode restart; Binance order cleanup is unverified."
+            )
         try:
             await asyncio.to_thread(bot._reconcile_state)
+        except RunnerLeaseLost:
+            raise
         except TradingHalt:
             # Keep the dashboard available so its engine_fault explains why
             # START is locked. Reconciliation has persisted cleanup-required.
@@ -3999,6 +4173,8 @@ async def _reconcile_service_boot(bot: GridBot, *, ready: bool) -> None:
         # Direct execution also needs a full exchange/ledger boot check.
         try:
             await asyncio.to_thread(bot._reconcile_state)
+        except RunnerLeaseLost:
+            raise
         except TradingHalt:
             try:
                 await asyncio.to_thread(bot.reconcile_idle_orders)
@@ -4009,6 +4185,8 @@ async def _reconcile_service_boot(bot: GridBot, *, ready: bool) -> None:
 
 async def _ensure_fault_cleanup(bot: GridBot, error: Exception) -> None:
     """Cover failures before and inside run(), including direct execution."""
+    if isinstance(error, RunnerLeaseLost):
+        return  # A newer owner is responsible; the fenced process must not cancel.
     if bot.stop_controller.stop_requested.is_set():
         if bot.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
             try:
@@ -4021,8 +4199,37 @@ async def _ensure_fault_cleanup(bot: GridBot, error: Exception) -> None:
         await asyncio.to_thread(bot.halt_after_fault, type(error).__name__)
 
 
+async def _runner_heartbeat(bot: GridBot) -> None:
+    while True:
+        await asyncio.sleep(RUNNER_LEASE_RENEW_SECONDS)
+        try:
+            if await asyncio.to_thread(bot.renew_runner_lease):
+                continue
+        except Exception:
+            LOGGER.exception("Trading runner lease renewal failed.")
+        bot._runner_lease_lost = True
+        bot.stop_controller.stop_requested.set()
+        LOGGER.critical("Trading runner lease lost; this process is fenced out.")
+        return
+
+
 async def _run_services(bot: GridBot, notifier: Optional[TelegramNotifier],
                         *, ready: bool = False) -> None:
+    """Own the SQLite runner fence throughout API and trading service lifetime."""
+    bot.acquire_runner_lease()
+    heartbeat = asyncio.create_task(_runner_heartbeat(bot), name="runner-lease")
+    try:
+        await _run_services_owned(bot, notifier, ready=ready)
+        if bot._runner_lease_lost:
+            raise RunnerLeaseLost("Trading runner lease was lost.")
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        bot.release_runner_lease()
+
+
+async def _run_services_owned(bot: GridBot, notifier: Optional[TelegramNotifier],
+                              *, ready: bool = False) -> None:
     """Run the local API and trading loop with outbound alerts only."""
     await _reconcile_service_boot(bot, ready=ready)
     if notifier is None:
@@ -4073,11 +4280,14 @@ async def _run_services(bot: GridBot, notifier: Optional[TelegramNotifier],
         if not ready:
             try:
                 await bot.run(notifier)
+            except RunnerLeaseLost:
+                raise
             except Exception as error:
                 await _ensure_fault_cleanup(bot, error)
                 raise
         else:
             while True:
+                bot.assert_runner_lease()
                 if api_task.done():
                     try:
                         await asyncio.to_thread(bot.stop_engine)
@@ -4090,6 +4300,8 @@ async def _run_services(bot: GridBot, notifier: Optional[TelegramNotifier],
                         if bot.stop_controller.stop_requested.is_set():
                             bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
                             bot.database.set_state(ENGINE_FAULT_KEY, "ProcessStopping")
+                    except RunnerLeaseLost:
+                        raise
                     except Exception as error:
                         LOGGER.exception("Trading engine faulted; dashboard stays online.")
                         await _ensure_fault_cleanup(bot, error)
@@ -4124,6 +4336,19 @@ async def _run_services(bot: GridBot, notifier: Optional[TelegramNotifier],
 
 
 async def _run_standby_services(bot: GridBot) -> None:
+    bot.acquire_runner_lease()
+    heartbeat = asyncio.create_task(_runner_heartbeat(bot), name="runner-lease")
+    try:
+        await _run_standby_services_owned(bot)
+        if bot._runner_lease_lost:
+            raise RunnerLeaseLost("Trading runner lease was lost.")
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        bot.release_runner_lease()
+
+
+async def _run_standby_services_owned(bot: GridBot) -> None:
     """Wait for an explicit grid request while serving the API and market data."""
     app.state.grid_bot = bot
     app.state.standby = True
@@ -4138,6 +4363,7 @@ async def _run_standby_services(bot: GridBot) -> None:
     api_task = asyncio.create_task(server.serve(), name="standby-api")
     try:
         while not bot.grid_activation_requested:
+            bot.assert_runner_lease()
             if api_task.done():
                 await api_task
                 raise TradingHalt("Standby API stopped before grid activation.")
@@ -4152,6 +4378,8 @@ async def _run_standby_services(bot: GridBot) -> None:
             raise
         try:
             await bot.run(notifier)
+        except RunnerLeaseLost:
+            raise
         except Exception as error:
             await _ensure_fault_cleanup(bot, error)
             raise
@@ -4202,13 +4430,6 @@ def main() -> int:
                       if existing_run else GridConfig.load())
             bot = GridBot(config, exchange, database)
             bot.ready_mode = True
-            # Persist cleanup before entering IDLE. The service verifies it
-            # against Binance before the dashboard accepts START.
-            if database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
-                database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
-            else:
-                database.require_order_cleanup(
-                    "Ready-mode restart; Binance order cleanup is unverified.")
             asyncio.run(_run_services(bot, None, ready=True))
             return 0
         if arguments.standby:
@@ -4220,9 +4441,6 @@ def main() -> int:
                 config = _apply_active_grid_config(GridConfig.load(), database)
                 bot = GridBot(config, exchange, database)
                 bot.ready_mode = True
-                if database.get_state(SAFETY_MODE_KEY) != LIQUIDATING:
-                    database.require_order_cleanup(
-                        "Standby restart; Binance order cleanup is unverified.")
                 asyncio.run(_run_services(bot, None, ready=True))
             else:
                 if (any(database.get_state(key) is not None for key in (
@@ -4238,29 +4456,40 @@ def main() -> int:
         key, secret = _credentials()
         exchange = create_exchange(key, secret)
         database = GridDatabase()
-        _center_config_at_current_price(exchange, database)
-        config = _apply_active_grid_config(GridConfig.load(), database)
-        bot = GridBot(config, exchange, database)
-        if arguments.check:
-            current, planned, upper_planned = bot.prepare(persist=False)
-            print(f"Spot Testnet {config.symbol}: current={current}, anchor={bot.anchor}")
-            print(f"Seed market buy: {bot._seed_quote()} {bot.market['quote']}")
-            print(f"Geometric lower buy levels: {len(planned)}")
-            for level, price, amount in planned:
-                print(f"  {level}: buy {amount} at {price}")
-            print(f"Geometric upper sell levels: {len(upper_planned)}")
-            for level, price, amount in upper_planned:
-                print(f"  {level}: sell {amount} at {price}")
-            print(
-                "Total planned quote: "
-                f"{bot._seed_quote() + sum((p * a for _, p, a in planned), Decimal(0))}"
-            )
+        runner_token = uuid.uuid4().hex
+        runner_epoch = database.acquire_runner_lease(
+            runner_token, ttl_seconds=RUNNER_LEASE_TTL_SECONDS
+        )
+        if runner_epoch is None:
+            raise RunnerLeaseLost("Another process holds the trading runner lease.")
+        try:
+            _center_config_at_current_price(exchange, database)
+            config = _apply_active_grid_config(GridConfig.load(), database)
+            bot = GridBot(config, exchange, database, runner_token=runner_token)
+            bot._runner_epoch = runner_epoch
+            bot._lease_required = True
+            if arguments.check:
+                current, planned, upper_planned = bot.prepare(persist=False)
+                print(f"Spot Testnet {config.symbol}: current={current}, anchor={bot.anchor}")
+                print(f"Seed market buy: {bot._seed_quote()} {bot.market['quote']}")
+                print(f"Geometric lower buy levels: {len(planned)}")
+                for level, price, amount in planned:
+                    print(f"  {level}: buy {amount} at {price}")
+                print(f"Geometric upper sell levels: {len(upper_planned)}")
+                for level, price, amount in upper_planned:
+                    print(f"  {level}: sell {amount} at {price}")
+                print(
+                    "Total planned quote: "
+                    f"{bot._seed_quote() + sum((p * a for _, p, a in planned), Decimal(0))}"
+                )
+                return 0
+            if database.get_state(ENGINE_STATUS_KEY) in (ENGINE_IDLE, ENGINE_HALTED) or (
+                    database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1"):
+                raise TradingHalt("Saved engine is IDLE, HALTED, or needs cleanup; use --ready.")
+            asyncio.run(_run_services(bot, None))
             return 0
-        if database.get_state(ENGINE_STATUS_KEY) in (ENGINE_IDLE, ENGINE_HALTED) or (
-                database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1"):
-            raise TradingHalt("Saved engine is IDLE, HALTED, or needs cleanup; use --ready.")
-        asyncio.run(_run_services(bot, None))
-        return 0
+        finally:
+            database.release_runner_lease(runner_token, runner_epoch)
     except ccxt.NetworkError as error:
         print(f"Bot stopped: {error}", file=sys.stderr)
         return 1
