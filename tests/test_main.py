@@ -255,7 +255,7 @@ class GridBotTests(unittest.TestCase):
                     "poll_seconds": 2,
                 },
             }), encoding="utf-8")
-            database = GridDatabase(path / "grid.sqlite3")
+            database = GridDatabase(path / "grid_testnet.sqlite")
             database.set_state("active_grid_config", json.dumps({
                 "lower": "90", "upper": "130", "spacing": "2.5",
                 "stop_loss_price": "70",
@@ -282,7 +282,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_ready_entry_defers_idle_mutation_until_lease_is_acquired(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             config = GridConfig(
                 "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
                 Decimal("10"), Decimal("50"), Decimal("70"), 2,
@@ -310,7 +310,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_ready_boot_cancels_matched_orders_before_idle_is_safe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
             bot.run_cycle()
             bot.run_cycle()
@@ -331,7 +331,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_second_ready_service_refuses_before_changing_engine_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             owner, exchange = self.make_bot(path)
             owner.acquire_runner_lease()
             contender = GridBot(owner.config, exchange, GridDatabase(path))
@@ -351,7 +351,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_boot_reconciliation_propagates_lost_runner_lease(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.ready_mode = True
             with (patch.object(bot, "_reconcile_state",
                                side_effect=grid_main.RunnerLeaseLost("lease lost")),
@@ -363,7 +363,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_runtime_full_book_audit_cancels_untracked_bot_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             ghost_id = bot.order_client_prefix + "orphan"
@@ -381,7 +381,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_full_book_audit_catches_old_bot_prefix_on_another_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             ghost_id = bot.order_client_prefix + "otherpair"
@@ -398,7 +398,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_failed_cross_pair_ghost_cleanup_keeps_durable_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             ghost_id = bot.order_client_prefix + "otherpair"
             exchange.create_order(
                 "ETH/USDT", "limit", "sell", 0.2, 200,
@@ -417,7 +417,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_lost_runner_lease_blocks_next_trading_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.acquire_runner_lease()
             bot.database.release_runner_lease(bot._runner_token, bot._runner_epoch)
@@ -429,7 +429,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_lost_runner_lease_blocks_stop_controller_exchange_calls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.acquire_runner_lease()
             bot.run_cycle()
@@ -443,7 +443,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_ready_boot_preserves_halted_completed_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -463,7 +463,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_ready_boot_cleans_orders_before_loading_alert_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
             bot.run_cycle()
             bot.run_cycle()
@@ -483,7 +483,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_standby_with_saved_run_uses_ready_cleanup_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
             config = GridConfig(
                 "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
                 Decimal("10"), Decimal("50"), Decimal("70"), 2,
@@ -507,7 +507,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_direct_boot_rejects_exchange_order_missing_from_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3",
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite",
                                           initial_base=Decimal("0"))
             exchange.create_order(
                 "BTC/USDT", "limit", "buy", 0.2, 50,
@@ -534,7 +534,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_carried_inventory_never_uses_local_id_for_exchange_trade_lookup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             carry_id = "carry-test-local-id"
             bot.database.insert_order(
                 carry_id, 0, "BUY", "100", "0.500", order_type="MARKET",
@@ -567,7 +567,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_factory_reset_erases_history_and_keeps_trading_halted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.database.insert_order("old", 1, "BUY", "90", "0.01")
             bot.database.update_order_status("old", "CANCELED")
             bot.database.record_trade("80", "90", "0.1")
@@ -593,7 +593,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_factory_reset_rejects_exchange_orders_and_bot_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.database.record_trade("80", "90", "0.1")
             exchange.orders["manual"] = {"status": "open", "side": "buy"}
             with self.assertRaisesRegex(TradingHalt, "Active orders exist"):
@@ -613,7 +613,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_factory_reset_fails_closed_when_exchange_cannot_be_checked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.database.record_trade("80", "90", "0.1")
             exchange.fetch_open_orders = lambda _symbol: (_ for _ in ()).throw(
                 ccxt.NetworkError("Order query timed out")
@@ -629,7 +629,7 @@ class GridBotTests(unittest.TestCase):
                 Decimal("10"), Decimal("50"), Decimal("70"), 2,
             )
             exchange = FakeSpotExchange()
-            bot = GridBot(config, exchange, GridDatabase(Path(directory) / "grid.sqlite3"))
+            bot = GridBot(config, exchange, GridDatabase(Path(directory) / "grid_testnet.sqlite"))
             _, planned, _ = bot.prepare(persist=False)
             required_limits = sum((price * amount for _, price, amount in planned),
                                   Decimal(0))
@@ -654,7 +654,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_idle_bot_starts_only_after_explicit_grid_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             exchange = FakeSpotExchange()
             config = GridConfig(
                 "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
@@ -696,7 +696,7 @@ class GridBotTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             exchange = SpotPrecisionExchange()
-            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
             config = GridConfig(
                 "BTC/USDT", Decimal("1000"), Decimal("80050"), Decimal("86256"),
                 Decimal("2.5"), Decimal("50"), Decimal("79700"), 2,
@@ -709,7 +709,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_undersized_replacement_pauses_without_stopping_risk_monitor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -729,7 +729,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_approved_idle_grid_does_not_trade_after_price_drifts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             exchange = FakeSpotExchange()
             config = GridConfig(
                 "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
@@ -746,7 +746,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_idle_grid_rejects_insufficient_capital_without_orders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
             exchange = FakeSpotExchange()
             exchange.quote_free = Decimal("100")
             config = GridConfig(
@@ -761,7 +761,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_seed_fill_rechecks_buy_capital_before_any_limit_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()  # Seed market buy is filled, but no limit orders exist.
             exchange.quote_free = Decimal("1")
             with self.assertRaises(grid_main.InsufficientGridCapital):
@@ -773,7 +773,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_seed_fill_waits_for_enough_bot_btc_before_initial_sells(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             exchange.base_free = bot.baseline_base  # Seed balance is unavailable.
             bot.run_cycle()
@@ -784,7 +784,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_recenter_rejects_insufficient_free_quote_before_canceling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             old_ids = {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")}
@@ -804,7 +804,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_reset_balance_drift_places_no_replacement_orders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.request_manual_recenter("102", "25")
@@ -816,7 +816,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_market_price_and_confirmed_fills_support_portfolio_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             self.assertEqual(
                 bot.database.get_state(grid_main.LAST_MARKET_PRICE_KEY), "100"
             )
@@ -840,7 +840,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_trailing_stop_raises_only_and_survives_restart_before_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             original_config = bot.config
             bot.run_cycle()
@@ -871,7 +871,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_trailing_stop_cancels_unsafe_buys_without_resetting_breakout_clock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             self.assertTrue(any(order["side"] == "buy" for order in
@@ -899,7 +899,7 @@ class GridBotTests(unittest.TestCase):
             [Decimal("90.0"), Decimal("81.00")],
         )
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             first_buy = bot.database.fetch_latest_orders_by_level()[1]
@@ -933,7 +933,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_realized_pnl_deducts_standard_fees_when_exchange_omits_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             buy = bot.database.fetch_latest_orders_by_level()[1]
@@ -958,7 +958,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_realized_pnl_uses_reported_fees_without_estimate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             buy = bot.database.fetch_latest_orders_by_level()[1]
@@ -984,7 +984,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_filled_buy_sell_uses_net_execution_after_btc_commission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             buy = bot.database.fetch_latest_orders_by_level()[1]
@@ -1025,7 +1025,7 @@ class GridBotTests(unittest.TestCase):
                 buy_grid_levels=2, sell_grid_levels=2,
             )
             exchange = FakeSpotExchange()
-            bot = GridBot(config, exchange, GridDatabase(Path(directory) / "grid.sqlite3"))
+            bot = GridBot(config, exchange, GridDatabase(Path(directory) / "grid_testnet.sqlite"))
             bot.prepare(persist=True)
             bot.run_cycle()
             bot.run_cycle()
@@ -1041,7 +1041,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_filled_buy_waits_for_commission_and_free_btc_before_sell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             buy = bot.database.fetch_latest_orders_by_level()[1]
@@ -1068,7 +1068,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_definite_sell_balance_rejection_keeps_filled_buy_for_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             buy = bot.database.fetch_latest_orders_by_level()[1]
@@ -1090,7 +1090,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_upper_sell_rearms_buy_then_sell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             upper_sell = bot.database.fetch_latest_orders_by_level()[-1]
@@ -1110,7 +1110,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_replenishment_buy_waits_for_quote_and_retries_definite_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             upper_sell = bot.database.fetch_latest_orders_by_level()[-1]
@@ -1136,7 +1136,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_cancels_only_bot_orders_and_sells_only_bot_btc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -1205,7 +1205,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_pause_cancels_buys_keeps_sells_and_survives_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -1245,7 +1245,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_prepare_factory_reset_cancels_bot_orders_and_stays_paused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -1283,7 +1283,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_master_stop_and_start_rebuilds_without_touching_manual_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
             bot.ready_mode = True
             bot.run_cycle()
@@ -1333,7 +1333,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_restart_reconciles_matching_grid_without_new_orders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
             bot.run_cycle()
             bot.run_cycle()
@@ -1354,7 +1354,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_reconciliation_conflict_forces_idle_and_explains_fault(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
             bot.run_cycle()
             bot.run_cycle()
@@ -1371,7 +1371,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_ready_mode_keeps_new_grid_idle_until_master_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             exchange = FakeSpotExchange()
             exchange.base_free = Decimal("0")
             config = GridConfig(
@@ -1404,7 +1404,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_idle_pending_grid_can_be_replaced_before_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
             database.set_state(grid_main.ENGINE_STATUS_KEY, grid_main.ENGINE_IDLE)
             exchange = FakeSpotExchange()
             exchange.base_free = Decimal("0")
@@ -1429,7 +1429,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_master_stop_stays_idle_when_exchange_cancellation_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.ready_mode = True
             bot.run_cycle()
             bot.run_cycle()
@@ -1448,7 +1448,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_fault_stop_persists_alarm_until_exchange_cleanup_is_verified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3",
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite",
                                           initial_base=Decimal("0"))
             bot.run_cycle()
             bot.run_cycle()
@@ -1474,7 +1474,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_unpause_respects_downside_guard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.set_manual_pause(True)
@@ -1487,7 +1487,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_includes_partially_filled_buy_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             buy = bot.database.fetch_latest_orders_by_level()[1]
@@ -1510,7 +1510,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_retries_a_definite_insufficient_funds_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.market_sell_insufficient = True
@@ -1533,7 +1533,7 @@ class GridBotTests(unittest.TestCase):
     def test_hard_stop_never_resubmits_an_ambiguous_timed_out_sell(self) -> None:
         for timeout in ("before", "after"):
             with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as directory:
-                bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+                bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
                 bot.run_cycle()
                 bot.run_cycle()
                 exchange.market_sell_timeout = timeout
@@ -1559,7 +1559,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_waits_for_delayed_order_visibility_without_second_sale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.market_sell_timeout = "after"
@@ -1586,7 +1586,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_retries_definite_rate_limit_rejections(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.market_sell_rate_limits = 2
@@ -1604,7 +1604,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_resumes_market_exit_during_public_ticker_outage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.price = Decimal("69")
@@ -1620,7 +1620,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_reconciles_missing_exchange_id_without_second_sale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.market_sell_no_id_after_accept = True
@@ -1633,7 +1633,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_backs_off_after_rate_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.market_sell_rate_limits = 1
@@ -1646,7 +1646,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_sells_remaining_btc_after_partial_terminal_fill(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.market_sell_partial_once = True
@@ -1665,7 +1665,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_splits_market_sales_at_market_lot_maximum(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.market["info"] = {"filters": [
@@ -1688,7 +1688,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_treats_only_exchange_minimum_dust_as_unsellable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, _ = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, _ = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             self.assertEqual(bot._sellable_hard_stop_amount(
                 Decimal("0.0005"), Decimal("69")), Decimal(0))
             self.assertEqual(bot._sellable_hard_stop_amount(
@@ -1698,7 +1698,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_zero_residual_skips_exchange_precision_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             with patch.object(
                 exchange, "amount_to_precision",
                 side_effect=ccxt.InvalidOrder("below BTC precision"),
@@ -1717,7 +1717,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_caps_sell_at_fresh_free_balance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             original_cancel = bot._cancel_bot_orders
@@ -1746,7 +1746,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_keeps_unsellable_dust_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             client_id = bot.order_client_prefix + "b" * 20
             buy = exchange.create_order(
                 "BTC/USDT", "market", "buy", 0.1, None,
@@ -1770,7 +1770,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_balance_retry_does_not_count_confirmed_sale_twice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             original_balance = exchange.fetch_balance
@@ -1795,7 +1795,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_applies_limit_filters_and_requires_valid_balance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.market["info"] = {"filters": [
                 {"filterType": "LOT_SIZE", "minQty": "0.5", "stepSize": "0.1"},
                 {"filterType": "NOTIONAL", "minNotional": "50"},
@@ -1811,7 +1811,7 @@ class GridBotTests(unittest.TestCase):
     def test_hard_stop_verifies_timed_out_targeted_cancel(self) -> None:
         for timeout in ("before", "after"):
             with self.subTest(timeout=timeout), tempfile.TemporaryDirectory() as directory:
-                bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+                bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
                 bot.run_cycle()
                 bot.run_cycle()
                 exchange.cancel_timeout = timeout
@@ -1824,7 +1824,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_reconciles_order_filled_during_targeted_cancel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.cancel_not_found_once = True
@@ -1836,7 +1836,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_grid_order_ids_are_tagged_and_fit_binance_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             ids = [order["clientOrderId"] for order in exchange.orders.values()]
@@ -1846,7 +1846,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_recenter_preserves_unrelated_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             manual = exchange.create_order(
@@ -1861,8 +1861,9 @@ class GridBotTests(unittest.TestCase):
     def test_targeted_cancel_preserves_another_gridbot_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            bot, exchange = self.make_bot(path / "primary.sqlite3")
-            other = GridBot(bot.config, exchange, GridDatabase(path / "other.sqlite3"))
+            bot, exchange = self.make_bot(path / "grid_testnet.sqlite")
+            (path / "other").mkdir()
+            other = GridBot(bot.config, exchange, GridDatabase(path / "other" / "grid_testnet.sqlite"))
             self.assertNotEqual(bot.order_client_prefix, other.order_client_prefix)
             bot.run_cycle()
             bot.run_cycle()
@@ -1877,7 +1878,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_targeted_cancel_recognizes_nested_client_id_and_legacy_tracked_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             legacy_row = next(row for row in bot.database.fetch_active_grids()
@@ -1908,7 +1909,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_preempts_pending_grid_reset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.request_manual_recenter("102", "20", "30")
@@ -1922,7 +1923,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_restart_recovers_accepted_sell_without_duplicate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -1940,7 +1941,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_hard_stop_replaces_legacy_open_limit_with_market_on_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -1975,7 +1976,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_admin_recenter_resets_completed_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -1998,7 +1999,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_upper_breakout_timer_resets_on_dip_gap_and_restarts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path, width=Decimal("15"))
             self.assertEqual(bot.breakout_width_percent, Decimal("15"))
             self.assertFalse(bot._observe_upper_breakout(Decimal("121"), now=0))
@@ -2030,7 +2031,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_confirmed_breakout_recenters_without_selling_carried_btc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(
                 path, width=Decimal("15")
             )
@@ -2106,7 +2107,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_breakout_fade_before_cancellation_keeps_old_orders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             old_ids = {order["id"] for order in exchange.fetch_open_orders("BTC/USDT")}
@@ -2124,7 +2125,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_recenter_uses_saved_reset_and_carries_btc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -2166,7 +2167,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_recenter_updates_pause_trigger_after_reconciliation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -2195,7 +2196,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_recenter_places_exact_requested_levels_and_restores_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             original_config = bot.config
             bot.run_cycle()
@@ -2232,7 +2233,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_exact_grid_rejects_exchange_minimum_before_canceling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             with self.assertRaisesRegex(ValueError, "market minimum"):
@@ -2242,7 +2243,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_exact_grid_rejects_duplicate_exchange_price_ticks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             with self.assertRaisesRegex(ValueError, "price precision"):
@@ -2252,7 +2253,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_stale_exact_recenter_restores_old_capital_and_geometry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.request_manual_recenter("102", "20", "30", "1500", 15)
@@ -2271,7 +2272,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_recenter_cannot_lower_active_trailing_floor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.price = Decimal("110")
@@ -2284,7 +2285,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_queued_recenter_is_withdrawn_if_trailing_floor_rises(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.request_manual_recenter("102", "20", "30")
@@ -2297,7 +2298,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_stale_manual_recenter_keeps_original_pause_trigger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.request_manual_recenter("102", "20", "30")
@@ -2315,7 +2316,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_recenter_rejects_invalid_or_stale_request_without_canceling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             old_ids = {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")}
@@ -2335,7 +2336,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_recenter_market_drift_rebuilds_old_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.request_manual_recenter("102", "25")
@@ -2357,7 +2358,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_manual_recenter_does_not_override_safety_pause(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.set_manual_pause(True)
@@ -2367,7 +2368,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_breakout_fade_during_cancellation_rebuilds_old_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.price = Decimal("121")
@@ -2391,7 +2392,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_uncertain_submission_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             exchange.fail_create = True
             with self.assertRaises(UncertainOrderError):
                 bot.run_cycle()
@@ -2402,7 +2403,7 @@ class GridBotTests(unittest.TestCase):
     def test_post_only_rejection_skips_one_order_and_retries_next_cycle(self) -> None:
         for side, skipped_level in (("sell", -1), ("buy", 1)):
             with self.subTest(side=side), tempfile.TemporaryDirectory() as directory:
-                bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+                bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
                 bot.run_cycle()  # The seed market buy is deliberately not post-only.
                 exchange.reject_post_only_once = True
                 exchange.reject_post_only_side = side
@@ -2426,7 +2427,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_other_immediate_order_error_remains_uncertain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             with patch.object(
                 exchange, "create_order",
@@ -2437,7 +2438,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_setgrid_carries_btc_and_rebuilds_without_market_sale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             bot.run_cycle()
             bot.run_cycle()
@@ -2481,7 +2482,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_grid_reset_waits_after_post_only_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             bot.request_grid_reset("75", "125")
@@ -2497,7 +2498,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_setgrid_rejects_bad_bounds_without_canceling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             before = len(exchange.fetch_open_orders("BTC/USDT"))
@@ -2510,7 +2511,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_setstop_updates_saved_run_without_touching_orders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "grid.sqlite3"
+            path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path)
             original_config = bot.config
             bot.run_cycle()
@@ -2541,7 +2542,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_setstop_rejects_invalid_price_without_touching_orders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             original_ids = {row["id"] for row in exchange.fetch_open_orders("BTC/USDT")}
@@ -2560,7 +2561,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_status_counts_live_limit_orders_and_nearest_prices(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.orders["external-buy"] = {
@@ -2582,7 +2583,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_wallet_balances_reads_spot_free_and_used_without_trading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             with patch.object(exchange, "fetch_balance", return_value={
                 "USDT": {"free": "250.00", "used": "150.00"},
                 "BTC": {"free": "0.01234567", "used": "0.004"},
@@ -2609,7 +2610,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_orders_lists_all_live_orders_sorted_by_price(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             exchange.orders["external-buy"] = {
@@ -2636,7 +2637,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_reset_preserves_cost_basis_after_old_sell_fill(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             lower_buy = bot.database.fetch_latest_orders_by_level()[1]
@@ -2662,7 +2663,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_reset_pauses_if_carried_btc_cannot_fund_upper_sells(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3")
+            bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
             bot.run_cycle()
             bot.run_cycle()
             old_upper = bot.database.fetch_latest_orders_by_level()[-1]

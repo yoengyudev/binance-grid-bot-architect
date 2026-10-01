@@ -24,7 +24,7 @@ from database import GridDatabase
 class StatusApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_exposes_recorded_realized_pnl(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
             database.record_trade("100", "110", "9.79", sell_order_id="sell-1")
             grid_main.app.state.grid_bot = SimpleNamespace(
                 config=SimpleNamespace(symbol="BTC/USDT", stop_loss_price=70000),
@@ -45,7 +45,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_order_ledger_requires_admin_and_uses_saved_fill_price(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
             database.insert_order("buy-open", 1, "BUY", "82000", "0.02",
                                   client_order_id="gridbot-open")
             database.insert_order("sell-filled", -1, "SELL", "88000", "0.01",
@@ -190,7 +190,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_status_is_read_only_and_allows_dashboard_origin(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
             transport = httpx.ASGITransport(app=grid_main.app)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://testserver"
@@ -199,6 +199,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(grid_main, "GridDatabase", return_value=database):
                     offline = await client.get("/api/bot/status")
                 self.assertEqual(offline.json(), {
+                    "trading_environment": "TESTNET",
                     "status": "Offline", "pair": "BTC/USDT",
                     "safety_pause": "Normal", "pause_mode": None,
                     "trading_state": "IDLE", "engine_status": "IDLE",
@@ -300,6 +301,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "http://localhost:5173",
         )
         self.assertEqual(response.json(), {
+            "trading_environment": "TESTNET",
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "pause_mode": grid_main.PAUSED_DOWNSIDE,
             "trading_state": "ACTIVE", "engine_status": "RUNNING",
@@ -1053,7 +1055,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wallet_values_carry_and_partial_sell_without_guessing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
             database.insert_order(
                 "carry-1", 0, "BUY", "84473.58", "0.00591",
                 order_type="MARKET",

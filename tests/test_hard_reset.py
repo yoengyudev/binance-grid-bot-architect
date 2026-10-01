@@ -16,7 +16,7 @@ class HardResetTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.database_path = Path(self.directory.name) / "bot.sqlite3"
+        self.database_path = Path(self.directory.name) / "grid_testnet.sqlite"
         self.database = GridDatabase(self.database_path)
         self.database.set_state("grid_run", json.dumps({
             "baseline_base": "1", "anchor": "80000", "fingerprint": "test",
@@ -90,6 +90,15 @@ class HardResetTests(unittest.TestCase):
         self.assertIn(
             "Successfully deleted the SQLite database file.", self.messages,
         )
+
+    def test_mainnet_is_rejected_before_any_destructive_action(self) -> None:
+        with patch.object(reset_util, "get_trading_settings", return_value=Mock(
+            environment=reset_util.TradingEnvironment.MAINNET,
+        )):
+            with self.assertRaisesRegex(reset_util.ResetError, "TESTNET only"):
+                self.run_utility()
+        self.exchange.cancel_all_orders.assert_not_called()
+        self.assertTrue(self.database_path.exists())
 
     def test_declined_reset_leaves_orders_and_database_untouched(self) -> None:
         self.assertEqual(self.run_utility("n"), 0)

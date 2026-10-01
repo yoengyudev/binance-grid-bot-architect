@@ -1,8 +1,36 @@
 # Grid Master — System Architecture & Feature Summary
 
-Grid Master is a human-directed BTC/USDT grid-trading system for **Binance Spot Testnet**. A Python engine manages orders and persistent risk state; a FastAPI service exposes telemetry and authenticated controls; a React dashboard presents the account, grid, and market data. Telegram is an outbound alert channel only.
+Grid Master is a human-directed BTC/USDT grid-trading system for **Binance Spot**. A Python engine manages orders and persistent risk state; a FastAPI service exposes telemetry and authenticated controls; a React dashboard presents the account, grid, and market data. Telegram is an outbound alert channel only.
 
-> **Scope:** The exchange client explicitly enables Binance Spot sandbox mode. This repository has not been validated for live Mainnet capital. The browser's prominent streaming price, execution, ATR, order-book data, and wallet balances all come from **Spot Testnet**. The browser stream and backend ticker are separate observations and can briefly differ.
+The selected trading environment controls execution, database state, and browser market feeds. The backend publishes `trading_environment` in every `/api/bot/status` response. Mainnet routing is covered by automated isolation tests; those tests do not place real orders.
+
+## Environment configuration and isolation
+
+Set `TRADING_ENVIRONMENT` explicitly to exactly `TESTNET` or `MAINNET` in the process environment or backend `.env`. Missing, lowercase, unknown, or whitespace-padded values fail startup. There is no default or credential fallback. The choice is cached for the lifetime of the process; changing networks requires restarting it.
+
+| Environment | Required credentials | CCXT sandbox | SQLite filename |
+| --- | --- | --- | --- |
+| `TESTNET` | `BINANCE_TESTNET_API_KEY`, `BINANCE_TESTNET_API_SECRET` | `True` | `grid_testnet.sqlite` |
+| `MAINNET` | `BINANCE_MAINNET_API_KEY`, `BINANCE_MAINNET_API_SECRET` | `False` | `grid_mainnet.sqlite` |
+
+Both selected credentials must be nonblank. Validation runs before the FastAPI app is created, including direct Uvicorn imports and `--monitor-only`. The JSON `exchange.sandbox` field is ignored for network selection. Spot remains the only supported market type.
+
+`GRID_BOT_DB_DIR` optionally selects the state directory. `GRID_BOT_DB_PATH` may select an absolute file path, but its filename and resolved filename must exactly match the selected environment. Each SQLite file also contains an immutable environment marker checked on every open. Renaming or copying a Testnet database to the Mainnet filename is rejected. Unbound legacy databases are rejected and `grid_bot.sqlite3` is never automatically migrated, renamed, or deleted. Use a fresh environment database; review any legacy positions/state separately before retiring it.
+
+The dashboard waits for a recognized backend environment before opening REST or WebSocket chart feeds. Network changes remount the ticker/chart and clear old market data; unavailable or invalid status closes the feeds. Form drafts are stored under separate environment keys, and legacy drafts are ignored. The one-off `hard_reset.py` utility remains restricted to TESTNET.
+
+Docker stores the selected database under `/data` using `GRID_BOT_DB_DIR`. Its existing preflight still requires an initialized database and persistent config; provision the corresponding environment file before starting Docker.
+
+Run the backend tests with explicit dummy TESTNET settings (never real keys):
+
+```powershell
+$env:TRADING_ENVIRONMENT = "TESTNET"
+$env:BINANCE_TESTNET_API_KEY = "unit-test-key"
+$env:BINANCE_TESTNET_API_SECRET = "unit-test-secret"
+.venv/Scripts/python.exe -m unittest discover -s tests -v
+```
+
+Frontend checks: `npm run lint`, `npm run build`, and `node --test src/tradingEnvironment.test.js`.
 
 ## Architecture at a glance
 
@@ -14,11 +42,11 @@ flowchart LR
     Public[Binance public WebSocket] -->|BTC/USDT ticker display| UI
     API --> Engine[GridBot execution loop]
     Engine <--> DB[(SQLite: orders, fills, trades, state)]
-    Engine <--> CCXT[CCXT Binance Spot Testnet]
+    Engine <--> CCXT[CCXT Binance Spot]
     Engine -->|One-way HTTPS alerts| TG[Telegram owner chat]
 ```
 
-The backend source is in this directory. The frontend is the sibling `web-dashboard/` project in the development workspace. `main.py` runs the trading loop, FastAPI, and asynchronous market-data refresh in one process. SQLite records order and trade history, active settings, trailing-stop state, pause modes, and reset progress so the bot can reconcile state after a restart. `database.py` uses decimal strings for monetary values; `exchange_handler.py` creates the rate-limited, sandboxed CCXT client.
+The backend source is in this directory. The frontend is the sibling `web-dashboard/` project in the development workspace. `main.py` runs the trading loop, FastAPI, and asynchronous market-data refresh in one process. SQLite records order and trade history, active settings, trailing-stop state, pause modes, and reset progress so the bot can reconcile state after a restart. `database.py` uses decimal strings for monetary values; `exchange_handler.py` creates the rate-limited, environment-isolated CCXT client.
 
 ## Core execution engine
 
@@ -136,7 +164,7 @@ FastAPI serves a public, read-only `/api/bot/status`. Wallet balance, order ledg
 
 ## Running and verification
 
-1. Create a Python 3.12 virtual environment in the backend directory and install `requirements.txt`. Configure `.env` from `.env.example` with **Spot Testnet** API keys, Telegram token/chat ID, `BOT_ADMIN_PASSWORD`, and a random `BOT_JWT_SECRET` of at least 32 characters. Keep `.env` and `grid_bot.sqlite3` out of Git.
+1. Create a Python 3.12 virtual environment in the backend directory and install `requirements.txt`. Configure `.env` from `.env.example` with **Spot Testnet** API keys, Telegram token/chat ID, `BOT_ADMIN_PASSWORD`, and a random `BOT_JWT_SECRET` of at least 32 characters. Keep `.env` and all SQLite state files out of Git.
 2. Use `python main.py --check` for a non-trading grid preview or `python main.py --ready` for the dashboard-controlled service. `--standby` uses the ready lifecycle when it finds a saved run. The legacy `--execute` mode performs full exchange reconciliation before trading and refuses a saved IDLE or cleanup-required state. `--monitor-only` serves a read-only API without the engine. Avoid running a second trading process against the same account and database.
 3. In the sibling frontend directory run `npm install` and `npm run dev`; open `http://localhost:5173`. Development API requests go to port 8000 on the same hostname. A production build uses same-origin `/api` and needs an HTTPS reverse proxy. The backend API binds to loopback by default; Docker Compose maps port 8000 to loopback on its host.
 4. Verify the backend with `python -m unittest discover -s tests -v`. Verify the frontend with `npm run lint` and `npm run build`.

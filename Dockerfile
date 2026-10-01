@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && mkdir /data \
     && chown bot:bot /data
 
-COPY --chown=bot:bot main.py database.py exchange_handler.py stop_controller.py telegram_bot.py docker_runner.py config.json ./
+COPY --chown=bot:bot main.py database.py exchange_handler.py trading_environment.py stop_controller.py telegram_bot.py docker_runner.py config.json ./
 
 USER bot
 CMD ["python", "docker_runner.py"]

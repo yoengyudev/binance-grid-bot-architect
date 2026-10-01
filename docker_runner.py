@@ -9,15 +9,18 @@ from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
+from database import resolve_database_path
+from trading_environment import get_trading_settings
+
 
 REQUIRED_TABLES = {"grid_orders", "trade_history", "bot_state"}
 
 
 def ready_to_start(secrets_path: Path = Path("/app/.env")) -> bool:
     config = os.getenv("GRID_BOT_CONFIG_PATH")
-    database = os.getenv("GRID_BOT_DB_PATH")
-    if not config or not database:
-        print("Docker startup blocked: set both persistent data paths.", file=sys.stderr)
+    database = str(resolve_database_path())
+    if not config:
+        print("Docker startup blocked: set the persistent config path.", file=sys.stderr)
         return False
     if not Path(config).is_file() or not Path(database).is_file():
         print("Docker startup blocked: config or SQLite database is missing from /data.", file=sys.stderr)
@@ -51,6 +54,12 @@ def ready_to_start(secrets_path: Path = Path("/app/.env")) -> bool:
 
 
 def main() -> int:
+    try:
+        get_trading_settings()
+        resolve_database_path()
+    except ValueError as error:
+        print(f"Docker configuration error: {error}", file=sys.stderr)
+        return 1
     if not ready_to_start():
         return 0  # A missing or unsafe state must not trigger Docker's restart policy.
 

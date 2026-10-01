@@ -27,7 +27,7 @@ class FakeExchange:
 class StopControllerTests(unittest.TestCase):
     def test_stop_pauses_and_reconciles_tracked_orders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            database = GridDatabase(Path(temporary_directory) / "grid_testnet.sqlite")
             for order_id in ("cancel-me", "filled-before-cancel", "unknown-outcome"):
                 database.insert_order(order_id, 0, "BUY", "100", "0.1")
             exchange = FakeExchange()

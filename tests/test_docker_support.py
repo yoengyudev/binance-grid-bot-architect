@@ -16,7 +16,7 @@ class DockerSupportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             data = Path(temporary_directory)
             config = data / "config.json"
-            database_path = data / "grid_bot.sqlite3"
+            database_path = data / "grid_testnet.sqlite"
             secrets = data / ".env"
             secrets.write_text("placeholder=1\n", encoding="utf-8")
             config.write_text(json.dumps({
@@ -43,6 +43,14 @@ class DockerSupportTests(unittest.TestCase):
                 self.assertEqual(load_config()["grid"]["symbol"], "BTC/USDT")
                 self.assertEqual(GridConfig.load().lower_price, 80000)
                 self.assertEqual(GridDatabase().get_state("grid_run"), "existing state")
+
+    def test_invalid_environment_crashes_before_preflight_or_child_start(self) -> None:
+        with patch("docker_runner.get_trading_settings", side_effect=ValueError("invalid environment")), \
+             patch("docker_runner.ready_to_start") as preflight, \
+             patch("docker_runner.subprocess.Popen") as popen:
+            self.assertEqual(docker_main(), 1)
+            preflight.assert_not_called()
+            popen.assert_not_called()
 
     def test_safety_halt_is_not_restarted_but_network_failure_is(self) -> None:
         with patch("docker_runner.ready_to_start", return_value=True), \

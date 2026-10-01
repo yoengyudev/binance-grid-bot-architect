@@ -10,10 +10,25 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
+from trading_environment import BASE_DIR, get_trading_settings
 
-DATABASE_PATH = Path(__file__).resolve().parent / "grid_bot.sqlite3"
 PathValue = Union[str, Path]
 NumberValue = Union[str, int, float, Decimal]
+
+
+def resolve_database_path(path: Optional[PathValue] = None) -> Path:
+    """Reject overrides (including symlinks) that defeat filename isolation."""
+    settings = get_trading_settings()
+    directory = Path(os.getenv("GRID_BOT_DB_DIR", str(BASE_DIR)))
+    selected = Path(path) if path is not None else Path(
+        os.getenv("GRID_BOT_DB_PATH", str(directory / settings.database_filename))
+    )
+    resolved = selected.resolve()
+    if (selected.name != settings.database_filename or
+            resolved.name != settings.database_filename):
+        raise ValueError(f"Database filename must be {settings.database_filename}.")
+    return resolved
+
 
 ORDER_TRANSITIONS = {
     "OPEN": {"PARTIALLY_FILLED", "FILLED", "CANCELED", "REJECTED", "EXPIRED"},
@@ -42,9 +57,8 @@ class GridDatabase:
     """Each operation commits atomically and can be recovered after a restart."""
 
     def __init__(self, path: Optional[PathValue] = None) -> None:
-        self.path = Path(path) if path is not None else Path(
-            os.getenv("GRID_BOT_DB_PATH", str(DATABASE_PATH))
-        )
+        self.environment = get_trading_settings().environment
+        self.path = resolve_database_path(path)
         self.initialize()
 
     @contextmanager
@@ -57,6 +71,30 @@ class GridDatabase:
     def initialize(self) -> None:
         """Create tables and indexes without changing any existing rows."""
         with self._connection() as connection:
+            # Bind the file itself too: renaming/copying it cannot change networks.
+            connection.execute("BEGIN IMMEDIATE")
+            tables = {row["name"] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            )}
+            if "trading_environment" not in tables and tables:
+                raise ValueError("Refusing an unbound legacy database; use a fresh environment database.")
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS trading_environment "
+                "(id INTEGER PRIMARY KEY CHECK (id = 1), environment TEXT NOT NULL "
+                "CHECK (environment IN ('TESTNET', 'MAINNET')))"
+            )
+            row = connection.execute(
+                "SELECT environment FROM trading_environment WHERE id = 1"
+            ).fetchone()
+            if row is None and tables:
+                raise ValueError("Database environment marker is missing.")
+            if row is not None and row["environment"] != self.environment.value:
+                raise ValueError("Database belongs to a different trading environment.")
+            connection.execute(
+                "INSERT OR IGNORE INTO trading_environment (id, environment) VALUES (1, ?)",
+                (self.environment.value,),
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS grid_orders (

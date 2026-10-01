@@ -14,7 +14,7 @@ from database import GridDatabase
 class GridDatabaseTests(unittest.TestCase):
     def test_runner_lease_fences_competing_connections_and_expired_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            path = Path(temporary_directory) / "grid.sqlite3"
+            path = Path(temporary_directory) / "grid_testnet.sqlite"
             first, second = GridDatabase(path), GridDatabase(path)
             gate = Barrier(2)
 
@@ -40,7 +40,7 @@ class GridDatabaseTests(unittest.TestCase):
 
     def test_realized_pnl_uses_utc_windows_and_deduplicates_sell_orders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            database = GridDatabase(Path(temporary_directory) / "grid_testnet.sqlite")
             database.record_trade("100", "110", "8.79", sell_order_id="today-win",
                                   buy_order_id="buy-1", sold_base="1",
                                   fee_basis="estimated")
@@ -83,9 +83,11 @@ class GridDatabaseTests(unittest.TestCase):
 
     def test_existing_trade_history_migrates_without_losing_profit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            path = Path(temporary_directory) / "legacy.sqlite3"
+            path = Path(temporary_directory) / "grid_testnet.sqlite"
             with closing(sqlite3.connect(path)) as connection:
                 with connection:
+                    connection.execute("CREATE TABLE trading_environment (id INTEGER PRIMARY KEY, environment TEXT)")
+                    connection.execute("INSERT INTO trading_environment VALUES (1, 'TESTNET')")
                     connection.execute(
                         "CREATE TABLE trade_history (id INTEGER PRIMARY KEY, "
                         "buy_price TEXT NOT NULL, sell_price TEXT NOT NULL, "
@@ -103,7 +105,7 @@ class GridDatabaseTests(unittest.TestCase):
 
     def test_order_and_trade_state_survive_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            path = Path(temporary_directory) / "grid.sqlite3"
+            path = Path(temporary_directory) / "grid_testnet.sqlite"
             database = GridDatabase(path)
             database.insert_order("buy-1", 0, "BUY", "84620.01", "0.01000000")
             database.insert_order("sell-1", 1, "SELL", "85889.31", "0.01000000")
@@ -122,7 +124,7 @@ class GridDatabaseTests(unittest.TestCase):
 
     def test_rejects_duplicate_orders_and_invalid_transitions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            database = GridDatabase(Path(temporary_directory) / "grid_testnet.sqlite")
             database.insert_order("order-1", 0, "BUY", "100", "0.1")
             with self.assertRaises(sqlite3.IntegrityError):
                 database.insert_order("order-1", 0, "BUY", "100", "0.1")
@@ -136,7 +138,7 @@ class GridDatabaseTests(unittest.TestCase):
 
     def test_post_only_cleanup_cannot_remove_an_accepted_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            database = GridDatabase(Path(temporary_directory) / "grid_testnet.sqlite")
             database.insert_order(
                 "maker-1", 1, "BUY", "85000", "0.01", client_order_id="maker-1"
             )
@@ -147,7 +149,7 @@ class GridDatabaseTests(unittest.TestCase):
 
     def test_recent_fills_include_archived_runs_and_exclude_synthetic_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            database = GridDatabase(Path(temporary_directory) / "grid.sqlite3")
+            database = GridDatabase(Path(temporary_directory) / "grid_testnet.sqlite")
             database.insert_order("old-fill", 1, "BUY", "80000", "0.01",
                                   client_order_id="gridbot-old-fill")
             database.mark_order_filled("old-fill")

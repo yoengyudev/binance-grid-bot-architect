@@ -19,8 +19,9 @@ from pathlib import Path
 import ccxt
 from dotenv import load_dotenv
 
-from database import DATABASE_PATH, GridDatabase
+from database import GridDatabase, resolve_database_path
 from exchange_handler import BASE_DIR, create_exchange, load_config
+from trading_environment import TradingEnvironment, get_trading_settings
 from main import GridBot, GridConfig, _portfolio_wallet
 
 
@@ -36,10 +37,13 @@ def _database_path() -> Path:
     configured = os.getenv("GRID_BOT_DB_PATH")
     if configured and not Path(configured).is_absolute():
         raise ResetError("GRID_BOT_DB_PATH must be absolute for a hard reset.")
-    path = Path(configured) if configured else DATABASE_PATH
-    if path.is_symlink():
+    raw_path = Path(configured) if configured else (
+        Path(os.getenv("GRID_BOT_DB_DIR", str(BASE_DIR))) /
+        get_trading_settings().database_filename
+    )
+    if raw_path.is_symlink():
         raise ResetError("Refusing to delete a database through a symbolic link.")
-    path = path.resolve()
+    path = resolve_database_path(raw_path)
     if path.suffix not in (".sqlite3", ".sqlite", ".db"):
         raise ResetError(f"Refusing to delete a file without a SQLite extension: {path}")
     if not path.is_file():
@@ -161,6 +165,8 @@ def _refresh_bot_order_fills(
 def hard_reset(*, keep_btc_manual=False, input_fn=input, output=print) -> int:
     """Cancel all testnet orders, verify exposure, then remove the local DB."""
     load_dotenv(dotenv_path=BASE_DIR / ".env")
+    if get_trading_settings().environment is not TradingEnvironment.TESTNET:
+        raise ResetError("This destructive utility supports TESTNET only.")
     config = load_config()
     if config["grid"]["symbol"] != SYMBOL:
         raise ResetError(f"Configured pair must be {SYMBOL} for this utility.")
@@ -193,11 +199,7 @@ def hard_reset(*, keep_btc_manual=False, input_fn=input, output=print) -> int:
         output("Hard reset canceled; no exchange or database changes were made.")
         return 0
 
-    api_key = os.getenv("BINANCE_TESTNET_API_KEY", "").strip()
-    api_secret = os.getenv("BINANCE_TESTNET_API_SECRET", "").strip()
-    if not api_key or not api_secret:
-        raise ResetError("Both Binance Spot Testnet API keys are required in .env.")
-    exchange = create_exchange(api_key, api_secret)
+    exchange = create_exchange()
     # create_exchange already enables sandbox mode; assert it here as well before
     # the first request so this destructive utility cannot use Mainnet URLs.
     exchange.set_sandbox_mode(True)

@@ -1,4 +1,4 @@
-"""Phase 4: Binance Spot Testnet geometric grid bot."""
+"""Phase 4: Binance Spot geometric grid bot."""
 
 import argparse
 import asyncio
@@ -31,8 +31,9 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, FiniteFloat, StrictBool, StrictInt
 
-from database import GridDatabase
+from database import GridDatabase, resolve_database_path
 from exchange_handler import config_path, create_exchange, load_config
+from trading_environment import get_trading_settings
 from stop_controller import StopController
 from telegram_bot import TelegramNotifier, load_telegram_credentials
 
@@ -96,6 +97,9 @@ JWT_LIFETIME_SECONDS = 15 * 60
 JWT_REFRESH_GRACE_SECONDS = 60
 AUTH_COOKIE_NAME = "__Host-grid_admin_session"
 load_dotenv(dotenv_path=BASE_DIR / ".env")
+# Validate before creating the ASGI app, including Uvicorn and monitor-only starts.
+TRADING_SETTINGS = get_trading_settings()
+resolve_database_path()
 
 
 def _configured_frontend_origin() -> str:
@@ -464,6 +468,7 @@ def bot_status() -> Dict[str, Any]:
         atr = app.state.atr_snapshot
         order_book = app.state.order_book_snapshot
         return {
+            "trading_environment": TRADING_SETTINGS.environment.value,
             "status": "Online", "pair": bot.config.symbol,
             "safety_pause": "Idle", "pause_mode": None,
             "trading_state": "IDLE", "engine_status": ENGINE_IDLE,
@@ -487,6 +492,7 @@ def bot_status() -> Dict[str, Any]:
         }
     if app.state.monitor_only and bot is None:
         return {
+            "trading_environment": TRADING_SETTINGS.environment.value,
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Stopped", "pause_mode": None,
             "trading_state": "STOPPED", "engine_status": ENGINE_IDLE,
@@ -559,6 +565,7 @@ def bot_status() -> Dict[str, Any]:
         except (KeyError, ValueError, InvalidOperation, TypeError):
             pass
     return {
+        "trading_environment": TRADING_SETTINGS.environment.value,
         "status": "Online" if bot is not None else "Offline",
         "pair": bot.config.symbol if bot is not None else "BTC/USDT",
         "safety_pause": (
@@ -657,8 +664,8 @@ def wallet_balance(response: Response,
         raise HTTPException(status_code=503, detail="The trading bot is offline.")
     try:
         if bot is None:
-            key, secret = _credentials()
-            exchange = create_exchange(key, secret)
+            _credentials()
+            exchange = create_exchange()
             balances = exchange.fetch_balance({"type": "spot"})
             asset = balances.get("USDT") if isinstance(balances, dict) else None
             free = asset.get("free") if isinstance(asset, dict) else None
@@ -1200,7 +1207,7 @@ class GridBot:
             self._runner_epoch = None
 
     def _reconcile_state(self) -> Dict[str, Any]:
-        """Verify the Testnet order book and wallet before ordinary trading resumes.
+        """Verify the Spot order book and wallet before ordinary trading resumes.
 
         SQLite remains the order ledger. Memory holds only a verified snapshot;
         every normal trading cycle still fetches live order status by saved ID.
@@ -1295,7 +1302,7 @@ class GridBot:
                     if self._sellable_hard_stop_amount(free, price) > 0:
                         unhedged = free
                         LOGGER.critical(
-                            "Unhedged %s BTC in Testnet Spot wallet; START needs "
+                            "Unhedged %s BTC in Spot wallet; START needs "
                             "manual clearance or explicit auto_cover_inventory.", free,
                         )
                 return {"resumable": bool(restored), "unhedged_btc": unhedged,
@@ -2491,7 +2498,7 @@ class GridBot:
                 self.database.discard_rejected_post_only_order(client_id)
                 self._post_only_rejected_in_cycle = True
                 LOGGER.warning(
-                    "Spot Testnet rejected post-only %s %s at %s (grid level %s); "
+                    "Spot rejected post-only %s %s at %s (grid level %s); "
                     "skipping this order until the next cycle.",
                     side, amount, price, level,
                 )
@@ -2506,7 +2513,7 @@ class GridBot:
                 self.database.discard_rejected_post_only_order(client_id)
                 self._post_only_rejected_in_cycle = True
                 LOGGER.warning(
-                    "Spot Testnet rejected %s %s at %s for insufficient free %s "
+                    "Spot rejected %s %s at %s for insufficient free %s "
                     "(grid level %s); retrying after balance reconciliation.",
                     side, amount, price,
                     self.market["base"] if side == "SELL" else self.market["quote"],
@@ -2523,7 +2530,7 @@ class GridBot:
             )
         self.database.set_exchange_order_id(client_id, str(response["id"]))
         LOGGER.info(
-            "Spot Testnet submitted %s %s %s %s at %s (grid level %s).",
+            "Spot submitted %s %s %s %s at %s (grid level %s).",
             order_type, side, amount, self.config.symbol, price, level,
         )
         return client_id
@@ -4080,12 +4087,7 @@ class GridBot:
 
 
 def _credentials() -> Tuple[str, str]:
-    load_dotenv(dotenv_path=BASE_DIR / ".env")
-    key = os.getenv("BINANCE_TESTNET_API_KEY", "").strip()
-    secret = os.getenv("BINANCE_TESTNET_API_SECRET", "").strip()
-    if not key or not secret:
-        raise ValueError("Set both Binance Spot Testnet keys in .env.")
-    return key, secret
+    return TRADING_SETTINGS.api_key, TRADING_SETTINGS.api_secret
 
 
 def _center_config_at_current_price(exchange: Any, database: GridDatabase) -> None:
@@ -4103,7 +4105,7 @@ def _center_config_at_current_price(exchange: Any, database: GridDatabase) -> No
     ticker = exchange.fetch_ticker(raw["grid"]["symbol"])
     price = _order_decimal(ticker.get("last"))
     if not price.is_finite() or price <= 0:
-        raise TradingHalt("Cannot center bounds without a valid Testnet price.")
+        raise TradingHalt("Cannot center bounds without a valid Spot price.")
     raw["grid"]["lower_price"] = float(price * (1 - percent / 100))
     raw["grid"]["upper_price"] = float(price * (1 + percent / 100))
     temporary_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
@@ -4116,7 +4118,7 @@ def _center_config_at_current_price(exchange: Any, database: GridDatabase) -> No
         if temporary_path.exists():
             temporary_path.unlink()
     print(
-        f"Centered bounds on Spot Testnet price {price}: "
+        f"Centered bounds on Spot {TRADING_SETTINGS.environment.value} price {price}: "
         f"{raw['grid']['lower_price']} to {raw['grid']['upper_price']}"
     )
 
@@ -4400,10 +4402,10 @@ def main() -> int:
     LOGGER.addHandler(handler)
     LOGGER.setLevel(logging.INFO)
     LOGGER.propagate = False
-    parser = argparse.ArgumentParser(description="Binance Spot Testnet geometric grid bot")
+    parser = argparse.ArgumentParser(description="Binance Spot geometric grid bot")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="Center and preview without orders")
-    mode.add_argument("--execute", action="store_true", help="Trade on Spot Testnet")
+    mode.add_argument("--execute", action="store_true", help="Trade on Spot")
     mode.add_argument("--monitor-only", action="store_true",
                       help="Serve the dashboard API without starting the trading bot")
     mode.add_argument("--standby", action="store_true",
@@ -4418,8 +4420,8 @@ def main() -> int:
             uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
             return 0
         if arguments.ready:
-            key, secret = _credentials()
-            exchange = create_exchange(key, secret)
+            _credentials()
+            exchange = create_exchange()
             database = GridDatabase()
             existing_run = database.get_state("grid_run") is not None
             if not existing_run and (any(database.get_state(key) is not None for key in (
@@ -4433,8 +4435,8 @@ def main() -> int:
             asyncio.run(_run_services(bot, None, ready=True))
             return 0
         if arguments.standby:
-            key, secret = _credentials()
-            exchange = create_exchange(key, secret)
+            _credentials()
+            exchange = create_exchange()
             database = GridDatabase()
             existing_run = database.get_state("grid_run") is not None
             if existing_run:
@@ -4453,8 +4455,8 @@ def main() -> int:
                     raise TradingHalt("Standby requires no open BTC/USDT orders.")
                 asyncio.run(_run_standby_services(bot))
             return 0
-        key, secret = _credentials()
-        exchange = create_exchange(key, secret)
+        _credentials()
+        exchange = create_exchange()
         database = GridDatabase()
         runner_token = uuid.uuid4().hex
         runner_epoch = database.acquire_runner_lease(
@@ -4470,7 +4472,7 @@ def main() -> int:
             bot._lease_required = True
             if arguments.check:
                 current, planned, upper_planned = bot.prepare(persist=False)
-                print(f"Spot Testnet {config.symbol}: current={current}, anchor={bot.anchor}")
+                print(f"Spot {TRADING_SETTINGS.environment.value} {config.symbol}: current={current}, anchor={bot.anchor}")
                 print(f"Seed market buy: {bot._seed_quote()} {bot.market['quote']}")
                 print(f"Geometric lower buy levels: {len(planned)}")
                 for level, price, amount in planned:
