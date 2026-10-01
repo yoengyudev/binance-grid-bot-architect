@@ -36,6 +36,8 @@ class StopControllerTests(unittest.TestCase):
             result = controller.request_stop()
 
             self.assertTrue(controller.stop_requested.is_set())
+            self.assertEqual(database.get_state("engine_stop_cleanup_pending"), "1")
+            self.assertIsNotNone(database.get_state("order_cleanup_alarm"))
             self.assertEqual((result.canceled, result.filled, result.unresolved), (1, 1, 1))
             self.assertEqual(database.get_order("cancel-me")["status"], "CANCELED")
             self.assertEqual(database.get_order("filled-before-cancel")["status"], "FILLED")

@@ -62,7 +62,7 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, forward_signal)
     signal.signal(signal.SIGINT, forward_signal)
-    child = subprocess.Popen([sys.executable, "main.py", "--execute"])
+    child = subprocess.Popen([sys.executable, "main.py", "--ready"])
     exit_code = child.wait()
     if exit_code in (2, 130, -signal.SIGTERM, -signal.SIGINT):
         print("Trading stopped; automatic restart suppressed.", file=sys.stderr)

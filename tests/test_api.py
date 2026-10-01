@@ -65,6 +65,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_standby_reports_idle_and_rejects_trading_controls(self) -> None:
         standby_bot = Mock()
         standby_bot.config.symbol = "BTC/USDT"
+        standby_bot.database.get_state.return_value = None
         standby_bot.request_initial_grid.return_value = (Decimal("80"), Decimal("120"))
         grid_main.app.state.grid_bot = standby_bot
         grid_main.app.state.standby = True
@@ -175,6 +176,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "safety_pause": "Normal", "pause_mode": None,
                     "trading_state": "IDLE", "engine_status": "IDLE",
                     "engine_fault": None, "pending_grid": None,
+                    "order_cleanup_required": False, "unresolved_order_alarm": None,
                     "has_grid_run": False,
                     "grid_levels": 0,
                     "exact_grid_recenter_supported": True,
@@ -189,6 +191,15 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                         "unrealized_pnl": None,
                     },
                 })
+                database.require_order_cleanup("Cancellation could not be verified.")
+                with patch.object(grid_main, "GridDatabase", return_value=database):
+                    alarm = await client.get("/api/bot/status")
+                self.assertEqual(alarm.json()["engine_status"], "IDLE")
+                self.assertTrue(alarm.json()["order_cleanup_required"])
+                self.assertEqual(alarm.json()["engine_fault"],
+                                 "Cancellation could not be verified.")
+                database.complete_order_cleanup()
+                database.clear_state(grid_main.ENGINE_STATUS_KEY)
 
                 saved_grid = json.dumps({
                     "phase": "placing", "source": "manual_recenter",
@@ -262,6 +273,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "safety_pause": "Active", "pause_mode": grid_main.PAUSED_DOWNSIDE,
             "trading_state": "ACTIVE", "engine_status": "RUNNING",
             "engine_fault": None, "pending_grid": None,
+            "order_cleanup_required": False, "unresolved_order_alarm": None,
             "has_grid_run": False,
             "grid_levels": 2,
             "exact_grid_recenter_supported": True,
@@ -1070,6 +1082,9 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.01)
 
         class FakeBot:
+            def _reconcile_state(self):
+                return {"resumable": False, "unhedged_btc": Decimal(0)}
+
             async def run(self, _notifier):
                 await api_started.wait()
 
@@ -1095,6 +1110,9 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeBot:
             ran = False
+
+            def _reconcile_state(self):
+                return {"resumable": False, "unhedged_btc": Decimal(0)}
 
             async def run(self, _notifier):
                 self.ran = True

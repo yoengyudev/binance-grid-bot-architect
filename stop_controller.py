@@ -1,10 +1,14 @@
 """Tracked-order cancellation and stop coordination for the trading loop."""
 
+import logging
 from dataclasses import dataclass
 from threading import Event, Lock, RLock
 from typing import Any, Callable, Dict, Optional
 
 from database import GridDatabase
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,7 +42,12 @@ class StopController:
     def request_stop(self) -> StopResult:
         """Signal stop before making exchange calls; retry unresolved rows later."""
         self.stop_requested.set()
-        return self.cancel_tracked_orders()
+        self.database.require_order_cleanup("Stop requested; Binance order cleanup is unverified.")
+        result = self.cancel_tracked_orders()
+        if result.unresolved:
+            LOGGER.error("Stop left %s tracked orders unresolved; cleanup remains required.",
+                         result.unresolved)
+        return result
 
     def cancel_tracked_orders(
         self, predicate: Optional[Callable[[Dict[str, Any]], bool]] = None
@@ -65,8 +74,10 @@ class StopController:
                             response = self._exchange_call(
                                 self.exchange.cancel_order, reference, self.symbol, params
                             )
-                    except Exception:
+                    except Exception as error:
                         # The order may have filled just before cancellation.
+                        LOGGER.warning("Cancellation of %s could not be confirmed (%s); fetching status.",
+                                       order_id, type(error).__name__)
                         response = None
 
                     status = response.get("status") if isinstance(response, dict) else None
@@ -89,7 +100,9 @@ class StopController:
                         filled += 1
                     else:
                         unresolved += 1
-                except Exception:
+                except Exception as error:
                     # Keep the row active so the next run can reconcile it.
+                    LOGGER.error("Stop could not resolve order %s (%s).",
+                                 order_id, type(error).__name__)
                     unresolved += 1
         return StopResult(canceled, filled, unresolved)

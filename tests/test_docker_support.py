@@ -1,4 +1,5 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,6 +50,7 @@ class DockerSupportTests(unittest.TestCase):
              patch("docker_runner.subprocess.Popen") as popen:
             popen.return_value.wait.return_value = 2
             self.assertEqual(docker_main(), 0)
+            popen.assert_called_with([sys.executable, "main.py", "--ready"])
             popen.return_value.wait.return_value = 1
             self.assertEqual(docker_main(), 1)
 

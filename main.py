@@ -51,6 +51,7 @@ ENGINE_IDLE = "IDLE"
 ENGINE_RUNNING = "RUNNING"
 ENGINE_FAULT_KEY = "engine_fault"
 ENGINE_STOP_CLEANUP_KEY = "engine_stop_cleanup_pending"
+ORDER_CLEANUP_ALARM_KEY = "order_cleanup_alarm"
 RECONCILE_COVER_KEY = "reconcile_cover_inventory"
 MANUAL_ACCOUNT_EXIT_REASON = "manual_full_account_exit"
 PAUSED_DOWNSIDE = "PAUSED_DOWNSIDE"
@@ -452,6 +453,10 @@ def bot_status() -> Dict[str, Any]:
             "status": "Online", "pair": bot.config.symbol,
             "safety_pause": "Idle", "pause_mode": None,
             "trading_state": "IDLE", "engine_status": ENGINE_IDLE,
+            "engine_fault": (bot.database.get_state(ENGINE_FAULT_KEY) or
+                             bot.database.get_state(ORDER_CLEANUP_ALARM_KEY)),
+            "order_cleanup_required": bot.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1",
+            "unresolved_order_alarm": bot.database.get_state(ORDER_CLEANUP_ALARM_KEY),
             "has_grid_run": False, "grid_levels": 0,
             "exact_grid_recenter_supported": True,
             "lower_bound": None, "upper_bound": None,
@@ -469,6 +474,7 @@ def bot_status() -> Dict[str, Any]:
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Stopped", "pause_mode": None,
             "trading_state": "STOPPED", "engine_status": ENGINE_IDLE,
+            "order_cleanup_required": False, "unresolved_order_alarm": None,
             "has_grid_run": False, "grid_levels": 0,
             "exact_grid_recenter_supported": False,
             "lower_bound": None, "upper_bound": None,
@@ -543,7 +549,10 @@ def bot_status() -> Dict[str, Any]:
         ),
         "pause_mode": safety_mode,
         "engine_status": engine_status,
-        "engine_fault": database.get_state(ENGINE_FAULT_KEY),
+        "engine_fault": (database.get_state(ENGINE_FAULT_KEY) or
+                         database.get_state(ORDER_CLEANUP_ALARM_KEY)),
+        "order_cleanup_required": database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1",
+        "unresolved_order_alarm": database.get_state(ORDER_CLEANUP_ALARM_KEY),
         "pending_grid": pending_grid,
         "has_grid_run": database.get_state("grid_run") is not None,
         "trading_state": "ACCOUNT_CLEARED" if manual_account_exit else safety_mode if safety_mode in (
@@ -1212,7 +1221,7 @@ class GridBot:
             except Exception as error:
                 message = ("State reconciliation failed: " + str(error) +
                            " Manual intervention is required.")
-                self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+                self.database.require_order_cleanup(message)
                 self.database.set_state(ENGINE_FAULT_KEY, message)
                 self.reconciled_orders = {}
                 LOGGER.critical(message, exc_info=True)
@@ -1467,6 +1476,7 @@ class GridBot:
         """Cancel only this bot's live orders and verify tracked SQLite rows."""
         with self.stop_controller._lock:
             tracked = self.database.fetch_active_grids()
+            known_orders = self.database.fetch_all_orders()
             selected = [
                 row for row in tracked
                 if (side is None or row["side"].lower() == side)
@@ -1475,7 +1485,7 @@ class GridBot:
             ]
 
             def matches(order: Any) -> bool:
-                if not self._is_bot_order(order, tracked):
+                if not self._is_bot_order(order, known_orders):
                     return False
                 if side is not None and str(order.get("side") or "").lower() != side:
                     return False
@@ -3261,7 +3271,7 @@ class GridBot:
             raise TradingHalt("Configured symbol is not an active Spot market.")
 
     def reconcile_idle_orders(self) -> None:
-        """Retry a failed stop after a process restart without placing orders."""
+        """Retry cleanup until the bot-owned Binance book and ledger are flat."""
         with self._cycle_lock:
             if (self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE or
                     self.database.get_state(ENGINE_STOP_CLEANUP_KEY) != "1"):
@@ -3271,9 +3281,27 @@ class GridBot:
                 return  # The separate liquidation state must be reviewed.
             self._load_market_for_engine_control()
             _, complete = self._cancel_bot_orders()
-            if not complete or self.database.fetch_active_grids():
+            known_orders = self.database.fetch_all_orders()
+            exchange_orders = self._live_open_orders()
+            if (not complete or self.database.fetch_active_grids() or
+                    any(self._is_bot_order(order, known_orders)
+                        for order in exchange_orders)):
                 raise TradingHalt("Idle bot orders still need reconciliation.")
-            self.database.clear_state(ENGINE_STOP_CLEANUP_KEY)
+            self.database.complete_order_cleanup()
+
+    def halt_after_fault(self, reason: str) -> bool:
+        """Stop placement, persist the alarm, and verify exchange cleanup."""
+        with self._cycle_lock:
+            result = self.stop_controller.request_stop()
+            if result.unresolved:
+                LOGGER.error("Fault stop left %s tracked orders unresolved.",
+                             result.unresolved)
+            try:
+                self.reconcile_idle_orders()
+            except Exception:
+                LOGGER.exception("Fault stop could not verify Binance order cleanup.")
+                return False
+            return True
 
     def stop_engine(self) -> Dict[str, Any]:
         """Persist IDLE before canceling and reconciling every bot-owned grid order."""
@@ -3281,19 +3309,15 @@ class GridBot:
             if self.database.get_state(SAFETY_MODE_KEY) in (
                     LIQUIDATING, LIQUIDATION_HALTED):
                 raise TradingHalt("Unresolved hard-stop liquidation cannot be interrupted.")
-            self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
-            self.database.set_state(ENGINE_STOP_CLEANUP_KEY, "1")
-            self._load_market_for_engine_control()
-            _, complete = self._cancel_bot_orders()
+            self.database.require_order_cleanup(
+                "Engine STOP requested; Binance order cleanup is unverified.")
             if self.grid_needs_reset:
                 pending_text = self.database.get_state("grid_reset")
                 if pending_text:
                     pending = json.loads(pending_text)
                     pending["phase"] = "canceling"
                     self.database.set_state("grid_reset", json.dumps(pending, sort_keys=True))
-            if not complete or self.database.fetch_active_grids():
-                raise TradingHalt("Engine is idle, but bot order cancellation needs another attempt.")
-            self.database.clear_state(ENGINE_STOP_CLEANUP_KEY)
+            self.reconcile_idle_orders()
             self.database.clear_state(RECONCILE_COVER_KEY)
             LOGGER.warning("Admin stopped the trading engine and cleared bot grid orders.")
             return {"engine_status": ENGINE_IDLE, "bot_orders_cleared": True,
@@ -3303,16 +3327,16 @@ class GridBot:
                      pending_grid_token: Optional[str] = None) -> Dict[str, Any]:
         """Reconcile first; resume matched orders or queue a guarded rebuild."""
         with self._cycle_lock:
+            if self.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
+                raise TradingHalt("A prior stop still needs Binance order cleanup.")
             state = self._reconcile_state()
             if self.stop_controller.stop_requested.is_set():
                 raise TradingHalt("The trading process is stopping or faulted.")
             if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_RUNNING:
                 if state["unhedged_btc"]:
-                    self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+                    self.stop_engine()
                     raise TradingHalt("Free BTC lacks SELL protection; engine is idle.")
                 return {"engine_status": ENGINE_RUNNING}
-            if self.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
-                raise TradingHalt("A prior STOP still needs order cleanup.")
             if not self.database.get_state("grid_run"):
                 raise TradingHalt("Configure a grid before starting the engine.")
             if self.database.get_state("halt_reason"):
@@ -3748,24 +3772,22 @@ class GridBot:
                     delay = min(backoff, 60)
                     backoff = min(backoff * 2, 60)
                 except Exception as error:
-                    self.stop_controller.stop_requested.set()
                     if self.grid_needs_reset:
                         self.database.set_state("halt_reason", "grid_reset_failed")
+                    await asyncio.to_thread(self.halt_after_fault, type(error).__name__)
                     if self.is_paused:
                         await self._notify_safety_state(notifier)
                     try:
                         await notifier.notify_critical_error(error)
                     except Exception:
                         pass
-                    if not self.is_paused:
-                        await asyncio.to_thread(self.stop_controller.request_stop)
                     raise
                 await asyncio.to_thread(self.stop_controller.stop_requested.wait, delay)
         finally:
             if (not self.stop_controller.stop_requested.is_set() and not self.is_paused
                     and not (self.ready_mode and self.database.get_state(ENGINE_STATUS_KEY)
                              == ENGINE_IDLE)):
-                await asyncio.to_thread(self.stop_controller.request_stop)
+                await asyncio.to_thread(self.halt_after_fault, "ProcessStopping")
 
 
 def _credentials() -> Tuple[str, str]:
@@ -3829,16 +3851,57 @@ def _apply_active_grid_config(config: GridConfig, database: GridDatabase) -> Gri
     )
 
 
-async def _run_services(bot: GridBot, notifier: TelegramNotifier,
-                        *, ready: bool = False) -> None:
-    """Run the local API and trading loop with outbound alerts only."""
+async def _reconcile_service_boot(bot: GridBot, *, ready: bool) -> None:
+    """Verify the exchange before either service mode can run a trading loop."""
     if ready:
         try:
             await asyncio.to_thread(bot._reconcile_state)
         except TradingHalt:
             # Keep the dashboard available so its engine_fault explains why
-            # START is locked. Reconciliation has already persisted IDLE.
+            # START is locked. Reconciliation has persisted cleanup-required.
             pass
+        if bot.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
+            try:
+                await asyncio.to_thread(bot.reconcile_idle_orders)
+            except Exception:
+                LOGGER.exception("Startup order cleanup remains unresolved.")
+    else:
+        # Direct execution also needs a full exchange/ledger boot check.
+        try:
+            await asyncio.to_thread(bot._reconcile_state)
+        except TradingHalt:
+            try:
+                await asyncio.to_thread(bot.reconcile_idle_orders)
+            except Exception:
+                LOGGER.exception("Direct-mode boot cleanup remains unresolved.")
+            raise
+
+
+async def _ensure_fault_cleanup(bot: GridBot, error: Exception) -> None:
+    """Cover failures before and inside run(), including direct execution."""
+    if bot.stop_controller.stop_requested.is_set():
+        if bot.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
+            try:
+                await asyncio.to_thread(bot.reconcile_idle_orders)
+            except Exception:
+                LOGGER.exception("Fault cleanup remains unresolved.")
+        elif bot.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE:
+            await asyncio.to_thread(bot.halt_after_fault, type(error).__name__)
+    else:
+        await asyncio.to_thread(bot.halt_after_fault, type(error).__name__)
+
+
+async def _run_services(bot: GridBot, notifier: Optional[TelegramNotifier],
+                        *, ready: bool = False) -> None:
+    """Run the local API and trading loop with outbound alerts only."""
+    await _reconcile_service_boot(bot, ready=ready)
+    if notifier is None:
+        try:
+            token, owner_chat_id = load_telegram_credentials()
+            notifier = TelegramNotifier(token, owner_chat_id)
+        except Exception as error:
+            await _ensure_fault_cleanup(bot, error)
+            raise
     app.state.grid_bot = bot
     app.state.ready = ready
     app.state.standby = ready and bot.database.get_state("grid_run") is None
@@ -3878,7 +3941,11 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier,
     )
     try:
         if not ready:
-            await bot.run(notifier)
+            try:
+                await bot.run(notifier)
+            except Exception as error:
+                await _ensure_fault_cleanup(bot, error)
+                raise
         else:
             while True:
                 if api_task.done():
@@ -3895,7 +3962,7 @@ async def _run_services(bot: GridBot, notifier: TelegramNotifier,
                             bot.database.set_state(ENGINE_FAULT_KEY, "ProcessStopping")
                     except Exception as error:
                         LOGGER.exception("Trading engine faulted; dashboard stays online.")
-                        bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
+                        await _ensure_fault_cleanup(bot, error)
                         bot.database.set_state(ENGINE_FAULT_KEY, type(error).__name__)
                 else:
                     try:
@@ -3946,9 +4013,18 @@ async def _run_standby_services(bot: GridBot) -> None:
                 raise TradingHalt("Standby API stopped before grid activation.")
             await asyncio.sleep(0.25)
         app.state.standby = False
-        token, owner_chat_id = load_telegram_credentials()
-        notifier = TelegramNotifier(token, owner_chat_id)
-        await bot.run(notifier)
+        await _reconcile_service_boot(bot, ready=False)
+        try:
+            token, owner_chat_id = load_telegram_credentials()
+            notifier = TelegramNotifier(token, owner_chat_id)
+        except Exception as error:
+            await _ensure_fault_cleanup(bot, error)
+            raise
+        try:
+            await bot.run(notifier)
+        except Exception as error:
+            await _ensure_fault_cleanup(bot, error)
+            raise
     finally:
         server.should_exit = True
         await asyncio.gather(api_task, return_exceptions=True)
@@ -3996,15 +4072,14 @@ def main() -> int:
                       if existing_run else GridConfig.load())
             bot = GridBot(config, exchange, database)
             bot.ready_mode = True
-            # A service restart never resumes ordinary grid trading by itself.
-            # START can adopt verified exchange orders after reconciliation.
+            # Persist cleanup before entering IDLE. The service verifies it
+            # against Binance before the dashboard accepts START.
             if database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
                 database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
             else:
-                database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE)
-            token, owner_chat_id = load_telegram_credentials()
-            asyncio.run(_run_services(bot, TelegramNotifier(token, owner_chat_id),
-                                      ready=True))
+                database.require_order_cleanup(
+                    "Ready-mode restart; Binance order cleanup is unverified.")
+            asyncio.run(_run_services(bot, None, ready=True))
             return 0
         if arguments.standby:
             key, secret = _credentials()
@@ -4014,8 +4089,11 @@ def main() -> int:
             if existing_run:
                 config = _apply_active_grid_config(GridConfig.load(), database)
                 bot = GridBot(config, exchange, database)
-                token, owner_chat_id = load_telegram_credentials()
-                asyncio.run(_run_services(bot, TelegramNotifier(token, owner_chat_id)))
+                bot.ready_mode = True
+                if database.get_state(SAFETY_MODE_KEY) != LIQUIDATING:
+                    database.require_order_cleanup(
+                        "Standby restart; Binance order cleanup is unverified.")
+                asyncio.run(_run_services(bot, None, ready=True))
             else:
                 if (any(database.get_state(key) is not None for key in (
                         "grid_reset", "active_grid_config", SAFETY_MODE_KEY,
@@ -4048,9 +4126,10 @@ def main() -> int:
                 f"{bot._seed_quote() + sum((p * a for _, p, a in planned), Decimal(0))}"
             )
             return 0
-        token, owner_chat_id = load_telegram_credentials()
-        notifier = TelegramNotifier(token, owner_chat_id)
-        asyncio.run(_run_services(bot, notifier))
+        if database.get_state(ENGINE_STATUS_KEY) == ENGINE_IDLE or (
+                database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1"):
+            raise TradingHalt("Saved engine is IDLE or needs cleanup; use --ready and START.")
+        asyncio.run(_run_services(bot, None))
         return 0
     except ccxt.NetworkError as error:
         print(f"Bot stopped: {error}", file=sys.stderr)

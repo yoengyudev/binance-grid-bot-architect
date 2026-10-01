@@ -328,6 +328,30 @@ class GridDatabase:
                 (key, value),
             )
 
+    def require_order_cleanup(self, reason: str) -> None:
+        """Atomically stop placement and persist the exchange cleanup obligation."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for key, value in (
+                ("engine_stop_cleanup_pending", "1"),
+                ("engine_status", "IDLE"),
+                ("order_cleanup_alarm", reason),
+            ):
+                connection.execute(
+                    "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+
+    def complete_order_cleanup(self) -> None:
+        """Clear the obligation only after the caller verifies the exchange book."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM bot_state WHERE key IN "
+                "('engine_stop_cleanup_pending', 'order_cleanup_alarm')"
+            )
+
     def update_runtime_grid_settings(self, grid_run: str, active_config: str,
                                      *, trailing_stop: Optional[str] = None,
                                      allow_pending_reset: bool = False) -> None:

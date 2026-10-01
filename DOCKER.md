@@ -4,10 +4,14 @@ Docker is not required for this bot. The existing EC2 `systemd` service remains
 the recommended live deployment. Docker packages Python and the dependencies
 for easier rebuilds, but moving a live bot requires moving its SQLite state.
 
-The Compose service uses outbound network access only; it publishes no ports.
+The Compose service publishes the dashboard API to host loopback on port 8000.
 It mounts `.env` read-only and keeps the mutable `config.json` and SQLite state
 in `docker-data/`. Both `.env` and `docker-data/` are excluded from the image
 and Git. The image runs as UID 1000, matching the `ubuntu` user on the current VM.
+The container starts in `--ready` mode: startup reconciles and cancels bot-owned
+orders before resting in IDLE. Trading requires an authenticated dashboard START.
+If cancellation cannot be verified, the cleanup alarm persists and START stays
+blocked while the service retries.
 
 ## Build without starting a second bot
 
@@ -45,8 +49,8 @@ create a fresh database implicitly; a missing or invalid database leaves the
 container stopped. A missing `.env` or config also leaves it stopped.
 
 The container restarts after a transient nonzero bot exit, such as a network
-error. A trading safety halt (exit code 2) or a normal `/stop` does not restart
-automatically. Docker's `on-failure` policy **does not restore the container
+error. A trading safety halt (exit code 2) does not restart automatically.
+Docker's `on-failure` policy **does not restore the container
 after a Docker daemon or VM restart**. For a 24/7 deployment across reboots,
 the existing `systemd` service is simpler and already configured for this.
 

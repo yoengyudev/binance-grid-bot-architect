@@ -302,8 +302,89 @@ class GridBotTests(unittest.TestCase):
                 self.assertEqual(grid_main.main(), 0)
             self.assertEqual(database.get_state(grid_main.ENGINE_STATUS_KEY),
                              grid_main.ENGINE_IDLE)
+            self.assertEqual(database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY), "1")
             self.assertTrue(services.await_args.kwargs["ready"])
             self.assertTrue(services.await_args.args[0].ready_mode)
+
+    def test_ready_boot_cancels_matched_orders_before_idle_is_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
+            bot.run_cycle()
+            bot.run_cycle()
+            self.assertTrue(exchange.fetch_open_orders("BTC/USDT"))
+
+            database = GridDatabase(path)
+            database.require_order_cleanup("Ready-mode restart")
+            reopened = GridBot(bot.config, exchange, database)
+            reopened.ready_mode = True
+            asyncio.run(grid_main._reconcile_service_boot(reopened, ready=True))
+
+            self.assertEqual(database.get_state(grid_main.ENGINE_STATUS_KEY),
+                             grid_main.ENGINE_IDLE)
+            self.assertIsNone(database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY))
+            self.assertIsNone(database.get_state(grid_main.ORDER_CLEANUP_ALARM_KEY))
+            self.assertEqual(database.fetch_active_grids(), [])
+            self.assertEqual(exchange.fetch_open_orders("BTC/USDT"), [])
+
+    def test_ready_boot_cleans_orders_before_loading_alert_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid.sqlite3"
+            bot, exchange = self.make_bot(path, initial_base=Decimal("0"))
+            bot.run_cycle()
+            bot.run_cycle()
+            database = GridDatabase(path)
+            database.require_order_cleanup("Ready-mode restart")
+            reopened = GridBot(bot.config, exchange, database)
+            reopened.ready_mode = True
+
+            with patch.object(grid_main, "load_telegram_credentials",
+                              side_effect=ValueError("missing alert token")):
+                with self.assertRaisesRegex(ValueError, "missing alert token"):
+                    asyncio.run(grid_main._run_services(reopened, None, ready=True))
+
+            self.assertEqual(exchange.fetch_open_orders("BTC/USDT"), [])
+            self.assertEqual(database.fetch_active_grids(), [])
+            self.assertIsNone(database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY))
+
+    def test_standby_with_saved_run_uses_ready_cleanup_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
+                Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            )
+            database.set_state("grid_run", json.dumps({
+                "anchor": "100", "baseline_base": "0",
+                "fingerprint": config.fingerprint(),
+            }))
+            with (patch("sys.argv", ["main.py", "--standby"]),
+                  patch.object(grid_main, "_credentials", return_value=("key", "secret")),
+                  patch.object(grid_main, "create_exchange", return_value=FakeSpotExchange()),
+                  patch.object(grid_main, "GridDatabase", return_value=database),
+                  patch.object(grid_main.GridConfig, "load", return_value=config),
+                  patch.object(grid_main, "load_telegram_credentials",
+                               return_value=("token", 123)),
+                  patch.object(grid_main, "_run_services", new_callable=AsyncMock) as services):
+                self.assertEqual(grid_main.main(), 0)
+            self.assertTrue(services.await_args.kwargs["ready"])
+            self.assertTrue(services.await_args.args[0].ready_mode)
+            self.assertEqual(database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY), "1")
+
+    def test_direct_boot_rejects_exchange_order_missing_from_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3",
+                                          initial_base=Decimal("0"))
+            exchange.create_order(
+                "BTC/USDT", "limit", "buy", 0.2, 50,
+                {"newClientOrderId": bot.order_client_prefix + "orphan"},
+            )
+            with self.assertRaisesRegex(TradingHalt, "reconciliation failed"):
+                asyncio.run(grid_main._reconcile_service_boot(bot, ready=False))
+            self.assertEqual(bot.database.get_state(grid_main.ENGINE_STATUS_KEY),
+                             grid_main.ENGINE_IDLE)
+            self.assertEqual(exchange.fetch_open_orders("BTC/USDT"), [])
+            self.assertIsNone(bot.database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY))
 
     def make_bot(self, path: Path, *, width: Decimal = None,
                  initial_base: Decimal = Decimal("1")):
@@ -1168,6 +1249,32 @@ class GridBotTests(unittest.TestCase):
             exchange.fetch_open_orders = original
             bot.reconcile_idle_orders()
             self.assertEqual(bot.database.fetch_active_grids(), [])
+
+    def test_fault_stop_persists_alarm_until_exchange_cleanup_is_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = self.make_bot(Path(directory) / "grid.sqlite3",
+                                          initial_base=Decimal("0"))
+            bot.run_cycle()
+            bot.run_cycle()
+            original_cancel = exchange.cancel_order
+            exchange.cancel_order = Mock(side_effect=ccxt.NetworkError("offline"))
+
+            self.assertFalse(bot.halt_after_fault("CycleFault"))
+            self.assertTrue(bot.stop_controller.stop_requested.is_set())
+            self.assertEqual(bot.database.get_state(grid_main.ENGINE_STATUS_KEY),
+                             grid_main.ENGINE_IDLE)
+            self.assertEqual(bot.database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY),
+                             "1")
+            self.assertIsNotNone(bot.database.get_state(grid_main.ORDER_CLEANUP_ALARM_KEY))
+            self.assertTrue(exchange.fetch_open_orders("BTC/USDT"))
+            with self.assertRaisesRegex(TradingHalt, "prior stop"):
+                bot.start_engine()
+
+            exchange.cancel_order = original_cancel
+            bot.reconcile_idle_orders()
+            self.assertEqual(exchange.fetch_open_orders("BTC/USDT"), [])
+            self.assertIsNone(bot.database.get_state(grid_main.ENGINE_STOP_CLEANUP_KEY))
+            self.assertIsNone(bot.database.get_state(grid_main.ORDER_CLEANUP_ALARM_KEY))
 
     def test_manual_unpause_respects_downside_guard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
