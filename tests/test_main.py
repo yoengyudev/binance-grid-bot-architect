@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -1110,10 +1111,44 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(bot.run_cycle(), [])
             asyncio.run(bot.run(AsyncMock()))
             self.assertEqual(exchange.orders, {})
-            self.assertEqual(bot.start_engine()["engine_status"],
+            with self.assertRaisesRegex(TradingHalt, "Review the saved pending grid"):
+                bot.start_engine()
+            self.assertEqual(exchange.orders, {})
+            pending_text = database.get_state("grid_reset")
+            token = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()
+            with self.assertRaisesRegex(TradingHalt, "Review the saved pending grid"):
+                bot.start_engine(pending_grid_token="0" * 64)
+            self.assertEqual(bot.start_engine(pending_grid_token=token)["engine_status"],
                              grid_main.ENGINE_RUNNING)
             self.assertTrue(bot.reset_grid())
             self.assertGreater(len(bot.database.fetch_active_grids()), 0)
+            notice = json.loads(database.get_state("grid_reset_notification_pending"))
+            self.assertEqual(notice["event"], "saved_pending")
+
+    def test_idle_pending_grid_can_be_replaced_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid.sqlite3")
+            database.set_state(grid_main.ENGINE_STATUS_KEY, grid_main.ENGINE_IDLE)
+            exchange = FakeSpotExchange()
+            exchange.base_free = Decimal("0")
+            config = GridConfig(
+                "BTC/USDT", Decimal("1000"), Decimal("80"), Decimal("120"),
+                Decimal("10"), Decimal("50"), Decimal("70"), 2,
+            )
+            bot = GridBot(config, exchange, database)
+            bot.ready_mode = True
+            bot.request_initial_grid("100", "20", "30", "1000", 10)
+            old_token = hashlib.sha256(database.get_state("grid_reset").encode()).hexdigest()
+            bot.request_manual_recenter("102", "20", "30", "1000", 10)
+            pending = json.loads(database.get_state("grid_reset"))
+            self.assertEqual(pending["source"], "manual_recenter")
+            self.assertEqual(pending["center_price"], "102")
+            with self.assertRaisesRegex(TradingHalt, "Review the saved pending grid"):
+                bot.start_engine(pending_grid_token=old_token)
+            self.assertEqual(exchange.orders, {})
+            database.insert_order("still-open", 1, "BUY", "90", "0.01")
+            with self.assertRaisesRegex(TradingHalt, "live bot orders"):
+                bot.request_manual_recenter("101", "20", "30", "1000", 10)
 
     def test_master_stop_stays_idle_when_exchange_cancellation_times_out(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1732,8 +1767,9 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(restarted.database.get_state(grid_main.BREAKOUT_WIDTH_KEY),
                              "25")
             self.assertEqual(restarted.database.get_state("grid_reset"), None)
-            self.assertEqual(restarted.database.get_state(
-                "grid_reset_notification_pending"), "1")
+            notice = json.loads(restarted.database.get_state(
+                "grid_reset_notification_pending"))
+            self.assertEqual(notice["event"], "manual_recenter")
             self.assertEqual(
                 exchange.base_free + sum(
                     Decimal(row["amount"]) for row in
@@ -1966,9 +2002,9 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(bot.config.upper_price, Decimal("120"))
             self.assertEqual(bot.anchor, Decimal("100"))
             self.assertIsNone(bot.database.get_state(grid_main.BREAKOUT_NOTICE_KEY))
-            self.assertEqual(
-                bot.database.get_state("grid_reset_notification_pending"), "1"
-            )
+            notice = json.loads(bot.database.get_state(
+                "grid_reset_notification_pending"))
+            self.assertEqual(notice["event"], "breakout_faded")
 
     def test_uncertain_submission_is_not_retried(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

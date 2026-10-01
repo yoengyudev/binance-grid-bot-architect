@@ -136,6 +136,7 @@ class PauseRequest(BaseModel):
 
 class EngineStartRequest(BaseModel):
     auto_cover_inventory: StrictBool = False
+    pending_grid_token: Optional[str] = None
 
 
 class StopLossRequest(BaseModel):
@@ -489,6 +490,33 @@ def bot_status() -> Dict[str, Any]:
                            MANUAL_ACCOUNT_EXIT_REASON)
     engine_status = (database.get_state(ENGINE_STATUS_KEY) or
                      (ENGINE_RUNNING if bot is not None else ENGINE_IDLE))
+    pending_text = database.get_state("grid_reset")
+    pending_grid = None
+    if pending_text:
+        try:
+            pending = json.loads(pending_text)
+            pending_grid = {
+                "token": hashlib.sha256(pending_text.encode("utf-8")).hexdigest(),
+                "source": pending.get("source", "saved_grid"),
+                "phase": pending.get("phase"),
+                "center": pending.get("center_price"),
+                "lower": pending.get("lower"),
+                "upper": pending.get("upper"),
+                "stop_loss": pending.get(
+                    "stop_loss_price", str(bot.config.stop_loss_price) if bot else None
+                ),
+                "investment_quote": pending.get(
+                    "investment_quote", str(bot.config.investment_quote) if bot else None
+                ),
+                "buy_levels": pending.get(
+                    "buy_levels", bot.config.buy_grid_levels if bot else None
+                ),
+                "sell_levels": pending.get(
+                    "sell_levels", bot.config.sell_grid_levels if bot else None
+                ),
+            }
+        except (TypeError, ValueError, AttributeError):
+            pending_grid = {"token": None, "source": "invalid"}
     atr = app.state.atr_snapshot if bot is not None else None
     order_book = app.state.order_book_snapshot if bot is not None else None
     stop_value = getattr(bot.config, "stop_loss_price", None) if bot is not None else None
@@ -516,6 +544,7 @@ def bot_status() -> Dict[str, Any]:
         "pause_mode": safety_mode,
         "engine_status": engine_status,
         "engine_fault": database.get_state(ENGINE_FAULT_KEY),
+        "pending_grid": pending_grid,
         "has_grid_run": database.get_state("grid_run") is not None,
         "trading_state": "ACCOUNT_CLEARED" if manual_account_exit else safety_mode if safety_mode in (
             LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING,
@@ -648,7 +677,8 @@ def start_engine(response: Response,
         raise HTTPException(status_code=503, detail="The ready-mode engine is offline.")
     try:
         result = bot.start_engine(
-            auto_cover_inventory=(payload.auto_cover_inventory if payload else False)
+            auto_cover_inventory=(payload.auto_cover_inventory if payload else False),
+            pending_grid_token=(payload.pending_grid_token if payload else None),
         )
     except InsufficientGridCapital as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
@@ -1672,7 +1702,14 @@ class GridBot:
                 if self.is_paused and self.database.get_state(SAFETY_MODE_KEY) != PAUSED_SIZING:
                     raise TradingHalt("Release Safety Pause before re-anchoring the grid.")
                 if self.grid_needs_reset or self.database.get_state("grid_reset"):
-                    raise TradingHalt("A grid reset is already in progress.")
+                    if self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE:
+                        raise TradingHalt("A grid reset is already in progress.")
+                    if self.database.fetch_active_grids() or any(
+                            self._is_bot_order(order) for order in self._live_open_orders()):
+                        raise TradingHalt(
+                            "Saved grid still has live bot orders; STOP and verify "
+                            "cancellation before replacing it."
+                        )
                 if self.database.get_state("grid_run") is None:
                     raise TradingHalt("No active grid run is available.")
                 if requested_stop is None and self.config.stop_loss_price >= lower:
@@ -1714,6 +1751,7 @@ class GridBot:
                 if requested_stop is not None:
                     request["stop_loss_price"] = str(requested_stop)
                 self.database.set_state("grid_reset", json.dumps(request, sort_keys=True))
+                self.database.clear_state(RECONCILE_COVER_KEY)
                 self.database.clear_state(BREAKOUT_TIMER_KEY)
                 self.pending_grid_bounds = (lower, upper)
                 self.grid_needs_reset = True
@@ -2820,7 +2858,13 @@ class GridBot:
                     BREAKOUT_NOTICE_KEY if request.get("source") == "breakout"
                     else "grid_reset_notification_pending"
                 )
-                self.database.finish_grid_reset(notification_key)
+                notification_value = "1" if notification_key == BREAKOUT_NOTICE_KEY else json.dumps({
+                    "event": ("saved_pending" if request.get("started_from_idle")
+                              else request.get("source", "grid_reset")),
+                    "lower": request.get("lower"),
+                    "upper": request.get("upper"),
+                }, sort_keys=True)
+                self.database.finish_grid_reset(notification_key, notification_value)
                 self.pending_grid_bounds = None
                 self.grid_needs_reset = False
                 return True
@@ -3255,7 +3299,8 @@ class GridBot:
             return {"engine_status": ENGINE_IDLE, "bot_orders_cleared": True,
                     "remaining_exchange_orders": len(self._live_open_orders())}
 
-    def start_engine(self, *, auto_cover_inventory: bool = False) -> Dict[str, Any]:
+    def start_engine(self, *, auto_cover_inventory: bool = False,
+                     pending_grid_token: Optional[str] = None) -> Dict[str, Any]:
         """Reconcile first; resume matched orders or queue a guarded rebuild."""
         with self._cycle_lock:
             state = self._reconcile_state()
@@ -3277,6 +3322,19 @@ class GridBot:
                         PAUSED_SIZING, LIQUIDATING, LIQUIDATED,
                         LIQUIDATION_HALTED):
                 raise TradingHalt(f"Cannot start while safety mode is {mode}.")
+            pending_text = self.database.get_state("grid_reset")
+            if self.grid_needs_reset and not pending_text:
+                raise TradingHalt("A pending grid is missing from SQLite; manual review required.")
+            if pending_grid_token and not pending_text:
+                raise TradingHalt("The pending grid changed; review it again before START.")
+            if pending_text:
+                expected = hashlib.sha256(pending_text.encode("utf-8")).hexdigest()
+                if not pending_grid_token or not secrets.compare_digest(
+                        pending_grid_token, expected):
+                    raise TradingHalt(
+                        "Review the saved pending grid before START. Refresh the dashboard "
+                        "and confirm its exact settings."
+                    )
             unhedged = state["unhedged_btc"]
             if unhedged:
                 if not auto_cover_inventory:
@@ -3311,6 +3369,12 @@ class GridBot:
                 self.pending_grid_bounds = (self.config.lower_price,
                                             self.config.upper_price)
                 self.grid_needs_reset = True
+            if pending_text:
+                if self.database.get_state("grid_reset") != pending_text:
+                    raise TradingHalt("The pending grid changed; review it again before START.")
+                pending = json.loads(pending_text)
+                pending["started_from_idle"] = True
+                self.database.set_state("grid_reset", json.dumps(pending, sort_keys=True))
             if unhedged:
                 needed = state["covered_btc"] + unhedged * (1 - SELL_AMOUNT_BUFFER)
                 self.database.set_state(RECONCILE_COVER_KEY, str(needed))
@@ -3639,9 +3703,22 @@ class GridBot:
                                 self.config.poll_seconds,
                             )
                         continue
-                    if self.database.get_state("grid_reset_notification_pending"):
+                    notification_text = self.database.get_state(
+                        "grid_reset_notification_pending"
+                    )
+                    if notification_text:
                         try:
-                            await notifier.notify_grid_reset()
+                            try:
+                                notification = json.loads(notification_text)
+                            except (TypeError, ValueError):
+                                notification = {}
+                            if not isinstance(notification, dict):
+                                notification = {}
+                            await notifier.notify_grid_reset(
+                                notification.get("event"),
+                                notification.get("lower"),
+                                notification.get("upper"),
+                            )
                         except Exception:
                             LOGGER.warning("Grid reset notification could not be delivered.")
                         else:

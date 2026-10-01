@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -172,7 +174,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "status": "Offline", "pair": "BTC/USDT",
                     "safety_pause": "Normal", "pause_mode": None,
                     "trading_state": "IDLE", "engine_status": "IDLE",
-                    "engine_fault": None, "has_grid_run": False,
+                    "engine_fault": None, "pending_grid": None,
+                    "has_grid_run": False,
                     "grid_levels": 0,
                     "exact_grid_recenter_supported": True,
                     "lower_bound": None, "upper_bound": None,
@@ -186,6 +189,22 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                         "unrealized_pnl": None,
                     },
                 })
+
+                saved_grid = json.dumps({
+                    "phase": "placing", "source": "manual_recenter",
+                    "center_price": "83700", "lower": "79129.8",
+                    "upper": "88270.2", "buy_levels": 5, "sell_levels": 5,
+                }, sort_keys=True)
+                database.set_state("grid_reset", saved_grid)
+                with patch.object(grid_main, "GridDatabase", return_value=database):
+                    pending_status = await client.get("/api/bot/status")
+                preview = pending_status.json()["pending_grid"]
+                self.assertEqual(preview["center"], "83700")
+                self.assertEqual(preview["buy_levels"], 5)
+                self.assertEqual(preview["token"], hashlib.sha256(
+                    saved_grid.encode("utf-8")
+                ).hexdigest())
+                database.clear_state("grid_reset")
 
                 database.insert_order("buy", 1, "BUY", "81000", "0.01")
                 database.insert_order("sell", -1, "SELL", "90000", "0.01")
@@ -242,7 +261,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "pause_mode": grid_main.PAUSED_DOWNSIDE,
             "trading_state": "ACTIVE", "engine_status": "RUNNING",
-            "engine_fault": None, "has_grid_run": False,
+            "engine_fault": None, "pending_grid": None,
+            "has_grid_run": False,
             "grid_levels": 2,
             "exact_grid_recenter_supported": True,
             "lower_bound": 81000.0, "upper_bound": 90000.0,
@@ -707,7 +727,8 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(started.headers["cache-control"], "no-store")
                     covered = await client.post(
                         "/api/engine/start", headers=origin,
-                        json={"auto_cover_inventory": True},
+                        json={"auto_cover_inventory": True,
+                              "pending_grid_token": "a" * 64},
                     )
                     self.assertEqual(covered.status_code, 200)
                     bot.start_engine.side_effect = grid_main.TradingHalt(
@@ -721,11 +742,13 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(bot.start_engine.call_count, 3)
                     self.assertEqual(
                         bot.start_engine.call_args_list[0].kwargs,
-                        {"auto_cover_inventory": False},
+                        {"auto_cover_inventory": False,
+                         "pending_grid_token": None},
                     )
                     self.assertEqual(
                         bot.start_engine.call_args_list[1].kwargs,
-                        {"auto_cover_inventory": True},
+                        {"auto_cover_inventory": True,
+                         "pending_grid_token": "a" * 64},
                     )
                     bot.stop_engine.assert_called_once_with()
         finally:

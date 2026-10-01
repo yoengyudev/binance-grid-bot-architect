@@ -73,6 +73,22 @@ class TelegramNotifierTests(unittest.TestCase):
         self.assertIn("LIQUIDATED", send.await_args_list[0].args[0])
         self.assertIn("HALTED", send.await_args_list[1].args[0])
 
+    def test_saved_grid_and_recenter_alerts_are_distinct(self) -> None:
+        notifier = TelegramNotifier("secret-token", 42)
+        with patch("telegram_bot.send_telegram_alert", new_callable=AsyncMock) as send:
+            asyncio.run(notifier.notify_grid_reset(
+                "saved_pending", "78101.71", "89638.29"
+            ))
+            asyncio.run(notifier.notify_grid_reset(
+                "manual_recenter", "79129.80", "88270.20"
+            ))
+        first = send.await_args_list[0].args[0]
+        second = send.await_args_list[1].args[0]
+        self.assertIn("Saved pending grid", first)
+        self.assertIn("Grid re-anchored", second)
+        self.assertIn("78101.71", first)
+        self.assertIn("88270.20", second)
+
 
 if __name__ == "__main__":
     unittest.main()

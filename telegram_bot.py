@@ -114,8 +114,19 @@ class TelegramNotifier:
         # Exchange exception text can include sensitive request details.
         await self._send(f"Critical bot error: {type(error).__name__}.")
 
-    async def notify_grid_reset(self) -> None:
-        await self._send("✅ New grid successfully placed and active.")
+    async def notify_grid_reset(self, event: str = None,
+                                lower: str = None, upper: str = None) -> None:
+        if event == "saved_pending":
+            message = "✅ Saved pending grid activated."
+        elif event == "manual_recenter":
+            message = "✅ Grid re-anchored and active."
+        elif event == "engine_resume":
+            message = "✅ Saved grid rebuilt and active."
+        else:
+            message = "✅ New grid successfully placed and active."
+        if lower is not None and upper is not None:
+            message += f" Bounds: {lower} to {upper} USDT."
+        await self._send(message)
 
     async def notify_hard_stop(self, liquidated: bool) -> None:
         if liquidated:
