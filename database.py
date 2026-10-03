@@ -699,7 +699,7 @@ class GridDatabase:
                     "'hard_stop_notification_pending')"
                 )
 
-    def clear_state(self, key: str) -> None:
+    def clear_state(self, key: str, *, trigger_event: Optional[str] = None) -> None:
         with self._connection() as connection:
             self._begin_transaction(connection)
             previous = connection.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
@@ -707,7 +707,7 @@ class GridDatabase:
             if previous is not None and key in ("engine_status", "safety_mode"):
                 self._journal(connection, previous["value"],
                               "NORMAL" if key == "safety_mode" else None,
-                              f"{key.upper()}_CLEARED")
+                              trigger_event or f"{key.upper()}_CLEARED")
 
     def factory_reset(self) -> None:
         """Erase trading history atomically while retaining restart configuration."""

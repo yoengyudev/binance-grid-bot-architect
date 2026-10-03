@@ -815,7 +815,7 @@ def recenter_grid(payload: RecenterRequest,
         raise HTTPException(status_code=code, detail=str(error)) from error
     except TradingHalt as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    except (ccxt.BaseError, OSError, RuntimeError) as error:
+    except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
         LOGGER.exception("Manual grid recenter request failed.")
         raise HTTPException(status_code=502, detail="Could not queue the grid reset.") from error
     return {"status": "queued", "lower_bound": float(lower),

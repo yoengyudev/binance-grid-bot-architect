@@ -46,6 +46,7 @@ from settings import (
     MIN_GRID_ORDER_NOTIONAL,
     ORDER_CLIENT_PREFIX,
     ORDER_CLIENT_PREFIX_KEY,
+    ORDER_CLEANUP_ALARM_KEY,
     PAUSED_DOWNSIDE,
     PAUSED_MANUAL,
     PAUSED_RESET,
@@ -951,9 +952,21 @@ class GridBot:
                     return self._restart_liquidated_run(
                         center, width_percent, lower, upper, requested_stop, candidate
                     )
-                if self.database.get_state(SAFETY_MODE_KEY) == PAUSED_RESET:
-                    raise TradingHalt("Orders are cleared for reset; complete the reset before re-anchoring.")
-                if self.is_paused and self.database.get_state(SAFETY_MODE_KEY) != PAUSED_SIZING:
+                mode = self.database.get_state(SAFETY_MODE_KEY)
+                releasing_reset = mode == PAUSED_RESET
+                if releasing_reset:
+                    self._assert_reset_reanchor_ready()
+                    # Exchange verification must finish before the SQLite transaction.
+                    live = self._full_account_open_orders()
+                    if any(not isinstance(order, dict) for order in live):
+                        raise TradingHalt("Binance returned an invalid open order.")
+                    known = self.database.fetch_all_orders()
+                    if any(self._is_bot_order(order, known) for order in live):
+                        raise TradingHalt(
+                            "Bot orders remain on Binance; retry order cleanup before re-anchoring."
+                        )
+                    self._record_exchange_audit()
+                if self.is_paused and mode not in (PAUSED_SIZING, PAUSED_RESET):
                     raise TradingHalt("Release Safety Pause before re-anchoring the grid.")
                 if self.grid_needs_reset or self.database.get_state("grid_reset"):
                     if self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE:
@@ -1005,12 +1018,40 @@ class GridBot:
                 if requested_stop is not None:
                     request["stop_loss_price"] = str(requested_stop)
                 with self.database.transaction():
+                    if releasing_reset:
+                        # Fail closed if another writer changed the safety state during validation.
+                        self.assert_runner_lease()
+                        self._assert_reset_reanchor_ready()
                     self.database.set_state("grid_reset", json.dumps(request, sort_keys=True))
                     self.database.clear_state(RECONCILE_COVER_KEY)
                     self.database.clear_state(BREAKOUT_TIMER_KEY)
+                    if releasing_reset:
+                        self.database.clear_state(
+                            SAFETY_MODE_KEY, trigger_event="RESET_REANCHOR_QUEUED"
+                        )
+                        self.database.clear_state(SAFETY_PAUSE_NOTICE_KEY)
+                        self.database.clear_state(SAFETY_RECOVERY_NOTICE_KEY)
+                        self.database.clear_state(SAFETY_RESUME_NOTICE_KEY)
                 self.pending_grid_bounds = (lower, upper)
                 self.grid_needs_reset = True
+                if releasing_reset:
+                    self.is_paused = False
                 return lower, upper
+
+    def _assert_reset_reanchor_ready(self) -> None:
+        """Release only a clean reset lock; this never starts the engine."""
+        if self.database.get_state(SAFETY_MODE_KEY) != PAUSED_RESET:
+            raise TradingHalt("Safety mode changed; refresh before re-anchoring.")
+        if self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE:
+            raise TradingHalt("STOP the engine before queuing a new Re-anchor Grid.")
+        if (self.stop_controller.stop_requested.is_set() or
+                self.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1" or
+                self.database.fetch_active_grids()):
+            raise TradingHalt("Order cleanup is incomplete; retry cleanup before re-anchoring.")
+        if any(self.database.get_state(key) for key in (
+                "halt_reason", ENGINE_FAULT_KEY, ORDER_CLEANUP_ALARM_KEY,
+                GHOST_ORDER_ALARM_KEY, LIQUIDATION_KEY, LIQUIDATION_ALARM_KEY)):
+            raise TradingHalt("An unresolved trading fault requires review before re-anchoring.")
 
     def _restart_liquidated_run(self, center: Decimal, width_percent: Decimal,
                                 lower: Decimal, upper: Decimal,
