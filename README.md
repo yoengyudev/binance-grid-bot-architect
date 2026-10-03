@@ -46,9 +46,35 @@ flowchart LR
     Engine -->|One-way HTTPS alerts| TG[Telegram owner chat]
 ```
 
-The backend source is in this directory. The frontend is the sibling `web-dashboard/` project in the development workspace. `main.py` runs the trading loop, FastAPI, and asynchronous market-data refresh in one process. SQLite records order and trade history, active settings, trailing-stop state, pause modes, and reset progress so the bot can reconcile state after a restart. `database.py` uses decimal strings for monetary values; `exchange_handler.py` creates the rate-limited, environment-isolated CCXT client.
+The backend source is in this directory. The frontend is the sibling `web-dashboard/` project in the development workspace. The services still run in one process, with these module boundaries:
+
+| Module | Responsibility |
+| --- | --- |
+| `main.py` | CLI entry point, service lifecycle, runner heartbeat, API and engine task supervision |
+| `api.py` | FastAPI app, authentication, status projections, dashboard controls |
+| `engine.py` | Grid execution, risk state machine, order reconciliation, startup recovery |
+| `models.py` | Pydantic request schemas, immutable grid config, exceptions, result structures |
+| `settings.py` | Validated environment settings, shared constants and state keys |
+| `market_data.py` | Hourly strategy ATR and dashboard order-book cache, with injected application state |
+| `portfolio.py` | Persisted fill snapshots, wallet cost basis, realized/unrealized fee calculations |
+| `telemetry.py` | Exception formatting and durable fault journaling |
+| `database.py` | Environment-isolated SQLite ledger, transactions, state and transition journal |
+| `exchange_handler.py` | CCXT client construction and API circuit breaker |
+| `stop_controller.py` | Stop coordination and verified tracked-order cancellation |
+
+CLI flags and dashboard endpoints are unchanged. `uvicorn main:app` remains valid; the app is defined in `api.py`. Programmatic engine/config imports should use `engine.GridBot` and `models.GridConfig`.
+
+SQLite records orders, fills, trades, active settings, trailing-stop state, pause modes, and reset progress. Monetary values remain decimal strings. `GridDatabase.transaction()` groups related local writes and journal entries into a single `BEGIN IMMEDIATE` transaction; nested operations use savepoints, and connections are isolated per thread. Engine activation, preparation, reset/pause controls, confirmed order snapshots/status, liquidation accounting, and terminal liquidation state now commit as coherent units. Exchange requests and notification delivery remain outside these transactions. Order intents commit before HTTP submission so an uncertain response remains recoverable by its exact client order ID.
+
+`tests/fakes.py` supplies shared deterministic exchange fixtures. `tests/test_fault_injections.py` covers ready-mode restart with active orders, cleanup/stop timeouts, no-fill liquidation across restart followed by a severe-slippage fill, failed fill/start/prepare/liquidation commits, and an abruptly terminated subprocess inside a multi-write SQLite transaction. The database tests also verify nested rollback and connection isolation across threads. Run the fault scenarios alone with `.venv/Scripts/python.exe -m unittest tests.test_fault_injections -v` using the dummy TESTNET settings above.
 
 ## Core execution engine
+
+### START recovery
+
+If a raised trailing stop overtakes a saved exact BUY level, START remains blocked. The API returns `GRID_STOP_CONFLICT` with the lowest BUY and current stop prices; the dashboard's **Review grid settings** action opens re-anchor controls. Keep all new BUY levels above the retained stop. Saving while IDLE queues settings for review; it does not start trading. The stop cannot be lowered to revive a stale grid.
+
+Small carried BTC can also limit the number of SELL lanes: each exchange-rounded SELL must meet the minimum notional. Explicitly select fewer levels if the retained inventory cannot fund every SELL lane. Increasing quote allocation alone does not enlarge carried BTC. Re-anchor validation may advance the trailing floor using the latest price, so a fixed stop copied from an earlier snapshot can become stale.
 
 ### Start and trade lifecycle
 

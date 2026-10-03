@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from database import GridDatabase
+from exchange_handler import ApiCircuitBreaker
 from stop_controller import StopController
 
 
@@ -46,6 +47,27 @@ class StopControllerTests(unittest.TestCase):
                 ["unknown-outcome"],
             )
             self.assertEqual(len(exchange.canceled), 3)
+            journal = GridDatabase(database.path).fetch_transition_journal()
+            details = "\n".join(row["error_details"] or "" for row in journal)
+            for text in ("Already filled", "Network unavailable", "Cannot verify order",
+                         "RuntimeError", "Traceback", "unknown-outcome"):
+                self.assertIn(text, details)
+            self.assertIn("STOP", [row["trigger_event"] for row in journal])
+
+    def test_open_circuit_defers_all_remaining_cleanup_without_network_calls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
+            for order_id in ("one", "two", "three"):
+                database.insert_order(order_id, 0, "BUY", "100", "0.1")
+            exchange = FakeExchange()
+            exchange.api_circuit_breaker = ApiCircuitBreaker(clock=lambda: 100)
+            for _ in range(3):
+                exchange.api_circuit_breaker.rate_limited()
+            result = StopController(exchange, database, "BTC/USDT").request_stop()
+            self.assertEqual(result.unresolved, 3)
+            self.assertEqual(exchange.canceled, [])
+            self.assertEqual(len(database.fetch_active_grids()), 3)
+            self.assertIn("CircuitOpenError", database.fetch_transition_journal()[-1]["error_details"])
 
 
 if __name__ == "__main__":

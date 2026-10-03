@@ -158,9 +158,10 @@ class TradingEnvironmentTests(unittest.TestCase):
         code = (
             "from unittest.mock import patch; "
             "guard = patch('dotenv.load_dotenv'); guard.start(); "
-            "import main; main.app.state.monitor_only = True; "
-            "assert main.bot_status()['trading_environment'] == "
-            "main.TRADING_SETTINGS.environment.value"
+            "import api; import settings; api.app.state.monitor_only = True; "
+            "patch('api._unprotected_exposure_payload', return_value={}).start(); "
+            "assert api.bot_status(api.Response())['trading_environment'] == "
+            "settings.TRADING_SETTINGS.environment.value"
         )
         for environment in TradingEnvironment:
             with self.subTest(environment=environment):

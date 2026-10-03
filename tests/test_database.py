@@ -12,6 +12,77 @@ from database import GridDatabase
 
 
 class GridDatabaseTests(unittest.TestCase):
+    def test_nested_transaction_failure_uses_a_savepoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
+            database.set_state("engine_status", "IDLE")
+            journal = database.fetch_transition_journal()
+            with database.transaction():
+                database.set_state("outer_key", "committed")
+                try:
+                    with database.transaction():
+                        database.insert_order("rolled-back", 1, "BUY", "90", "1")
+                        database.set_state("engine_status", "RUNNING")
+                        raise ValueError("Injected nested failure")
+                except ValueError:
+                    pass
+                self.assertEqual(database.get_state("engine_status"), "IDLE")
+                self.assertIsNone(database.get_order("rolled-back"))
+            reopened = GridDatabase(database.path)
+            self.assertEqual(reopened.get_state("outer_key"), "committed")
+            self.assertEqual(reopened.fetch_transition_journal(), journal)
+
+    def test_transaction_connection_is_not_shared_between_threads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
+            database.set_state("engine_status", "IDLE")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                with database.transaction():
+                    database.set_state("engine_status", "RUNNING")
+                    self.assertEqual(database.get_state("engine_status"), "RUNNING")
+                    # Another thread must see only committed data through its own connection.
+                    self.assertEqual(executor.submit(database.get_state, "engine_status").result(5),
+                                     "IDLE")
+                self.assertEqual(executor.submit(database.get_state, "engine_status").result(5),
+                                 "RUNNING")
+
+    def test_journal_survives_restart_and_factory_reset_with_utc_timestamps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "grid_testnet.sqlite"
+            database = GridDatabase(path)
+            database.set_state("engine_status", "RUNNING")
+            database.require_order_cleanup("Operator STOP", trigger_event="STOP")
+            database.set_state("safety_mode", "LIQUIDATING")
+            database.set_state("safety_mode", "LIQUIDATED")
+            database.set_state("engine_status", "HALTED")
+            database.record_transition("HALTED", "HALTED", "FAULT", "Full persisted fault details")
+            entries = GridDatabase(path).fetch_transition_journal()
+            self.assertEqual([entry["trigger_event"] for entry in entries], [
+                "START", "STOP", "LIQUIDATION_LIQUIDATING", "LIQUIDATION_LIQUIDATED", "HALTED", "FAULT",
+            ])
+            self.assertEqual((entries[1]["previous_state"], entries[1]["new_state"]), ("RUNNING", "IDLE"))
+            for entry in entries:
+                timestamp = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+                self.assertEqual(timestamp.tzinfo, timezone.utc)
+            database.factory_reset()
+            self.assertEqual(database.fetch_transition_journal()[:len(entries)], entries)
+            self.assertEqual(database.get_state("safety_mode"), "LIQUIDATED")
+
+    def test_state_and_journal_roll_back_together_if_journal_insert_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
+            database.set_state("engine_status", "IDLE")
+            with database._connection() as connection:
+                connection.execute("CREATE TRIGGER reject_journal BEFORE INSERT ON transition_journal "
+                                   "BEGIN SELECT RAISE(ABORT, 'journal unavailable'); END")
+            with self.assertRaises(sqlite3.IntegrityError):
+                database.set_state("engine_status", "RUNNING")
+            self.assertEqual(database.get_state("engine_status"), "IDLE")
+            with self.assertRaises(sqlite3.IntegrityError):
+                database.require_order_cleanup("Stop")
+            self.assertIsNone(database.get_state("engine_stop_cleanup_pending"))
+            self.assertEqual(len(database.fetch_transition_journal()), 1)
+
     def test_runner_lease_fences_competing_connections_and_expired_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "grid_testnet.sqlite"

@@ -22,7 +22,9 @@ from dotenv import load_dotenv
 from database import GridDatabase, resolve_database_path
 from exchange_handler import BASE_DIR, create_exchange, load_config
 from trading_environment import TradingEnvironment, get_trading_settings
-from main import GridBot, GridConfig, _portfolio_wallet
+from engine import GridBot
+from models import GridConfig
+from portfolio import _portfolio_wallet
 
 
 SYMBOL = "BTC/USDT"

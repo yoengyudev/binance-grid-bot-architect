@@ -8,7 +8,7 @@ from unittest.mock import patch
 from database import GridDatabase
 from docker_runner import main as docker_main, ready_to_start
 from exchange_handler import load_config
-from main import GridConfig
+from models import GridConfig
 
 
 class DockerSupportTests(unittest.TestCase):

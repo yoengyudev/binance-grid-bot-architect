@@ -8,6 +8,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from threading import local
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 from trading_environment import BASE_DIR, get_trading_settings
@@ -59,20 +60,68 @@ class GridDatabase:
     def __init__(self, path: Optional[PathValue] = None) -> None:
         self.environment = get_trading_settings().environment
         self.path = resolve_database_path(path)
+        self._transactions = local()
         self.initialize()
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
+        active = getattr(self._transactions, "connection", None)
+        if active is not None:
+            # Each operation remains rollback-safe even if its caller catches an
+            # exception inside the larger unit of work.
+            serial = getattr(self._transactions, "serial", 0) + 1
+            self._transactions.serial = serial
+            savepoint = f"operation_{serial}"
+            active.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield active
+            except BaseException:
+                active.execute(f"ROLLBACK TO {savepoint}")
+                raise
+            finally:
+                active.execute(f"RELEASE {savepoint}")
+            return
         with closing(sqlite3.connect(str(self.path), timeout=10)) as connection:
             connection.row_factory = sqlite3.Row
             with connection:
                 yield connection
 
+    @staticmethod
+    def _begin_transaction(connection: sqlite3.Connection) -> None:
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+
+    @property
+    def in_transaction(self) -> bool:
+        return getattr(self._transactions, "connection", None) is not None
+
+    @contextmanager
+    def transaction(self) -> Iterator["GridDatabase"]:
+        """Commit a synchronous local unit of work, including its journal, once.
+
+        Existing methods reuse this thread's connection. Never await or perform
+        exchange/notification I/O here: order intents must commit before HTTP.
+        Nested units use savepoints and all failures, including interrupts,
+        roll back their writes.
+        """
+        if self.in_transaction:
+            with self._connection():
+                yield self
+            return
+        with self._connection() as connection:
+            self._begin_transaction(connection)
+            self._transactions.connection = connection
+            self._transactions.serial = 0
+            try:
+                yield self
+            finally:
+                self._transactions.connection = None
+
     def initialize(self) -> None:
         """Create tables and indexes without changing any existing rows."""
         with self._connection() as connection:
             # Bind the file itself too: renaming/copying it cannot change networks.
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
             tables = {row["name"] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
                 "AND name NOT LIKE 'sqlite_%'"
@@ -182,6 +231,23 @@ class GridDatabase:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS transition_journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL DEFAULT
+                        (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    previous_state TEXT,
+                    new_state TEXT,
+                    trigger_event TEXT NOT NULL,
+                    error_details TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transition_journal_timestamp "
+                "ON transition_journal (timestamp)"
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS runner_lease (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     owner_token TEXT NOT NULL,
@@ -284,7 +350,7 @@ class GridDatabase:
         if status not in ORDER_TRANSITIONS:
             raise ValueError(f"Unsupported order status: {status}")
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
             row = connection.execute(
                 "SELECT status FROM grid_orders WHERE order_id = ?", (str(order_id),)
             ).fetchone()
@@ -378,7 +444,7 @@ class GridDatabase:
     def get_or_create_state(self, key: str, value: str) -> str:
         """Initialize a shared state key once across competing processes."""
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
             connection.execute(
                 "INSERT INTO bot_state (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO NOTHING", (key, value),
@@ -401,7 +467,7 @@ class GridDatabase:
             raise ValueError("Runner lease requires an owner and positive TTL.")
         now = self._lease_time_ms(now_ms)
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
             row = connection.execute(
                 "SELECT owner_token, epoch, expires_at_ms FROM runner_lease WHERE id = 1"
             ).fetchone()
@@ -457,8 +523,34 @@ class GridDatabase:
             ).rowcount
         return changed == 1
 
-    def set_state(self, key: str, value: str) -> None:
+    @staticmethod
+    def _journal(connection: sqlite3.Connection, previous_state: Optional[str],
+                 new_state: Optional[str], trigger_event: str,
+                 error_details: Optional[str] = None) -> int:
+        cursor = connection.execute(
+            "INSERT INTO transition_journal "
+            "(previous_state, new_state, trigger_event, error_details) VALUES (?, ?, ?, ?)",
+            (previous_state, new_state, trigger_event, error_details),
+        )
+        return cursor.lastrowid
+
+    def record_transition(self, previous_state: Optional[str], new_state: Optional[str],
+                          trigger_event: str, error_details: Optional[str] = None) -> int:
+        """Append a durable event, including failures that leave state unchanged."""
         with self._connection() as connection:
+            return self._journal(connection, previous_state, new_state, trigger_event, error_details)
+
+    def fetch_transition_journal(self) -> List[Dict[str, Any]]:
+        with self._connection() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM transition_journal ORDER BY id"
+            )]
+
+    def set_state(self, key: str, value: str, *, trigger_event: Optional[str] = None,
+                  error_details: Optional[str] = None) -> None:
+        with self._connection() as connection:
+            self._begin_transaction(connection)
+            previous = connection.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
             connection.execute(
                 """
                 INSERT INTO bot_state (key, value) VALUES (?, ?)
@@ -466,11 +558,24 @@ class GridDatabase:
                 """,
                 (key, value),
             )
+            if key in ("engine_status", "safety_mode") and (
+                    previous is None or previous["value"] != value or trigger_event is not None):
+                event = trigger_event or (
+                    "START" if key == "engine_status" and value == "RUNNING" else
+                    f"LIQUIDATION_{value}" if key == "safety_mode" and value in
+                    ("LIQUIDATING", "LIQUIDATED", "HALTED") else value
+                )
+                self._journal(connection, previous["value"] if previous else None,
+                              value, event, error_details)
 
-    def require_order_cleanup(self, reason: str) -> None:
+    def require_order_cleanup(self, reason: str, *, trigger_event: str = "IDLE_CLEANUP_REQUIRED",
+                              error_details: Optional[str] = None) -> None:
         """Atomically stop placement and persist the exchange cleanup obligation."""
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
+            previous = connection.execute(
+                "SELECT value FROM bot_state WHERE key = 'engine_status'"
+            ).fetchone()
             for key, value in (
                 ("engine_stop_cleanup_pending", "1"),
                 ("engine_status", "IDLE"),
@@ -481,22 +586,33 @@ class GridDatabase:
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (key, value),
                 )
+            self._journal(connection, previous["value"] if previous else None,
+                          "IDLE", trigger_event, error_details or reason)
 
     def complete_order_cleanup(self) -> None:
         """Clear the obligation only after the caller verifies the exchange book."""
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
+            pending = connection.execute(
+                "SELECT value FROM bot_state WHERE key = 'engine_stop_cleanup_pending'"
+            ).fetchone()
             connection.execute(
                 "DELETE FROM bot_state WHERE key IN "
                 "('engine_stop_cleanup_pending', 'order_cleanup_alarm')"
             )
+            if pending is not None:
+                state = connection.execute(
+                    "SELECT value FROM bot_state WHERE key = 'engine_status'"
+                ).fetchone()
+                current = state["value"] if state else None
+                self._journal(connection, current, current, "ORDER_CLEANUP_COMPLETE")
 
     def update_runtime_grid_settings(self, grid_run: str, active_config: str,
                                      *, trailing_stop: Optional[str] = None,
                                      allow_pending_reset: bool = False) -> None:
         """Persist a setting change with its matching run fingerprint atomically."""
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
             saved_run = connection.execute(
                 "SELECT value FROM bot_state WHERE key = 'grid_run'"
             ).fetchone()
@@ -529,7 +645,7 @@ class GridDatabase:
                             clear_liquidation_state: bool = False) -> None:
         """Archive old lanes and switch runs in one SQLite transaction."""
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
             if clear_liquidation_state:
                 mode = connection.execute(
                     "SELECT value FROM bot_state WHERE key = 'safety_mode'"
@@ -576,6 +692,7 @@ class GridDatabase:
                     (key, value),
                 )
             if clear_liquidation_state:
+                self._journal(connection, "LIQUIDATED", "NORMAL", "LIQUIDATION_RESET")
                 connection.execute(
                     "DELETE FROM bot_state WHERE key IN "
                     "('safety_mode', 'halt_reason', 'hard_stop_liquidation', "
@@ -584,18 +701,34 @@ class GridDatabase:
 
     def clear_state(self, key: str) -> None:
         with self._connection() as connection:
+            self._begin_transaction(connection)
+            previous = connection.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
             connection.execute("DELETE FROM bot_state WHERE key = ?", (key,))
+            if previous is not None and key in ("engine_status", "safety_mode"):
+                self._journal(connection, previous["value"],
+                              "NORMAL" if key == "safety_mode" else None,
+                              f"{key.upper()}_CLEARED")
 
     def factory_reset(self) -> None:
         """Erase trading history atomically while retaining restart configuration."""
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
             active = connection.execute(
                 "SELECT COUNT(*) FROM grid_orders "
                 "WHERE status IN ('OPEN', 'PARTIALLY_FILLED')"
             ).fetchone()[0]
             if active:
                 raise ValueError("Tracked orders remain active; reconcile them first.")
+            previous = connection.execute(
+                "SELECT value FROM bot_state WHERE key = 'engine_status'"
+            ).fetchone()
+            self._journal(connection, previous["value"] if previous else None,
+                          None, "FACTORY_RESET")
+            previous_mode = connection.execute(
+                "SELECT value FROM bot_state WHERE key = 'safety_mode'"
+            ).fetchone()
+            self._journal(connection, previous_mode["value"] if previous_mode else None,
+                          "LIQUIDATED", "FACTORY_RESET_SAFETY")
             connection.execute("DELETE FROM trade_history")
             connection.execute("DELETE FROM archived_grid_orders")
             connection.execute("DELETE FROM grid_orders")
@@ -613,13 +746,23 @@ class GridDatabase:
                 (json.dumps({"phase": "complete", "residual_base": "0"}),),
             )
 
+    def discard_unsubmitted_order(self, order_id: str) -> None:
+        """Remove an intent only when the local circuit rejected it before HTTP."""
+        with self._connection() as connection:
+            changed = connection.execute(
+                "DELETE FROM grid_orders WHERE order_id = ? AND status = 'OPEN' "
+                "AND exchange_order_id IS NULL AND client_order_id IS NOT NULL", (order_id,),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("Unsubmitted intent is not an unconfirmed OPEN order.")
+
     def finish_grid_reset(
         self, notification_key: str = "grid_reset_notification_pending",
         notification_value: str = "1",
     ) -> None:
         """Mark placement complete and queue its owner notification atomically."""
         with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_transaction(connection)
             connection.execute("DELETE FROM bot_state WHERE key = 'grid_reset'")
             connection.execute(
                 "INSERT INTO bot_state (key, value) VALUES (?, ?) "
