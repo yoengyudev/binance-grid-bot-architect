@@ -1055,14 +1055,36 @@ class GridBot:
                 GHOST_ORDER_ALARM_KEY, LIQUIDATION_KEY, LIQUIDATION_ALARM_KEY)):
             raise TradingHalt("An unresolved trading fault requires review before re-anchoring.")
 
+    def _assert_liquidation_reset_ready(self) -> None:
+        """A completed, fault-free exit may be replaced by a reviewed new grid."""
+        if self.database.get_state(SAFETY_MODE_KEY) != LIQUIDATED:
+            raise TradingHalt("Liquidation is unresolved; inspect exchange orders first.")
+        if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_RUNNING:
+            raise TradingHalt("STOP the engine before configuring a new grid after liquidation.")
+        if (self.stop_controller.stop_requested.is_set() or
+                self.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1" or
+                self.database.fetch_active_grids()):
+            raise TradingHalt("Order cleanup is incomplete; review it before resetting liquidation.")
+        if (self.database.get_state("halt_reason") not in (None, "hard_stop_liquidated") or
+                any(self.database.get_state(key) for key in (
+                    ENGINE_FAULT_KEY, ORDER_CLEANUP_ALARM_KEY,
+                    GHOST_ORDER_ALARM_KEY, LIQUIDATION_ALARM_KEY))):
+            raise TradingHalt("An unresolved trading fault requires review before resetting liquidation.")
+        try:
+            state = json.loads(self.database.get_state(LIQUIDATION_KEY) or "null")
+            residual = Decimal(state["residual_base"])
+            complete = state["phase"] == "complete" and residual.is_finite() and residual == 0
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            complete = False
+        if not complete:
+            raise TradingHalt("Liquidation is unresolved; inspect exchange orders first.")
+
     def _restart_liquidated_run(self, center: Decimal, width_percent: Decimal,
                                 lower: Decimal, upper: Decimal,
                                 stop_loss: Decimal, candidate: GridConfig,
                                 ) -> Tuple[Decimal, Decimal]:
         """Only an authenticated recenter may release a completed hard stop."""
-        state_text = self.database.get_state(LIQUIDATION_KEY)
-        if not state_text or json.loads(state_text).get("phase") != "complete":
-            raise TradingHalt("Liquidation is unresolved; inspect exchange orders first.")
+        self._assert_liquidation_reset_ready()
         if any(self._is_bot_order(order) for order in self._live_open_orders()):
             raise TradingHalt("Bot orders remain; cannot reset a liquidated grid.")
         if self.database.fetch_active_grids():
@@ -1091,6 +1113,7 @@ class GridBot:
         trailing = {"high_water_mark": str(center),
                     "stop_loss_distance": str(center - stop_loss)}
         request = {"phase": "placing", "source": "manual_liquidation_reset",
+                   "center_price": str(center), "stop_loss_price": str(stop_loss),
                    "lower": str(lower), "upper": str(upper),
                    "spacing": str(new_config.spacing_percent),
                    "investment_quote": str(new_config.investment_quote)}
@@ -1098,6 +1121,7 @@ class GridBot:
             request["buy_levels"] = new_config.buy_grid_levels
             request["sell_levels"] = new_config.sell_grid_levels
         with self.database.transaction():
+            self._assert_liquidation_reset_ready()
             self.database.complete_grid_reset(
                 json.dumps(run, sort_keys=True), json.dumps(active, sort_keys=True),
                 json.dumps(request, sort_keys=True),
@@ -1107,6 +1131,9 @@ class GridBot:
             )
             self.database.clear_state(LIQUIDATION_ALARM_KEY)
             self.database.clear_state(BREAKOUT_TIMER_KEY)
+            if self.ready_mode:
+                self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE,
+                                        trigger_event="LIQUIDATION_GRID_SAVED")
         self.config = new_config
         self.anchor = center
         self.baseline_base = baseline
@@ -2853,9 +2880,15 @@ class GridBot:
                 return {"engine_status": ENGINE_RUNNING}
             if not self.database.get_state("grid_run"):
                 raise TradingHalt("Configure a grid before starting the engine.")
+            mode = self.database.get_state(SAFETY_MODE_KEY)
+            if mode == LIQUIDATED:
+                self._assert_liquidation_reset_ready()
+                raise TradingHalt(
+                    "Hard-stop liquidation is complete. Save a new grid in Settings, "
+                    "then review and START the saved grid."
+                )
             if self.database.get_state("halt_reason"):
                 raise TradingHalt("A saved trading fault requires review before starting.")
-            mode = self.database.get_state(SAFETY_MODE_KEY)
             if mode in (PAUSED_DOWNSIDE, PAUSED_MANUAL, PAUSED_RESET,
                         PAUSED_SIZING, LIQUIDATING, LIQUIDATED,
                         LIQUIDATION_HALTED):

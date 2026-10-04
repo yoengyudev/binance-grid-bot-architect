@@ -22,6 +22,7 @@ from notifier import markdown_text, schedule_telegram_alert
 from settings import (
     AUTH_COOKIE_NAME,
     ENGINE_FAULT_KEY,
+    ENGINE_HALTED,
     ENGINE_IDLE,
     ENGINE_RUNNING,
     ENGINE_STATUS_KEY,
@@ -377,6 +378,7 @@ def bot_status(response: Response,
             "unresolved_order_alarm": bot.database.get_state(ORDER_CLEANUP_ALARM_KEY),
             "ghost_order_alarm": bot.database.get_state(GHOST_ORDER_ALARM_KEY),
             "has_grid_run": False, "grid_levels": 0,
+            "can_reset_liquidation": False,
             "exact_grid_recenter_supported": True,
             "lower_bound": None, "upper_bound": None,
             **_exchange_audit_telemetry(bot, bot.database),
@@ -400,6 +402,7 @@ def bot_status(response: Response,
             "order_cleanup_required": False, "unresolved_order_alarm": None,
             "ghost_order_alarm": None,
             "has_grid_run": False, "grid_levels": 0,
+            "can_reset_liquidation": False,
             "exact_grid_recenter_supported": False,
             "lower_bound": None, "upper_bound": None,
             "last_exchange_audit_time": None,
@@ -468,6 +471,13 @@ def bot_status(response: Response,
             high_water_mark = Decimal(json.loads(trailing_text)["high_water_mark"])
         except (KeyError, ValueError, InvalidOperation, TypeError):
             pass
+    can_reset_liquidation = False
+    if isinstance(bot, GridBot) and app.state.ready and safety_mode == LIQUIDATED:
+        try:
+            bot._assert_liquidation_reset_ready()
+            can_reset_liquidation = True
+        except TradingHalt:
+            pass  # Status reports the lock; the authenticated reset enforces it again.
     return {
         "trading_environment": TRADING_SETTINGS.environment.value,
         "status": "Online" if bot is not None else "Offline",
@@ -485,10 +495,12 @@ def bot_status(response: Response,
         "unresolved_order_alarm": database.get_state(ORDER_CLEANUP_ALARM_KEY),
         "ghost_order_alarm": database.get_state(GHOST_ORDER_ALARM_KEY),
         "pending_grid": pending_grid,
+        "can_reset_liquidation": can_reset_liquidation,
         "has_grid_run": database.get_state("grid_run") is not None,
         "trading_state": "ACCOUNT_CLEARED" if manual_account_exit else safety_mode if safety_mode in (
             LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING,
-            PAUSED_RESET) else (ENGINE_IDLE if engine_status == ENGINE_IDLE else "ACTIVE"),
+            PAUSED_RESET) else (engine_status if engine_status in
+                                   (ENGINE_IDLE, ENGINE_HALTED) else "ACTIVE"),
         **({"pause_reason": database.get_state(SIZING_PAUSE_REASON_KEY)}
            if safety_mode == PAUSED_SIZING else {}),
         "grid_levels": len(orders),
