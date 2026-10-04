@@ -15,14 +15,14 @@ import ccxt
 import httpx
 
 from database import GridDatabase
-from engine import GridBot
+from engine import GridBot, _reconcile_service_boot
 from models import GridConfig, GridSizingError, TradingHalt
 from settings import (
     BREAKOUT_TIMER_KEY, ENGINE_FAULT_KEY, ENGINE_HALTED, ENGINE_IDLE,
     ENGINE_RUNNING, ENGINE_STATUS_KEY, ENGINE_STOP_CLEANUP_KEY,
     GHOST_ORDER_ALARM_KEY, LIQUIDATION_ALARM_KEY, LIQUIDATION_KEY,
     ORDER_CLEANUP_ALARM_KEY, PAUSED_MANUAL, PAUSED_RESET, RISK_OVERRIDE_DENIED,
-    SAFETY_MODE_KEY, SAFETY_PAUSE_NOTICE_KEY,
+    SAFETY_MODE_KEY, SAFETY_PAUSE_NOTICE_KEY, TRAILING_STOP_KEY,
 )
 from tests.fakes import FakeSpotExchange, make_bot
 
@@ -98,6 +98,70 @@ class ResetReanchorTests(unittest.TestCase):
                 with self.assertRaisesRegex(TradingHalt, "STOP the engine"):
                     self.queue()
                 self.assert_locked()
+
+    def test_ready_restart_reanchors_before_prepare_and_restores_saved_risk_state(self):
+        reopened = GridBot(self.bot.config, self.exchange, GridDatabase(self.path))
+        reopened.ready_mode = True
+        self.assertIsNone(reopened.high_water_mark)
+        self.assertIsNone(reopened.baseline_base)
+        asyncio.run(_reconcile_service_boot(reopened, ready=True))
+        next_id = self.exchange.next_id
+
+        # This is the production ready-mode path: no prepare() before the API call.
+        reopened.request_manual_recenter('100', '20', '30', '1000', 10)
+        self.assertEqual(reopened.high_water_mark, Decimal('100'))
+        self.assertEqual(reopened.stop_loss_distance, Decimal('30'))
+        self.assertEqual(reopened.config.stop_loss_price, Decimal('70'))
+        self.assertIsNone(reopened.database.get_state(SAFETY_MODE_KEY))
+        self.assertEqual(reopened.database.get_state(ENGINE_STATUS_KEY), ENGINE_IDLE)
+        self.assertEqual(self.exchange.next_id, next_id)
+
+        saved = reopened.database.get_state('grid_reset')
+        token = hashlib.sha256(saved.encode('utf-8')).hexdigest()
+        reopened.start_engine(auto_cover_inventory=True, pending_grid_token=token)
+        self.assertTrue(reopened.reset_grid())
+        reopened.run_cycle()
+        reopened.run_cycle()
+        self.assertEqual(reopened.database.get_state(ENGINE_STATUS_KEY), ENGINE_RUNNING)
+        self.assertIsNone(reopened.database.get_state('grid_reset'))
+        self.assertEqual(len(reopened.database.fetch_active_grids()), 10)
+
+    def test_ready_restart_rejects_missing_or_corrupt_saved_trailing_state(self):
+        original = self.bot.database.get_state(TRAILING_STOP_KEY)
+        for value in (None, '{broken', '{"high_water_mark":"100","stop_loss_distance":"20"}'):
+            with self.subTest(value=value):
+                if value is None:
+                    self.bot.database.clear_state(TRAILING_STOP_KEY)
+                else:
+                    self.bot.database.set_state(TRAILING_STOP_KEY, value)
+                reopened = GridBot(self.bot.config, self.exchange, GridDatabase(self.path))
+                reopened.ready_mode = True
+                asyncio.run(_reconcile_service_boot(reopened, ready=True))
+                with self.assertRaises(TradingHalt):
+                    reopened.request_manual_recenter('100', '20', '30', '1000', 10)
+                self.assertEqual(reopened.database.get_state(SAFETY_MODE_KEY), PAUSED_RESET)
+                self.assertIsNone(reopened.database.get_state('grid_reset'))
+                self.assertIsNone(reopened.high_water_mark)
+        self.bot.database.set_state(TRAILING_STOP_KEY, original)
+
+    def test_ready_restart_reanchor_keeps_trailing_floor_monotonic(self):
+        reopened = GridBot(self.bot.config, self.exchange, GridDatabase(self.path))
+        reopened.ready_mode = True
+        asyncio.run(_reconcile_service_boot(reopened, ready=True))
+        self.exchange.price = Decimal('110')
+        with self.assertRaisesRegex(ValueError, RISK_OVERRIDE_DENIED):
+            reopened.request_manual_recenter('110', '20', '30', '1000', 10)
+        self.assertEqual(reopened.high_water_mark, Decimal('110'))
+        self.assertEqual(reopened.stop_loss_distance, Decimal('30'))
+        self.assertEqual(reopened.config.stop_loss_price, Decimal('80'))
+        self.assertIsNone(reopened.database.get_state('grid_reset'))
+        self.assertEqual(reopened.database.get_state(SAFETY_MODE_KEY), PAUSED_RESET)
+
+        reopened.request_manual_recenter('110', '20', '25', '1000', 10)
+        pending = json.loads(reopened.database.get_state('grid_reset'))
+        self.assertEqual(Decimal(pending['stop_loss_price']), Decimal('82.5'))
+        self.assertEqual(reopened.config.stop_loss_price, Decimal('80'))
+        self.assertEqual(reopened.database.get_state(ENGINE_STATUS_KEY), ENGINE_IDLE)
 
     def test_pending_cleanup_or_fault_cannot_unlock(self):
         for key in (ENGINE_STOP_CLEANUP_KEY, ENGINE_FAULT_KEY, "halt_reason",
@@ -200,6 +264,11 @@ class ResetReanchorTests(unittest.TestCase):
         import api
         from settings import FRONTEND_ORIGIN
 
+        self.bot = GridBot(self.bot.config, self.exchange, GridDatabase(self.path))
+        self.bot.ready_mode = True
+        asyncio.run(_reconcile_service_boot(self.bot, ready=True))
+        self.assertIsNone(self.bot.high_water_mark)
+
         async def exercise():
             previous_state = (api.app.state.grid_bot, api.app.state.standby,
                               api.app.state.monitor_only)
@@ -277,12 +346,24 @@ class ResetReanchorTests(unittest.TestCase):
                         bot.request_manual_recenter('84812', width, stop, capital, 10)
                     self.assertEqual(bot.database.get_state(SAFETY_MODE_KEY), PAUSED_RESET)
                     self.assertIsNone(bot.database.get_state('grid_reset'))
+            # Re-open without prepare(), as EC2 does after a ready-mode restart.
+            bot = GridBot(bot.config, exchange, GridDatabase(bot.database.path))
+            bot.ready_mode = True
+            asyncio.run(_reconcile_service_boot(bot, ready=True))
             next_id = exchange.next_id
             bot.request_manual_recenter('84812', width, stop, '150', 8)
             self.assertIsNone(bot.database.get_state(SAFETY_MODE_KEY))
             self.assertEqual(json.loads(bot.database.get_state('grid_reset'))['sell_levels'], 4)
             self.assertEqual(bot.database.get_state(ENGINE_STATUS_KEY), ENGINE_IDLE)
             self.assertEqual(exchange.next_id, next_id)
+            saved = bot.database.get_state('grid_reset')
+            bot.start_engine(auto_cover_inventory=True,
+                             pending_grid_token=hashlib.sha256(saved.encode('utf-8')).hexdigest())
+            self.assertTrue(bot.reset_grid())
+            bot.run_cycle()
+            bot.run_cycle()
+            self.assertEqual(len(bot.database.fetch_active_grids()), 8)
+            self.assertEqual(bot.database.get_state(ENGINE_STATUS_KEY), ENGINE_RUNNING)
 
 
 if __name__ == "__main__":

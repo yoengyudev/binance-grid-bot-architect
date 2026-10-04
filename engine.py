@@ -867,6 +867,8 @@ class GridBot:
                 active["buy_levels"] = new_config.buy_grid_levels
                 active["sell_levels"] = new_config.sell_grid_levels
             if self.high_water_mark is None:
+                self._restore_trailing_stop()
+            if self.high_water_mark is None:
                 raise TradingHalt("Trailing stop was not initialized.")
             distance = self.high_water_mark - stop_loss
             if distance <= 0:
@@ -1200,10 +1202,30 @@ class GridBot:
             raise TradingHalt("Ticker has no valid last price.")
         return price
 
+    def _restore_trailing_stop(self) -> bool:
+        """Load saved risk state without preparing old orders or changing its floor."""
+        trailing_text = self.database.get_state(TRAILING_STOP_KEY)
+        if not trailing_text:
+            return False
+        try:
+            trailing = json.loads(trailing_text)
+            high_water_mark = _decimal(trailing["high_water_mark"], "high_water_mark")
+            stop_loss_distance = _decimal(trailing["stop_loss_distance"], "stop_loss_distance")
+        except (KeyError, TypeError, ValueError) as error:
+            raise TradingHalt("Saved trailing stop state is invalid.") from error
+        if (high_water_mark <= self.config.stop_loss_price or
+                high_water_mark - stop_loss_distance > self.config.stop_loss_price):
+            raise TradingHalt("Saved trailing stop conflicts with the active grid.")
+        self.high_water_mark = high_water_mark
+        self.stop_loss_distance = stop_loss_distance
+        return True
+
     def advance_trailing_stop(self, price: Decimal) -> None:
         """Persist a new high and raised liquidation floor as one grid update."""
         with self._cycle_lock, self._grid_lock:
             self.assert_runner_lease()
+            if self.high_water_mark is None or self.stop_loss_distance is None:
+                self._restore_trailing_stop()
             if self.high_water_mark is None or self.stop_loss_distance is None:
                 raise TradingHalt("Trailing stop was not initialized.")
             if price <= self.high_water_mark:
@@ -1280,23 +1302,8 @@ class GridBot:
 
         if not self.config.lower_price < self.anchor < self.config.upper_price:
             raise TradingHalt("Saved anchor lies outside the configured grid bounds.")
-        trailing_text = self.database.get_state(TRAILING_STOP_KEY)
-        if trailing_text:
-            try:
-                trailing = json.loads(trailing_text)
-                self.high_water_mark = _decimal(
-                    trailing["high_water_mark"], "high_water_mark"
-                )
-                self.stop_loss_distance = _decimal(
-                    trailing["stop_loss_distance"], "stop_loss_distance"
-                )
-            except (KeyError, TypeError, ValueError) as error:
-                raise TradingHalt("Saved trailing stop state is invalid.") from error
-            if (self.high_water_mark <= self.config.stop_loss_price or
-                    self.high_water_mark - self.stop_loss_distance >
-                    self.config.stop_loss_price):
-                raise TradingHalt("Saved trailing stop conflicts with the active grid.")
-        else:
+        trailing_restored = self._restore_trailing_stop()
+        if not trailing_restored:
             self.high_water_mark = self.anchor
             self.stop_loss_distance = self.anchor - self.config.stop_loss_price
             if self.stop_loss_distance <= 0:
@@ -1346,7 +1353,7 @@ class GridBot:
             with self.database.transaction():
                 if not saved:
                     self.database.set_state("grid_run", json.dumps(state, sort_keys=True))
-                if not trailing_text:
+                if not trailing_restored:
                     self.database.set_state(TRAILING_STOP_KEY, json.dumps({
                         "high_water_mark": str(self.high_water_mark),
                         "stop_loss_distance": str(self.stop_loss_distance),
