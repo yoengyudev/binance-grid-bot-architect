@@ -413,7 +413,7 @@ class GridBot:
             if not self.market.get("spot") or self.market.get("active") is False:
                 raise TradingHalt("Configured symbol is not an active Spot market.")
             current = self._ticker_price()
-            if not lower < current < upper or current <= stop:
+            if not self._within_grid_bounds(current, candidate, strict=True) or current <= stop:
                 raise ValueError("Live price must be inside the new bounds and above the hard stop.")
             buys, sells = configured_grid_levels(center, candidate)
             self._validate_level_prices(center, buys, sells)
@@ -838,7 +838,7 @@ class GridBot:
             if self.database.get_state(SAFETY_MODE_KEY) in (
                     LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
                 raise TradingHalt("Hard-stop liquidation has locked grid settings.")
-            if stop_loss >= self.config.lower_price:
+            if self._compare_grid_prices(stop_loss, self.config.lower_price) >= 0:
                 raise ValueError(
                     "❌ Rejected: Stop-loss must be lower than the current lower bound."
                 )
@@ -890,10 +890,10 @@ class GridBot:
         if not self.config.stop_loss_price < lower < upper:
             raise ValueError("Require stop-loss < lower < upper.")
         price = self._ticker_price()
-        if not lower < price < upper:
-            raise ValueError("Current price must be inside the new bounds.")
         candidate = replace(self.config, lower_price=lower, upper_price=upper,
                             spacing_percent=RESET_SPACING_PERCENT)
+        if not self._within_grid_bounds(price, candidate, strict=True):
+            raise ValueError("Current price must be inside the new bounds.")
         configured_grid_levels(price, candidate)
         with self._grid_lock:
             if self.stop_controller.stop_requested.is_set():
@@ -1074,7 +1074,7 @@ class GridBot:
         ratio = max(center / candidate_buys[0], candidate_sells[0] / center)
         if not center / ratio < price < center * ratio:
             raise ValueError("Center must be close to the live market price.")
-        if not stop_loss < lower < price < upper:
+        if not stop_loss < lower or not self._within_grid_bounds(price, candidate, strict=True):
             raise ValueError("New hard stop and bounds must contain the live price.")
         new_config = replace(candidate, stop_loss_price=stop_loss)
         lowers, uppers = self._validate_reset_grid(new_config, center, Decimal(0))
@@ -1125,9 +1125,10 @@ class GridBot:
         width = self.breakout_width_percent / 100
         lower = price * (1 - width)
         upper = price * (1 + width)
-        if not lower < price < upper or self.config.stop_loss_price >= price:
-            raise TradingHalt("Breakout bounds would violate the hard stop.")
         candidate = replace(self.config, lower_price=lower, upper_price=upper)
+        if (not self._within_grid_bounds(price, candidate, strict=True) or
+                self.config.stop_loss_price >= price):
+            raise TradingHalt("Breakout bounds would violate the hard stop.")
         lowers, _ = configured_grid_levels(price, candidate)
         if candidate.buy_grid_levels is not None and any(
                 self._price(raw) <= candidate.stop_loss_price for raw in lowers):
@@ -1155,7 +1156,8 @@ class GridBot:
 
     def _observe_upper_breakout(self, price: Decimal, *, now: Optional[float] = None) -> bool:
         """Require four hours of uninterrupted above-bound observations."""
-        if self.is_paused or self.grid_needs_reset or price <= self.config.upper_price:
+        if (self.is_paused or self.grid_needs_reset or
+                self._compare_grid_prices(price, self.config.upper_price) <= 0):
             self.database.clear_state(BREAKOUT_TIMER_KEY)
             return False
         now = time.time() if now is None else now
@@ -1292,7 +1294,7 @@ class GridBot:
         else:
             if self.database.fetch_all_orders():
                 raise TradingHalt("Orders exist without a saved anchor; reconcile them first.")
-            if not self.config.lower_price < current_price < self.config.upper_price:
+            if not self._within_grid_bounds(current_price, strict=True):
                 raise ValueError(
                     f"Current price {current_price} must be inside "
                     f"{self.config.lower_price}–{self.config.upper_price}."
@@ -1300,7 +1302,7 @@ class GridBot:
             self.anchor = current_price
             self.baseline_base = self._free_balance(self.market["base"])
 
-        if not self.config.lower_price < self.anchor < self.config.upper_price:
+        if not self._within_grid_bounds(self.anchor, strict=True):
             raise TradingHalt("Saved anchor lies outside the configured grid bounds.")
         trailing_restored = self._restore_trailing_stop()
         if not trailing_restored:
@@ -1405,7 +1407,29 @@ class GridBot:
             )
 
     def _price(self, value: Decimal) -> Decimal:
+        """Apply the loaded market's price precision (Binance PRICE_FILTER tickSize)."""
         return Decimal(self.exchange.price_to_precision(self.config.symbol, str(value)))
+
+    def _compare_grid_prices(self, left: Decimal, right: Decimal) -> int:
+        """Compare exchange ticks, avoiding float artifacts retained in saved bounds."""
+        left_tick, right_tick = self._price(left), self._price(right)
+        return (left_tick > right_tick) - (left_tick < right_tick)
+
+    def _within_grid_bounds(self, price: Decimal, config: Optional[GridConfig] = None,
+                            *, strict: bool = False) -> bool:
+        config = config or self.config
+        lower = self._compare_grid_prices(price, config.lower_price)
+        upper = self._compare_grid_prices(price, config.upper_price)
+        return lower > 0 and upper < 0 if strict else lower >= 0 and upper <= 0
+
+    def _grid_order_price(self, target: Decimal, side: str) -> Decimal:
+        """Round orders and both bounds identically before allowing submission."""
+        price = self._price(target)
+        if self._compare_grid_prices(price, self.config.lower_price) < 0:
+            raise TradingHalt(f"Planned {side.lower()} is below the lower grid bound.")
+        if self._compare_grid_prices(price, self.config.upper_price) > 0:
+            raise TradingHalt(f"Planned {side.lower()} is above the upper grid bound.")
+        return price
 
     def _amount(self, value: Decimal) -> Decimal:
         return Decimal(self.exchange.amount_to_precision(self.config.symbol, str(value)))
@@ -1434,6 +1458,7 @@ class GridBot:
         """Reject exact levels that collapse onto one exchange price tick."""
         buy_prices = [self._price(price) for price in buys]
         sell_prices = [self._price(price) for price in sells]
+        center = self._price(center)
         if (len(set(buy_prices)) != len(buy_prices) or
                 len(set(sell_prices)) != len(sell_prices) or
                 any(price >= center for price in buy_prices) or
@@ -1800,7 +1825,7 @@ class GridBot:
             return
         target = (self.config.upper_price if self.database.get_state(RECONCILE_COVER_KEY)
                   else self.upper_levels[-level - 1])
-        price = self._price(target)
+        price = self._grid_order_price(target, "SELL")
         self._check_order_size(price, amount)
         if self._free_bot_base() < amount:
             return  # Account balance can lag a newly filled market buy.
@@ -1831,6 +1856,7 @@ class GridBot:
             price = self._price(
                 self.anchor if level == -1 else self.upper_levels[-level - 2]
             )
+        price = self._grid_order_price(price, "BUY")
         if price <= self.config.stop_loss_price:
             return  # Never create a BUY at or beneath the liquidation floor.
         self._check_order_size(price, amount)
@@ -1861,9 +1887,7 @@ class GridBot:
             target = self.upper_levels[-row["level"] - 1]
         if self.database.get_state(RECONCILE_COVER_KEY):
             target = self.config.upper_price
-        price = self._price(target)
-        if price > self.config.upper_price:
-            raise TradingHalt("Planned sell is above the upper grid bound.")
+        price = self._grid_order_price(target, "SELL")
         free_bot_base = self._free_bot_base()
         if amount > free_bot_base:
             LOGGER.info(
@@ -2058,7 +2082,8 @@ class GridBot:
                 LOGGER.warning("Queued manual recenter withdrawn: trailing floor rose.")
                 return False
             if request.get("source") == "breakout":
-                if self._ticker_price() <= Decimal(request["previous_upper"]):
+                if self._compare_grid_prices(
+                        self._ticker_price(), Decimal(request["previous_upper"])) <= 0:
                     self.database.clear_state("grid_reset")
                     self.pending_grid_bounds = None
                     self.grid_needs_reset = False
@@ -2091,8 +2116,8 @@ class GridBot:
                 self._liquidate_locked(price)
                 return False
             if request.get("source") == "breakout":
-                if price <= Decimal(request["previous_upper"]):
-                    if not self.config.lower_price < price < self.config.upper_price:
+                if self._compare_grid_prices(price, Decimal(request["previous_upper"])) <= 0:
+                    if not self._within_grid_bounds(price, strict=True):
                         raise TradingHalt(
                             "Breakout faded outside old bounds after cancellation; "
                             "inspect orders before restart."
@@ -2119,7 +2144,7 @@ class GridBot:
                 ratio = max(center / buys[0], sells[0] / center)
                 if center / ratio < price < center * ratio:
                     anchor = center
-                elif self.config.lower_price < price < self.config.upper_price:
+                elif self._within_grid_bounds(price, strict=True):
                     request["source"] = "manual_stale"
                     request["lower"] = str(self.config.lower_price)
                     request["upper"] = str(self.config.upper_price)
@@ -2152,7 +2177,7 @@ class GridBot:
                                  stop_loss_price=stop_loss)
             if new_config.stop_loss_price >= anchor:
                 raise TradingHalt("New grid anchor is at or below the hard stop.")
-            if not new_config.lower_price < price < new_config.upper_price:
+            if not self._within_grid_bounds(price, new_config, strict=True):
                 raise TradingHalt("Price left the requested bounds during reset.")
             try:
                 lowers, uppers = self._validate_reset_grid(new_config, anchor, carry_amount)
@@ -2697,7 +2722,7 @@ class GridBot:
             if mode != PAUSED_MANUAL:
                 return mode
             price = self._ticker_price()
-            if price <= self.config.lower_price:
+            if self._compare_grid_prices(price, self.config.lower_price) <= 0:
                 # The automatic downside guard still owns the pause.
                 self.database.set_state(SAFETY_MODE_KEY, PAUSED_DOWNSIDE)
                 self.is_paused = True
@@ -2861,7 +2886,7 @@ class GridBot:
                         "BTC has no complete bot cost-basis history; clear it manually."
                     )
             current, _, _ = self.prepare(persist=False)
-            if not self.config.lower_price < current < self.config.upper_price:
+            if not self._within_grid_bounds(current, strict=True):
                 raise TradingHalt("Market price is outside the saved grid; re-anchor first.")
             if current <= self.config.stop_loss_price:
                 raise TradingHalt("Market price is at or below the hard stop.")
@@ -2994,7 +3019,8 @@ class GridBot:
         if self.is_paused:
             pause_events, cancellations_complete = self._cancel_buy_orders_for_pause()
             events.extend(pause_events)
-            if (cancellations_complete and current_price > self.config.lower_price
+            if (cancellations_complete and
+                    self._compare_grid_prices(current_price, self.config.lower_price) > 0
                     and self.database.get_state(SAFETY_MODE_KEY) == PAUSED_DOWNSIDE):
                 with self.database.transaction():
                     self.database.clear_state(SAFETY_MODE_KEY)
@@ -3048,7 +3074,7 @@ class GridBot:
         latest = self.database.fetch_latest_orders_by_level()
         in_bounds = (
             not self.is_paused and not cover_text and
-            self.config.lower_price <= current_price <= self.config.upper_price
+            self._within_grid_bounds(current_price)
         )
         if in_bounds and all(
             level not in latest for level in range(1, len(self.levels) + 1)
@@ -3171,7 +3197,7 @@ class GridBot:
             initial_request = json.loads(initial_request_text)
             if initial_request.get("source") == "manual_initial":
                 current = await asyncio.to_thread(self._ticker_price)
-                if not self.config.lower_price < current < self.config.upper_price:
+                if not self._within_grid_bounds(current, strict=True):
                     raise TradingHalt("Price left the approved grid bounds before startup.")
                 saved_run = self.database.get_state("grid_run")
                 if not saved_run:
