@@ -1454,9 +1454,23 @@ class GridBot:
         upper_amount = self._amount(upper_total * (1 - SELL_AMOUNT_BUFFER) / len(sells))
         for raw in sells:
             price = self._price(raw)
-            self._check_order_size(price, upper_amount)
-            conservative_sell = self._amount(upper_amount * (1 - SELL_AMOUNT_BUFFER))
-            self._check_order_size(price, conservative_sell)
+            checked_amount = upper_amount
+            try:
+                self._check_order_size(price, checked_amount)
+                checked_amount = self._amount(upper_amount * (1 - SELL_AMOUNT_BUFFER))
+                self._check_order_size(price, checked_amount)
+            except GridSizingError as error:
+                if carry_amount <= 0:
+                    raise
+                raise GridSizingError(
+                    f"Existing BTC ({carry_amount}) cannot support {len(sells)} SELL levels "
+                    "after exchange rounding and fee reserves: "
+                    f"{checked_amount} BTC at {price} is {checked_amount * price:.4f} USDT "
+                    f"and fails order-size rules (bot minimum {MIN_GRID_ORDER_NOTIONAL} USDT, "
+                    "plus exchange limits). Choose fewer total grid levels. "
+                    "Increasing allocated USDT funds BUY limits; it does not top up "
+                    "the existing BTC used for SELL limits during a re-anchor."
+                ) from error
 
     def _fetch_order(self, row: Dict[str, Any], *, persist: bool = True) -> Dict[str, Any]:
         carry_text = self.database.get_state("carry_inventory")

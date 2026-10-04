@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +16,7 @@ import httpx
 
 from database import GridDatabase
 from engine import GridBot
-from models import TradingHalt
+from models import GridConfig, GridSizingError, TradingHalt
 from settings import (
     BREAKOUT_TIMER_KEY, ENGINE_FAULT_KEY, ENGINE_HALTED, ENGINE_IDLE,
     ENGINE_RUNNING, ENGINE_STATUS_KEY, ENGINE_STOP_CLEANUP_KEY,
@@ -24,7 +24,7 @@ from settings import (
     ORDER_CLEANUP_ALARM_KEY, PAUSED_MANUAL, PAUSED_RESET, RISK_OVERRIDE_DENIED,
     SAFETY_MODE_KEY, SAFETY_PAUSE_NOTICE_KEY,
 )
-from tests.fakes import make_bot
+from tests.fakes import FakeSpotExchange, make_bot
 
 
 class ResetReanchorTests(unittest.TestCase):
@@ -242,6 +242,47 @@ class ResetReanchorTests(unittest.TestCase):
                 api.app.dependency_overrides.update(previous_overrides)
 
         asyncio.run(exercise())
+
+    def test_small_carried_btc_rejects_ten_levels_but_accepts_eight(self):
+        class SpotPrecisionExchange(FakeSpotExchange):
+            def market(self, symbol):
+                market = super().market(symbol)
+                market['limits'] = {'amount': {'min': 0.00001}, 'cost': {'min': 5}}
+                return market
+
+            def amount_to_precision(self, symbol, amount):
+                return str(Decimal(amount).quantize(Decimal('0.00001'), rounding=ROUND_DOWN))
+
+        with tempfile.TemporaryDirectory() as directory:
+            exchange = SpotPrecisionExchange()
+            exchange.price = Decimal('84812')
+            exchange.base_free = Decimal(0)
+            config = GridConfig(
+                'BTC/USDT', Decimal('81.42'), Decimal('80050'), Decimal('88862.67'),
+                Decimal('2.5'), Decimal('50'), Decimal('79789.7'), 2,
+            )
+            bot = GridBot(config, exchange, GridDatabase(Path(directory) / 'grid_testnet.sqlite'))
+            bot.prepare(persist=True)
+            bot.run_cycle()
+            bot.run_cycle()
+            bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
+            bot.prepare_factory_reset()
+            bot.stop_engine()
+            self.assertEqual(exchange.base_free, Decimal('0.00048'))
+            width = str(Decimal('335.91') * 100 / Decimal('84812'))
+            stop = str(Decimal('369.50') * 100 / Decimal('84812'))
+            for capital in ('150', '1500'):
+                with self.subTest(capital=capital):
+                    with self.assertRaisesRegex(GridSizingError, r'Existing BTC .*5 SELL levels'):
+                        bot.request_manual_recenter('84812', width, stop, capital, 10)
+                    self.assertEqual(bot.database.get_state(SAFETY_MODE_KEY), PAUSED_RESET)
+                    self.assertIsNone(bot.database.get_state('grid_reset'))
+            next_id = exchange.next_id
+            bot.request_manual_recenter('84812', width, stop, '150', 8)
+            self.assertIsNone(bot.database.get_state(SAFETY_MODE_KEY))
+            self.assertEqual(json.loads(bot.database.get_state('grid_reset'))['sell_levels'], 4)
+            self.assertEqual(bot.database.get_state(ENGINE_STATUS_KEY), ENGINE_IDLE)
+            self.assertEqual(exchange.next_id, next_id)
 
 
 if __name__ == "__main__":
