@@ -769,7 +769,7 @@ class GridBot:
                 if status == "closed":
                     changed = self._persist_order_response(row, order, "FILLED")
                     if changed:
-                        self._alert_confirmed_fill(row, order)
+                        self._log_confirmed_fill(row, order)
                         events.append(("filled", (
                             row["order_id"], row["side"],
                             str(order.get("filled") or row["amount"]),
@@ -1561,7 +1561,10 @@ class GridBot:
                 self.database.set_exchange_order_id(row["order_id"], str(order["id"]))
             self._save_fill_snapshot(row["order_id"], order)
             if status is not None:
-                return self.database.update_order_status(row["order_id"], status)
+                changed = self.database.update_order_status(row["order_id"], status)
+                if changed and status == "FILLED" and row["side"] == "BUY":
+                    self.database.set_state(f"telegram_buy_pending:{row['order_id']}", "1")
+                return changed
         return False
 
     def _save_fill_snapshot(
@@ -1600,25 +1603,76 @@ class GridBot:
                 LOGGER.warning("Could not backfill fill for %s: %s",
                                row["order_id"], type(error).__name__)
 
-    def _alert_confirmed_fill(self, row: Dict[str, Any], order: Dict[str, Any]) -> None:
+    def _log_confirmed_fill(self, row: Dict[str, Any], order: Dict[str, Any]) -> None:
         amount = order.get("filled") or row["amount"]
         price = order.get("average") or order.get("price") or row["price"]
-        message = (f"*Order FILLED*\nPair: {markdown_text(self.config.symbol)}"
-                   f"\nSide: {markdown_text(row['side'])}"
-                   f"\nPrice: {markdown_text(price)}\nAmount: {markdown_text(amount)}"
-                   f"\nOrder: {markdown_text(row['order_id'])}")
-        if row["side"] == "SELL":
-            message += "\nRealized P&L: pending accounting"
-        schedule_telegram_alert(message)
+        LOGGER.info("Order FILLED: %s %s %s at %s; order %s. Accounting follows locally.",
+                    row["side"], amount, self.config.symbol, price, row["order_id"])
+
+    def _alert_accounted_buy(self, row: Dict[str, Any], net_base: Decimal) -> None:
+        """Notify only new BUY fills after their durable cost/commission snapshot."""
+        if self.database.in_transaction:
+            return  # The caller's outer transaction has not committed yet.
+        order_id = row["order_id"]
+        pending_key = f"telegram_buy_pending:{order_id}"
+        notice_key = f"telegram_buy_scheduled:{order_id}"
+        if (not self.database.get_state(pending_key) or
+                self.database.get_state(notice_key)):
+            return
+        snapshot_text = self.database.get_state(FILL_SNAPSHOT_PREFIX + order_id)
+        if not snapshot_text:
+            return
+        try:
+            snapshot = json.loads(snapshot_text)
+            if not isinstance(snapshot, dict):
+                raise ValueError("Fill accounting must be an object.")
+            if (getattr(self.exchange, "has", {}).get("fetchOrderTrades") and
+                    snapshot.get("fee_source") != "trades"):
+                return  # Binance commission details have not been reconciled yet.
+            filled = Decimal(snapshot["filled_base"])
+            quote_cost = Decimal(snapshot["filled_quote"])
+            quote_fee = Decimal(snapshot["quote_fee"])
+            base_fee = Decimal(snapshot["base_fee"])
+            accounted_base = filled - base_fee
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            LOGGER.warning("BUY alert awaits valid fill accounting for %s.", order_id)
+            return
+        if (not all(value.is_finite() for value in (filled, quote_cost, quote_fee, base_fee, net_base)) or
+                filled <= 0 or quote_cost <= 0 or quote_fee < 0 or base_fee < 0
+                or accounted_base <= 0 or net_base <= 0):
+            return
+        queued = schedule_telegram_alert(
+            f"*BUY FILLED*\nPair: {markdown_text(self.config.symbol)}\nSide: BUY"
+            f"\nPrice: {markdown_text(quote_cost / filled)}"
+            f"\nAmount: {markdown_text(filled)}"
+            f"\nNet inventory: {markdown_text(accounted_base)} {markdown_text(self.market['base'])}"
+            f"\nCost basis: {markdown_text(quote_cost + quote_fee)} {markdown_text(self.market['quote'])}"
+            f"\nRealized P&L: 0 {markdown_text(self.market['quote'])}"
+            f"\n{markdown_text('BUY adds inventory; profit is realized on SELL.')}"
+            f"\nOrder: {markdown_text(order_id)}"
+        )
+        if queued:
+            with self.database.transaction():
+                self.database.set_state(notice_key, "1")
+                self.database.clear_state(pending_key)
 
     def _alert_realized_sell(self, order_id: str, price: Decimal,
-                             amount: Decimal, profit: Decimal, *, filled: bool = True) -> None:
+                              amount: Decimal, profit: Decimal, *, filled: bool = True) -> None:
+        if self.database.in_transaction:
+            return  # Never publish accounting that an outer transaction can roll back.
+        trade = self.database.get_trade_by_sell_order_id(order_id)
+        if trade is None:
+            return
+        price = Decimal(trade["sell_price"])
+        profit = Decimal(trade["profit"])
+        if trade["sold_base"] is not None:
+            amount = Decimal(trade["sold_base"])
         notice_key = f"telegram_pnl_scheduled:{order_id}"
         if self.database.get_state(notice_key):
             return
         event = "SELL FILLED" if filled else "SELL PARTIAL EXECUTION"
         queued = schedule_telegram_alert(
-            f"*{event} — Realized P&L*\nPair: {markdown_text(self.config.symbol)}"
+            f"*{event} — Realized P&L*\nPair: {markdown_text(self.config.symbol)}\nSide: SELL"
             f"\nPrice: {markdown_text(price)}\nAmount: {markdown_text(amount)}"
             f"\nRealized P&L: {markdown_text(profit)} {markdown_text(self.market['quote'])}"
             f"\nOrder: {markdown_text(order_id)}"
@@ -1638,7 +1692,7 @@ class GridBot:
         if status == "closed":
             changed = self._persist_order_response(row, order, "FILLED")
             if changed:
-                self._alert_confirmed_fill(row, order)
+                self._log_confirmed_fill(row, order)
                 amount = str(order.get("filled") or row["amount"])
                 price = str(order.get("average") or order.get("price") or row["price"])
                 return ("filled", (row["order_id"], row["side"], amount, price))
@@ -1832,6 +1886,7 @@ class GridBot:
         net_base = filled - base_fee
         if not net_base.is_finite() or net_base <= 0 or net_base > filled:
             raise TradingHalt("BUY commission leaves no valid BTC for a SELL.")
+        self._alert_accounted_buy(row, net_base)
         return net_base
 
     def _place_seed_buy(self, current_price: Decimal) -> None:
@@ -2031,6 +2086,9 @@ class GridBot:
             if filled <= 0:
                 continue
             net = filled - self._buy_fee_in_asset(row, buy, self.market["base"])
+            # Use the accounting already available here; notification delivery
+            # must not add commission HTTP lookups to emergency liquidation.
+            self._alert_accounted_buy(row, net)
             remaining = net - sold_by_buy.get(row["order_id"], Decimal(0))
             if remaining < 0:
                 raise TradingHalt("Sold BTC exceeds a tracked buy lot.")
@@ -3326,8 +3384,8 @@ class GridBot:
                             self.database.clear_state(BREAKOUT_NOTICE_KEY)
                     events = await asyncio.to_thread(self.run_cycle)
                     await self._notify_liquidation(notifier)
-                    # Confirmed fills schedule alerts at the persisted transition,
-                    # including fills discovered while canceling orders.
+                    # Raw fills are local logs; trade alerts wait for committed
+                    # BUY cost/commission or SELL realized-P&L accounting.
                     await self._notify_safety_state(notifier)
                     backoff = 1
                     delay = 0 if self.grid_needs_reset else self.config.poll_seconds

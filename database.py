@@ -818,6 +818,14 @@ class GridDatabase:
                 return row["id"]
             return connection.execute("SELECT last_insert_rowid()").fetchone()[0]
 
+    def get_trade_by_sell_order_id(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """Return committed accounting for a consolidated execution notification."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM trade_history WHERE sell_order_id = ?", (order_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def fetch_trade_history(self) -> List[Dict[str, Any]]:
         with self._connection() as connection:
             rows = connection.execute(
