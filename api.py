@@ -53,6 +53,7 @@ from settings import (
 )
 from models import (
     EngineStartRequest,
+    ForceLiquidateRequest,
     GridStopConflict,
     InsufficientGridCapital,
     LoginRequest,
@@ -671,6 +672,32 @@ def stop_engine(response: Response,
     except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
         LOGGER.exception("Engine stop could not verify bot order cancellation.")
         raise HTTPException(status_code=502, detail="Engine is idle, but order cleanup needs verification.") from error
+
+
+@app.post("/api/admin/force_liquidate")
+def force_liquidate(payload: ForceLiquidateRequest, response: Response,
+                    _: None = Depends(_require_dashboard_origin),
+                    __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    if payload.confirmed is not True:
+        raise HTTPException(status_code=400, detail="Explicit panic-liquidation confirmation is required.")
+    bot = app.state.grid_bot
+    if not app.state.ready or bot is None:
+        raise HTTPException(status_code=503, detail="The ready-mode engine is offline.")
+    try:
+        result = bot.force_liquidate()
+    except (TradingHalt, ValueError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
+        LOGGER.exception("Manual panic liquidation could not confirm completion.")
+        raise HTTPException(status_code=502, detail="Panic liquidation could not confirm completion. Check the liquidation state and alarms.") from error
+    if not result["completed"]:
+        raise HTTPException(status_code=409, detail={
+            "code": "LIQUIDATION_INCOMPLETE",
+            "message": "Panic liquidation halted before completion. Review the liquidation alarm; BTC may remain.",
+            **result,
+        })
+    return result
 
 
 @app.post("/api/bot/prepare-reset")

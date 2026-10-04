@@ -2684,24 +2684,34 @@ class GridBot:
             return False
         raise TradingHalt("Unknown hard-stop liquidation phase.")
 
-    def _liquidate_locked(self, price: Decimal) -> None:
+    def _liquidate_locked(self, price: Decimal, *, trigger_event: str = "HARD_STOP") -> None:
         """Cancel, verify, sell only bot inventory, and persist a terminal state."""
         state_text = self.database.get_state(LIQUIDATION_KEY)
         state = json.loads(state_text) if state_text else {
-            "phase": "canceling", "trigger_price": str(price),
+            "phase": "canceling", "trigger_price": str(price), "trigger_event": trigger_event,
         }
         if state_text is None:
             with self.database.transaction():
                 self._save_liquidation(state)
-                self.database.set_state(SAFETY_MODE_KEY, LIQUIDATING)
+                self.database.set_state(SAFETY_MODE_KEY, LIQUIDATING,
+                                        trigger_event=trigger_event if trigger_event != "HARD_STOP" else None)
+                if trigger_event == "MANUAL_PANIC_LIQUIDATION":
+                    # The API worker owns the exit. Stop ordinary placement even
+                    # when panic was requested from IDLE or a safety pause.
+                    self.database.set_state(ENGINE_STATUS_KEY, ENGINE_HALTED,
+                                            trigger_event=trigger_event)
+            headline = ("MANUAL PANIC — MARKET LIQUIDATION" if trigger_event == "MANUAL_PANIC_LIQUIDATION"
+                        else "HARD STOP TRIGGERED — MARKET LIQUIDATION")
             schedule_telegram_alert(
-                f"🚨 *HARD STOP TRIGGERED — MARKET LIQUIDATION*"
+                f"🚨 *{headline}*"
                 f"\nPair: {markdown_text(self.config.symbol)}"
-                f"\nTrigger price: {markdown_text(price)}"
+                + ("\nRequested by admin" if trigger_event == "MANUAL_PANIC_LIQUIDATION"
+                   else f"\nTrigger price: {markdown_text(price)}")
             )
             self.is_paused = True
-            LOGGER.critical("Hard stop triggered at %s %s; liquidating bot inventory.",
-                            price, self.config.symbol)
+            label = "Manual panic requested" if trigger_event == "MANUAL_PANIC_LIQUIDATION" else "Hard stop triggered"
+            LOGGER.critical("%s at %s %s; liquidating bot inventory.",
+                            label, price, self.config.symbol)
         if state["phase"] == "complete":
             self._complete_hard_stop(state, Decimal(state["sold_base"]),
                                      Decimal(state.get("proceeds_quote", "0")))
@@ -2775,6 +2785,45 @@ class GridBot:
         with self._cycle_lock:
             self.assert_runner_lease()
             self._liquidate_locked(price)
+
+    def force_liquidate(self) -> Dict[str, Any]:
+        """An explicit admin exit; never change the stop or sell baseline BTC."""
+        with self._cycle_lock:
+            self.assert_runner_lease()
+            state_text = self.database.get_state(LIQUIDATION_KEY)
+            state = json.loads(state_text) if state_text else None
+            if state and state["phase"] == "failed":
+                raise TradingHalt("Liquidation is unresolved. Review the saved alarm before another exit.")
+            if not state or state["phase"] != "complete":
+                saved_run = self.database.get_state("grid_run")
+                if not saved_run:
+                    raise TradingHalt("No saved bot inventory exists to liquidate.")
+                try:
+                    baseline = Decimal(json.loads(saved_run)["baseline_base"])
+                    if not baseline.is_finite() or baseline < 0:
+                        raise ValueError("Invalid baseline")
+                except (KeyError, TypeError, ValueError, InvalidOperation) as error:
+                    raise TradingHalt("Saved BTC baseline is unavailable; cannot safely liquidate.") from error
+                self.baseline_base = baseline
+                self._load_market_for_engine_control()
+                # A public ticker failure must not gate the emergency exit.
+                # The existing protocol fetches fresh prices for exchange sizing.
+                price = self.config.stop_loss_price
+                try:
+                    observed = Decimal(self.database.get_state(LAST_MARKET_PRICE_KEY) or str(price))
+                    if observed.is_finite() and observed > 0:
+                        price = observed
+                except (TypeError, ValueError, InvalidOperation):
+                    pass
+                self._liquidate_locked(price, trigger_event="MANUAL_PANIC_LIQUIDATION")
+                state = json.loads(self.database.get_state(LIQUIDATION_KEY))
+            return {
+                "engine_status": self.database.get_state(ENGINE_STATUS_KEY),
+                "mode": self.database.get_state(SAFETY_MODE_KEY),
+                "phase": state["phase"], "completed": state["phase"] == "complete",
+                "sold_base": state.get("sold_base", "0"),
+                "residual_base": state.get("residual_base"),
+            }
 
     def set_manual_pause(self, active: bool) -> Optional[str]:
         """Persist a manual pause and use the existing targeted BUY cancellation."""

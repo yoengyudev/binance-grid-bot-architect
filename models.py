@@ -29,6 +29,10 @@ class EngineStartRequest(BaseModel):
     pending_grid_token: Optional[str] = None
 
 
+class ForceLiquidateRequest(BaseModel):
+    confirmed: StrictBool
+
+
 class StopLossRequest(BaseModel):
     price: FiniteFloat = Field(gt=0)
 
