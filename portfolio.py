@@ -40,10 +40,32 @@ def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
         liquidation = database.get_state(LIQUIDATION_KEY)
         if liquidation:
             state = json.loads(liquidation)
+            if state.get("phase") == "dust_acknowledged":
+                # The residual has its own persistent reserve ledger and warning.
+                if not any(row["id"] == state.get("dust_reserve_id") and
+                           row["status"] == "UNMONITORED" and
+                           Decimal(row["quantity"]) == Decimal(state["residual_base"])
+                           for row in database.fetch_dust_reserves()):
+                    return _unavailable_wallet()
+                return {"btc_held": 0.0, "average_cost": None, "unrealized_pnl": 0.0}
             if state.get("phase") == "complete":
                 residual = float(state.get("residual_base", "0"))
                 return {"btc_held": residual, "average_cost": None,
                         "unrealized_pnl": 0.0 if residual == 0 else None}
+            if state.get("phase") == "failed" and state.get("failure_type") == "LiquidationDust":
+                residual = Decimal(state["residual_base"])
+                held = Decimal(state["held_base"])
+                cost = Decimal(state["cost_basis_quote"])
+                if (not all(value.is_finite() for value in (residual, held, cost))
+                        or not 0 < residual <= held or cost <= 0):
+                    return _unavailable_wallet()
+                average = cost / held
+                price_text = database.get_state(LAST_MARKET_PRICE_KEY)
+                price = Decimal(price_text) if price_text else None
+                pnl = (residual * (price - average)
+                       if price is not None and price.is_finite() and price > 0 else None)
+                return {"btc_held": float(residual), "average_cost": float(average),
+                        "unrealized_pnl": float(pnl) if pnl is not None else None}
             return _unavailable_wallet()
         carry_text = database.get_state("carry_inventory")
         carry = json.loads(carry_text) if carry_text else {}

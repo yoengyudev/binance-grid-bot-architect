@@ -1473,13 +1473,14 @@ class GridBotTests(unittest.TestCase):
             exchange.base_free += partial
             exchange.price = Decimal("69")
 
-            with patch.object(grid_engine.time, "sleep", side_effect=KeyboardInterrupt):
-                with self.assertRaises(KeyboardInterrupt):
-                    bot.run_cycle()
+            bot.run_cycle()
 
             state = json.loads(bot.database.get_state(grid_settings.LIQUIDATION_KEY))
             self.assertEqual(bot.database.get_state(grid_settings.SAFETY_MODE_KEY),
-                             grid_settings.LIQUIDATING)
+                             grid_settings.LIQUIDATION_HALTED)
+            self.assertEqual(state["failure_type"], "LiquidationDust")
+            self.assertEqual(bot.database.get_state(grid_settings.ENGINE_STATUS_KEY),
+                             grid_settings.ENGINE_HALTED)
             self.assertGreater(Decimal(state["confirmed_sold_base"]), partial)
             self.assertGreater(Decimal(state["residual_base"]), 0)
             self.assertIsNotNone(bot.database.get_state(grid_settings.LIQUIDATION_ALARM_KEY))
@@ -1735,12 +1736,13 @@ class GridBotTests(unittest.TestCase):
                 order_type="MARKET",
             )
             exchange.price = Decimal("69")
-            with patch.object(grid_engine.time, "sleep", side_effect=KeyboardInterrupt):
-                with self.assertRaises(KeyboardInterrupt):
-                    bot.run_cycle()
+            bot.run_cycle()
             state = json.loads(bot.database.get_state(grid_settings.LIQUIDATION_KEY))
             self.assertEqual(bot.database.get_state(grid_settings.SAFETY_MODE_KEY),
-                             grid_settings.LIQUIDATING)
+                             grid_settings.LIQUIDATION_HALTED)
+            self.assertEqual(state["failure_type"], "LiquidationDust")
+            self.assertEqual(bot.database.get_state(grid_settings.ENGINE_STATUS_KEY),
+                             grid_settings.ENGINE_HALTED)
             self.assertEqual(Decimal(state["residual_base"]), Decimal("0.1"))
             self.assertEqual(exchange.market_sell_calls, 0)
             self.assertIsNotNone(bot.database.get_state(grid_settings.LIQUIDATION_ALARM_KEY))

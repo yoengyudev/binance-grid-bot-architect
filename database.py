@@ -246,6 +246,16 @@ class GridDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_transition_journal_timestamp "
                 "ON transition_journal (timestamp)"
             )
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS dust_reserves (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    asset TEXT NOT NULL, quantity TEXT NOT NULL,
+                    cost_basis_quote TEXT NOT NULL,
+                    source_liquidation TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'UNMONITORED'
+                )
+            """)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS runner_lease (
@@ -268,6 +278,35 @@ class GridDatabase:
                 "CREATE INDEX IF NOT EXISTS idx_archived_grid_orders_recent_fills "
                 "ON archived_grid_orders (status, updated_at DESC)"
             )
+
+    def fetch_dust_reserves(self) -> List[Dict[str, Any]]:
+        with self._connection() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT * FROM dust_reserves ORDER BY id"
+            ).fetchall()]
+
+    def acknowledge_liquidation_dust(self, expected: str, asset: str,
+                                    quantity: Decimal, cost: Decimal) -> int:
+        """Keep the residual's cost and exit record while releasing configuration."""
+        with self.transaction():
+            if (self.get_state("hard_stop_liquidation") != expected or
+                    self.get_state("engine_status") != "HALTED" or
+                    self.get_state("safety_mode") != "HALTED" or self.fetch_active_grids()):
+                raise ValueError("Liquidation changed; refresh before acknowledging dust.")
+            with self._connection() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO dust_reserves (asset,quantity,cost_basis_quote,source_liquidation) "
+                    "VALUES (?,?,?,?)", (asset, str(quantity), str(cost), expected),
+                )
+                reserve_id = cursor.lastrowid
+            state = json.loads(expected)
+            state.update(phase="dust_acknowledged", dust_reserve_id=reserve_id)
+            self.set_state("hard_stop_liquidation", json.dumps(state, sort_keys=True))
+            self.set_state("safety_mode", "LIQUIDATED", trigger_event="DUST_ACKNOWLEDGED",
+                           error_details=f"{quantity} {asset} retained unmonitored; cost basis {cost}.")
+            for key in ("hard_stop_alarm", "halt_reason", "hard_stop_notification_pending"):
+                self.clear_state(key)
+            return reserve_id
 
     def insert_order(
         self,

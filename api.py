@@ -52,6 +52,7 @@ from settings import (
     _credentials,
 )
 from models import (
+    DustAcknowledgmentRequest,
     EngineStartRequest,
     ForceLiquidateRequest,
     GridStopConflict,
@@ -359,6 +360,33 @@ def _unprotected_exposure_payload(bot: Optional["GridBot"],
             "has_unprotected_exposure": exposure > protected}
 
 
+def _dust_recovery_payload(database: GridDatabase) -> Dict[str, Any]:
+    recovery = None
+    text = database.get_state("hard_stop_liquidation")
+    try:
+        state = json.loads(text or "null")
+        if state and state.get("failure_type") == "LiquidationDust" and state.get("phase") == "failed":
+            residual = Decimal(state["residual_base"])
+            if residual.is_finite() and residual > 0:
+                held = Decimal(state["held_base"])
+                cost = Decimal(state["cost_basis_quote"])
+                if not held.is_finite() or not cost.is_finite() or held <= 0 or cost <= 0:
+                    raise ValueError("Invalid dust cost basis")
+                recovery = {"kind": "UNSELLABLE_DUST", "quantity": str(residual),
+                            "cost_basis_quote": str(cost * residual / held),
+                            "recovery_token": hashlib.sha256(text.encode()).hexdigest(),
+                            "can_acknowledge": database.get_state(ENGINE_STATUS_KEY) == ENGINE_HALTED
+                            and database.get_state(SAFETY_MODE_KEY) == LIQUIDATION_HALTED
+                            and not database.fetch_active_grids()
+                            and not any(database.get_state(key) for key in (
+                                ENGINE_STOP_CLEANUP_KEY, ENGINE_FAULT_KEY,
+                                ORDER_CLEANUP_ALARM_KEY, GHOST_ORDER_ALARM_KEY))}
+    except (KeyError, ValueError, TypeError, InvalidOperation, ZeroDivisionError):
+        pass
+    reserves = database.fetch_dust_reserves()
+    return {"dust_recovery": recovery, "dust_reserves": reserves}
+
+
 @app.get("/api/bot/status")
 def bot_status(response: Response,
                _: str = Depends(get_current_user)) -> Dict[str, Any]:
@@ -380,6 +408,7 @@ def bot_status(response: Response,
             "ghost_order_alarm": bot.database.get_state(GHOST_ORDER_ALARM_KEY),
             "has_grid_run": False, "grid_levels": 0,
             "can_reset_liquidation": False,
+            **_dust_recovery_payload(bot.database),
             "exact_grid_recenter_supported": True,
             "lower_bound": None, "upper_bound": None,
             **_exchange_audit_telemetry(bot, bot.database),
@@ -497,6 +526,7 @@ def bot_status(response: Response,
         "ghost_order_alarm": database.get_state(GHOST_ORDER_ALARM_KEY),
         "pending_grid": pending_grid,
         "can_reset_liquidation": can_reset_liquidation,
+        **_dust_recovery_payload(database),
         "has_grid_run": database.get_state("grid_run") is not None,
         "trading_state": "ACCOUNT_CLEARED" if manual_account_exit else safety_mode if safety_mode in (
             LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING,
@@ -698,6 +728,25 @@ def force_liquidate(payload: ForceLiquidateRequest, response: Response,
             **result,
         })
     return result
+
+
+@app.post("/api/admin/acknowledge-dust")
+def acknowledge_dust(payload: DustAcknowledgmentRequest, response: Response,
+                     _: None = Depends(_require_dashboard_origin),
+                     __: str = Depends(get_current_user)) -> Dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    if payload.confirmed is not True:
+        raise HTTPException(status_code=400, detail="Explicit acknowledgment of unmonitored BTC is required.")
+    bot = app.state.grid_bot
+    if not app.state.ready or bot is None:
+        raise HTTPException(status_code=503, detail="The ready-mode engine is offline.")
+    try:
+        return bot.acknowledge_dust(payload.recovery_token)
+    except (TradingHalt, ValueError, KeyError, TypeError, InvalidOperation) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (ccxt.BaseError, OSError, sqlite3.Error) as error:
+        LOGGER.exception("Dust acknowledgment could not verify safety.")
+        raise HTTPException(status_code=502, detail="Dust acknowledgment could not verify exchange safety. Refresh recovery status.") from error
 
 
 @app.post("/api/bot/prepare-reset")

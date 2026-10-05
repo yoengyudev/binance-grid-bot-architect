@@ -70,6 +70,7 @@ from models import (
     GridSizingError,
     GridStopConflict,
     InsufficientGridCapital,
+    LiquidationDust,
     LiquidationPending,
     OpenOrderEntry,
     RunnerLeaseLost,
@@ -1074,6 +1075,12 @@ class GridBot:
             state = json.loads(self.database.get_state(LIQUIDATION_KEY) or "null")
             residual = Decimal(state["residual_base"])
             complete = state["phase"] == "complete" and residual.is_finite() and residual == 0
+            if state["phase"] == "dust_acknowledged" and residual.is_finite() and residual > 0:
+                complete = any(
+                    row["id"] == state.get("dust_reserve_id") and
+                    Decimal(row["quantity"]) == residual and row["status"] == "UNMONITORED"
+                    for row in self.database.fetch_dust_reserves()
+                )
         except (KeyError, TypeError, ValueError, InvalidOperation):
             complete = False
         if not complete:
@@ -2632,8 +2639,9 @@ class GridBot:
                 )
             state["residual_base"] = str(tracked)
             self._save_liquidation(state)
-            raise LiquidationPending(
-                "Bot BTC is below Binance MARKET order filters; liquidation is unresolved."
+            raise LiquidationDust(
+                f"Liquidation halted: {tracked} BTC remains below Binance MARKET order "
+                "minimums. No sell was submitted for this remainder. Review dust recovery in Settings."
             )
         return amount, available
 
@@ -2745,6 +2753,8 @@ class GridBot:
         state = json.loads(state_text) if state_text else {
             "phase": "canceling", "trigger_price": str(price), "trigger_event": trigger_event,
         }
+        if state["phase"] == "dust_acknowledged":
+            return  # This closed grid's residual is explicitly reserved outside risk monitoring.
         if state_text is None:
             with self.database.transaction():
                 self._save_liquidation(state)
@@ -2841,12 +2851,78 @@ class GridBot:
             self.assert_runner_lease()
             self._liquidate_locked(price)
 
+    def acknowledge_dust(self, recovery_token: str) -> Dict[str, Any]:
+        """Explicitly retain verified unsellable BTC outside the next grid."""
+        if not self._cycle_lock.acquire(timeout=2):
+            raise TradingHalt("Liquidation is still reconciling; dust cannot be acknowledged yet.")
+        try:
+            self.assert_runner_lease()
+            text = self.database.get_state(LIQUIDATION_KEY)
+            if not text or not secrets.compare_digest(
+                    hashlib.sha256(text.encode()).hexdigest(), recovery_token):
+                raise TradingHalt("Dust recovery changed; refresh and review it again.")
+            state = json.loads(text or "null")
+            if (not state or state.get("phase") != "failed" or
+                    state.get("failure_type") != "LiquidationDust" or
+                    self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_HALTED or
+                    self.database.get_state(SAFETY_MODE_KEY) != LIQUIDATION_HALTED):
+                raise TradingHalt("Only a verified unsellable-dust halt may be acknowledged.")
+            if self.stop_controller.stop_requested.is_set() or any(
+                    self.database.get_state(key) for key in (
+                        ENGINE_STOP_CLEANUP_KEY, ENGINE_FAULT_KEY,
+                        ORDER_CLEANUP_ALARM_KEY, GHOST_ORDER_ALARM_KEY)):
+                raise TradingHalt("Order cleanup or a trading fault requires review first.")
+            self._load_market_for_engine_control()
+            saved_run = json.loads(self.database.get_state("grid_run") or "null")
+            baseline = Decimal(saved_run["baseline_base"])
+            if not baseline.is_finite() or baseline < 0:
+                raise TradingHalt("Saved BTC baseline cannot be verified.")
+            live = self._full_account_open_orders()
+            self._audit_open_order_drift(live, self.database.fetch_active_grids())
+            if self.database.fetch_active_grids() or any(self._is_bot_order(row) for row in live):
+                raise TradingHalt("Bot orders remain; dust cannot be acknowledged.")
+            if state.get("client_order_id"):
+                order = self._liquidation_order(state["client_order_id"])
+                if (not order or order.get("status") not in ("closed", "canceled", "expired")
+                        or state.get("confirmed_order_id") != state["client_order_id"]):
+                    raise TradingHalt("The last liquidation sale is not fully reconciled.")
+            residual = Decimal(state["residual_base"])
+            held = Decimal(state["held_base"])
+            cost = Decimal(state["cost_basis_quote"])
+            sold = Decimal(state.get("sold_base", "0"))
+            if (not all(value.is_finite() for value in (residual, held, cost, sold))
+                    or not 0 < residual <= held or sold < 0 or held - sold != residual or cost <= 0):
+                raise TradingHalt("Residual inventory cannot be verified.")
+            price = self._ticker_price()
+            if self._sellable_hard_stop_amount(residual, price) > 0:
+                raise TradingHalt("The remaining BTC is sellable; it cannot be set aside as dust.")
+            available = self._available_base_for_liquidation()
+            if available - baseline < residual:
+                raise TradingHalt("The recorded remainder is not available in the Spot wallet.")
+            with self.database.transaction():
+                self.assert_runner_lease()
+                if any(self.database.get_state(key) for key in (
+                        ENGINE_STOP_CLEANUP_KEY, ENGINE_FAULT_KEY,
+                        ORDER_CLEANUP_ALARM_KEY, GHOST_ORDER_ALARM_KEY)):
+                    raise TradingHalt("Safety state changed; refresh before acknowledging dust.")
+                reserve_id = self.database.acknowledge_liquidation_dust(
+                    text, self.market["base"], residual, cost * residual / held,
+                )
+                self._record_exchange_audit()
+            return {"engine_status": ENGINE_HALTED, "mode": LIQUIDATED,
+                    "dust_reserve_id": reserve_id, "residual_base": str(residual),
+                    "message": "Dust recorded outside grid monitoring. Configure a new grid, then review and START."}
+        finally:
+            self._cycle_lock.release()
+
     def force_liquidate(self) -> Dict[str, Any]:
         """An explicit admin exit; never change the stop or sell baseline BTC."""
         with self._cycle_lock:
             self.assert_runner_lease()
             state_text = self.database.get_state(LIQUIDATION_KEY)
             state = json.loads(state_text) if state_text else None
+            if state and state["phase"] == "dust_acknowledged":
+                raise TradingHalt("Dust is recorded outside this grid. Configure a new grid before another exit.")
             if state and state["phase"] == "failed":
                 raise TradingHalt("Liquidation is unresolved. Review the saved alarm before another exit.")
             if not state or state["phase"] != "complete":
@@ -2965,9 +3041,12 @@ class GridBot:
             if (self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_IDLE or
                     self.database.get_state(ENGINE_STOP_CLEANUP_KEY) != "1"):
                 return
-            if self.database.get_state(SAFETY_MODE_KEY) in (
-                    LIQUIDATING, LIQUIDATION_HALTED):
-                return  # The separate liquidation state must be reviewed.
+            mode = self.database.get_state(SAFETY_MODE_KEY)
+            state = json.loads(self.database.get_state(LIQUIDATION_KEY) or "null")
+            if mode == LIQUIDATING or (mode == LIQUIDATION_HALTED and not (
+                    state and state.get("phase") == "failed" and
+                    state.get("failure_type") == "LiquidationDust")):
+                return  # A sale with an uncertain outcome still owns recovery.
             self._load_market_for_engine_control()
             _, complete = self._cancel_bot_orders()
             known_orders = self.database.fetch_all_orders()
@@ -3000,12 +3079,32 @@ class GridBot:
 
     def stop_engine(self) -> Dict[str, Any]:
         """Persist IDLE before canceling and reconciling every bot-owned grid order."""
-        with self._cycle_lock:
+        if not self._cycle_lock.acquire(timeout=2):
+            raise TradingHalt(
+                "A trading operation is still reconciling with Binance. STOP was not "
+                "applied; refresh its status and retry. An uncertain sale cannot be interrupted."
+            )
+        try:
             self.assert_runner_lease()
             mode = self.database.get_state(SAFETY_MODE_KEY)
-            if mode in (
-                    LIQUIDATING, LIQUIDATION_HALTED):
+            if mode == LIQUIDATING:
                 raise TradingHalt("Unresolved hard-stop liquidation cannot be interrupted.")
+            if mode == LIQUIDATION_HALTED:
+                # A halted exit no longer owns the cycle lock. Verify cancellation
+                # while keeping its residual inventory and recovery lock intact.
+                state = json.loads(self.database.get_state(LIQUIDATION_KEY) or "null")
+                if not state or state.get("failure_type") != "LiquidationDust":
+                    raise TradingHalt("Unresolved liquidation requires review before STOP.")
+                _, complete = self._cancel_bot_orders()
+                live = self._full_account_open_orders()
+                self._audit_open_order_drift(live, self.database.fetch_active_grids())
+                if (not complete or self.database.fetch_active_grids() or
+                        any(self._is_bot_order(order) for order in live)):
+                    raise TradingHalt("Bot order cancellation is not yet verified.")
+                self.database.set_state(ENGINE_STATUS_KEY, ENGINE_HALTED, trigger_event="STOP")
+                return {"engine_status": ENGINE_HALTED, "bot_orders_cleared": True,
+                        "remaining_exchange_orders": len(self._live_open_orders()),
+                        "message": "Engine halted. Remaining BTC is recorded; liquidation recovery is required."}
             with self.database.transaction():
                 self.database.require_order_cleanup(
                     "Engine STOP requested; Binance order cleanup is unverified.", trigger_event="STOP")
@@ -3024,6 +3123,8 @@ class GridBot:
             return {"engine_status": ENGINE_HALTED if mode == LIQUIDATED else ENGINE_IDLE,
                     "bot_orders_cleared": True,
                     "remaining_exchange_orders": len(self._live_open_orders())}
+        finally:
+            self._cycle_lock.release()
 
     def start_engine(self, *, auto_cover_inventory: bool = False,
                      pending_grid_token: Optional[str] = None) -> Dict[str, Any]:
@@ -3611,7 +3712,11 @@ async def _reconcile_service_boot(bot: GridBot, *, ready: bool) -> None:
         if (bot.database.get_state(ENGINE_STOP_CLEANUP_KEY) is None and
                 bot.database.get_state(SAFETY_MODE_KEY) == LIQUIDATED and
                 liquidation_text and
-                json.loads(liquidation_text).get("phase") == "complete"):
+                json.loads(liquidation_text).get("phase") in ("complete", "dust_acknowledged")):
+            bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_HALTED)
+        if (bot.database.get_state(ENGINE_STOP_CLEANUP_KEY) is None and
+                bot.database.get_state(SAFETY_MODE_KEY) == LIQUIDATION_HALTED and
+                liquidation_text and json.loads(liquidation_text).get("failure_type") == "LiquidationDust"):
             bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_HALTED)
     else:
         # Direct execution also needs a full exchange/ledger boot check.

@@ -33,6 +33,11 @@ class ForceLiquidateRequest(BaseModel):
     confirmed: StrictBool
 
 
+class DustAcknowledgmentRequest(BaseModel):
+    confirmed: StrictBool
+    recovery_token: str = Field(min_length=64, max_length=64)
+
+
 class StopLossRequest(BaseModel):
     price: FiniteFloat = Field(gt=0)
 
@@ -79,6 +84,10 @@ class UncertainOrderError(TradingHalt):
 
 class LiquidationPending(RuntimeError):
     """BTC is still exposed; retry reconciliation without declaring success."""
+
+
+class LiquidationDust(TradingHalt):
+    """Verified BTC remains below exchange filters; retrying cannot sell it."""
 
 
 class RunnerLeaseLost(TradingHalt):

@@ -192,6 +192,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         standby_bot.config.lower_price = Decimal("80")
         standby_bot.config.upper_price = Decimal("120")
         standby_bot.database.get_state.return_value = None
+        standby_bot.database.fetch_dust_reserves.return_value = []
         standby_bot.database.realized_pnl_summary.return_value = {
             "today": Decimal(0), "seven_day": Decimal(0), "total": Decimal(0),
         }
@@ -310,6 +311,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "trading_state": "IDLE", "engine_status": "IDLE",
                     "engine_fault": None, "pending_grid": None,
                     "can_reset_liquidation": False,
+                    "dust_recovery": None, "dust_reserves": [],
                     "order_cleanup_required": False, "unresolved_order_alarm": None,
                     "ghost_order_alarm": None,
                     "has_grid_run": False,
@@ -416,6 +418,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "trading_state": "ACTIVE", "engine_status": "RUNNING",
             "engine_fault": None, "pending_grid": None,
             "can_reset_liquidation": False,
+            "dust_recovery": None, "dust_reserves": [],
             "order_cleanup_required": False, "unresolved_order_alarm": None,
             "ghost_order_alarm": None,
             "has_grid_run": False,
