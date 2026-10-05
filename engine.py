@@ -1376,12 +1376,14 @@ class GridBot:
                 raise TradingHalt("A rounded grid order exceeds its quote allocation.")
             planned.append((level, price, amount))
 
-        upper_amount = self._amount(
-            seed_amount * (1 - SELL_AMOUNT_BUFFER) / Decimal(len(self.upper_levels))
+        upper_amounts = self._split_sell_amounts(
+            seed_amount * (1 - SELL_AMOUNT_BUFFER),
+            list(range(-1, -len(self.upper_levels) - 1, -1)),
         )
         upper_planned: List[Tuple[int, Decimal, Decimal]] = []
         for index, raw_price in enumerate(self.upper_levels, start=1):
             price = self._price(raw_price)
+            upper_amount = upper_amounts[-index]
             if not sizing_paused:
                 self._check_order_size(price, upper_amount)
             upper_planned.append((-index, price, upper_amount))
@@ -1528,9 +1530,13 @@ class GridBot:
             sell_target = self._price(raw / (1 - config.spacing_percent / 100))
             self._check_order_size(sell_target, conservative_sell)
         upper_total = carry_amount if carry_amount > 0 else self._amount(seed_quote / center)
-        upper_amount = self._amount(upper_total * (1 - SELL_AMOUNT_BUFFER) / len(sells))
-        for raw in sells:
+        upper_amounts = self._split_sell_amounts(
+            upper_total * (1 - SELL_AMOUNT_BUFFER),
+            list(range(-1, -len(sells) - 1, -1)),
+        )
+        for index, raw in enumerate(sells, start=1):
             price = self._price(raw)
+            upper_amount = upper_amounts[-index]
             checked_amount = upper_amount
             try:
                 self._check_order_size(price, checked_amount)
@@ -1922,7 +1928,7 @@ class GridBot:
             )
 
     def _place_seed_upper_sell(self, level: int, seed_row: Dict[str, Any]) -> None:
-        amount = self._seed_upper_sell_amount(seed_row)
+        amount = self._seed_upper_sell_amount(seed_row, level)
         if amount is None:
             return
         target = (self.config.upper_price if self.database.get_state(RECONCILE_COVER_KEY)
@@ -1937,13 +1943,59 @@ class GridBot:
                 parent_order_id=seed_row["order_id"],
             )
 
-    def _seed_upper_sell_amount(self, seed_row: Dict[str, Any]) -> Optional[Decimal]:
+    def _split_sell_amounts(self, net_base: Decimal, levels: List[int]) -> Dict[int, Decimal]:
+        """Share exchange-tradable BTC without losing rounded allocation remainders."""
+        if not levels or not net_base.is_finite() or net_base < 0:
+            raise TradingHalt("Seed SELL allocation has invalid inventory or levels.")
+        total = self._amount(net_base)
+        if not total.is_finite() or not 0 <= total <= net_base:
+            raise TradingHalt("Exchange precision rounded a seed SELL above net received BTC.")
+        remaining = total
+        amounts = {}
+        for index, level in enumerate(levels):
+            # Divide the remaining inventory, rather than rounding every lane's
+            # original equal share. The last lane receives all remaining ticks.
+            amount = self._amount(remaining / Decimal(len(levels) - index))
+            if not amount.is_finite() or not 0 <= amount <= remaining:
+                raise TradingHalt("Seed SELL allocation exceeds its remaining inventory.")
+            amounts[level] = amount
+            remaining -= amount
+        if remaining != 0:
+            raise TradingHalt("Seed SELL allocation could not account for every tradable increment.")
+        return amounts
+
+    def _seed_upper_sell_allocations(self, seed_row: Dict[str, Any]) -> Optional[Dict[int, Decimal]]:
         seed = self._fetch_order(seed_row)
         net_base = self._net_buy_fill_base(seed_row, seed)
         if net_base is None:
             return None
-        allocated_base = net_base / Decimal(len(self.upper_levels))
-        return self._amount(allocated_base)
+        total = self._amount(net_base)
+        if not total.is_finite() or not 0 <= total <= net_base:
+            raise TradingHalt("Exchange precision rounded a seed SELL above net received BTC.")
+        levels = list(range(-1, -len(self.upper_levels) - 1, -1))
+        allocated = {}
+        for row in self.database.fetch_all_orders():
+            if row["parent_order_id"] != seed_row["order_id"] or row["side"] != "SELL":
+                continue
+            level = row["level"]
+            amount = _order_decimal(row["amount"])
+            if (level not in levels or level in allocated or not amount.is_finite()
+                    or amount <= 0):
+                raise TradingHalt("Saved seed SELL allocations are invalid or duplicated.")
+            # Reserve the full submitted quantity, including BTC already sold.
+            # Durable order intents also count if a response was lost on restart.
+            allocated[level] = amount
+        remaining = total - sum(allocated.values(), Decimal(0))
+        if remaining < 0:
+            raise TradingHalt("Saved seed SELL orders exceed net received BTC.")
+        missing = [level for level in levels if level not in allocated]
+        if missing:
+            allocated.update(self._split_sell_amounts(remaining, missing))
+        return allocated
+
+    def _seed_upper_sell_amount(self, seed_row: Dict[str, Any], level: int = -1) -> Optional[Decimal]:
+        amounts = self._seed_upper_sell_allocations(seed_row)
+        return amounts[level] if amounts is not None else None
 
     def _place_buy(self, level: int, parent_order_id: Optional[str]) -> None:
         if level > 0:
@@ -3391,14 +3443,17 @@ class GridBot:
                 self.config, self.levels, self.config.stop_loss_price,
                 seed_required=False,
             )
-        if all(level not in latest for level in
-               range(-1, -len(self.upper_levels) - 1, -1)):
-            sell_amount = self._seed_upper_sell_amount(seed_row)
-            if sell_amount is None:
+        missing_upper = [level for level in range(-1, -len(self.upper_levels) - 1, -1)
+                         if level not in latest]
+        if missing_upper:
+            sell_amounts = self._seed_upper_sell_allocations(seed_row)
+            if sell_amounts is None:
                 return events
-            required_base = sell_amount * len(self.upper_levels)
-            for raw in self.upper_levels:
-                self._check_order_size(self._price(raw), sell_amount)
+            required_base = sum((sell_amounts[level] for level in missing_upper), Decimal(0))
+            for level in missing_upper:
+                target = (self.config.upper_price if cover_text
+                          else self.upper_levels[-level - 1])
+                self._check_order_size(self._grid_order_price(target, "SELL"), sell_amounts[level])
             if self._free_bot_base() < required_base:
                 LOGGER.warning(
                     "Insufficient free bot BTC for initial SELL limits; "
