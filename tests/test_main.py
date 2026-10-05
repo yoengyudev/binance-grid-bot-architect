@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing, redirect_stderr
+from dataclasses import replace
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from io import StringIO
@@ -1344,7 +1345,23 @@ class GridBotTests(unittest.TestCase):
             bot.prepare(persist=True)
             bot.ready_mode = True
             bot.database.set_state(grid_settings.ENGINE_STATUS_KEY, grid_settings.ENGINE_IDLE)
-            bot.advance_trailing_stop(Decimal("115"))
+            # Retain a floor established while an earlier inventory lot was held.
+            # The bot is flat now, so a price observation must not raise the stop.
+            bot.config = replace(bot.config, stop_loss_price=Decimal("85"))
+            saved_run = json.loads(bot.database.get_state("grid_run"))
+            saved_run["fingerprint"] = bot.config.fingerprint()
+            bot.database.update_runtime_grid_settings(
+                json.dumps(saved_run),
+                json.dumps({
+                    "lower": "80", "upper": "120", "spacing": "10",
+                    "investment_quote": "1000", "stop_loss_price": "85",
+                    "buy_levels": 5, "sell_levels": 5,
+                }),
+                trailing_stop=json.dumps({
+                    "high_water_mark": "115", "stop_loss_distance": "30",
+                }),
+            )
+            bot.high_water_mark = Decimal("115")
             exchange.price = Decimal("110")
             with self.assertRaises(grid_models.GridStopConflict) as raised:
                 bot.start_engine(auto_cover_inventory=True)
@@ -1961,6 +1978,7 @@ class GridBotTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "grid_testnet.sqlite"
             bot, exchange = self.make_bot(path, width=Decimal("15"))
+            bot.run_cycle()  # Breakout tracking applies while seed BTC is held.
             self.assertEqual(bot.breakout_width_percent, Decimal("15"))
             self.assertFalse(bot._observe_upper_breakout(Decimal("121"), now=0))
             self.assertFalse(bot._observe_upper_breakout(Decimal("121"), now=60))

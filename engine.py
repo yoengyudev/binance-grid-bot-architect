@@ -1181,10 +1181,16 @@ class GridBot:
             self.grid_needs_reset = True
             LOGGER.info("Four-hour breakout confirmed at %s; grid reset queued.", price)
 
-    def _observe_upper_breakout(self, price: Decimal, *, now: Optional[float] = None) -> bool:
+    def _observe_upper_breakout(self, price: Decimal, *, now: Optional[float] = None,
+                                bot_btc_balance: Optional[Decimal] = None) -> bool:
         """Require four hours of uninterrupted above-bound observations."""
         if (self.is_paused or self.grid_needs_reset or
                 self._compare_grid_prices(price, self.config.upper_price) <= 0):
+            self.database.clear_state(BREAKOUT_TIMER_KEY)
+            return False
+        if bot_btc_balance is None:
+            bot_btc_balance = self._bot_btc_balance()
+        if bot_btc_balance <= 0:
             self.database.clear_state(BREAKOUT_TIMER_KEY)
             return False
         now = time.time() if now is None else now
@@ -1249,18 +1255,23 @@ class GridBot:
         self.stop_loss_distance = stop_loss_distance
         return True
 
-    def advance_trailing_stop(self, price: Decimal) -> None:
+    def advance_trailing_stop(self, price: Decimal, *,
+                              bot_btc_balance: Optional[Decimal] = None) -> None:
         """Persist a new high and raised liquidation floor as one grid update."""
         with self._cycle_lock, self._grid_lock:
             self.assert_runner_lease()
+            if self.database.get_state(SAFETY_MODE_KEY) in (
+                    LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
+                return
+            if bot_btc_balance is None:
+                bot_btc_balance = self._bot_btc_balance()
+            if bot_btc_balance <= 0:
+                return
             if self.high_water_mark is None or self.stop_loss_distance is None:
                 self._restore_trailing_stop()
             if self.high_water_mark is None or self.stop_loss_distance is None:
                 raise TradingHalt("Trailing stop was not initialized.")
             if price <= self.high_water_mark:
-                return
-            if self.database.get_state(SAFETY_MODE_KEY) in (
-                    LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
                 return
             saved_text = self.database.get_state("grid_run")
             if saved_text is None:
@@ -1680,8 +1691,10 @@ class GridBot:
         if queued:
             self.database.set_state(notice_key, "1")
 
-    def _reconcile_order(self, row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[str, ...]]]:
-        order = self._fetch_order(row, persist=False)
+    def _reconcile_order(self, row: Dict[str, Any], *,
+                         order: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, Tuple[str, ...]]]:
+        if order is None:
+            order = self._fetch_order(row, persist=False)
         status = order.get("status")
         if status == "open":
             if _order_decimal(order.get("filled")) > 0 and row["status"] == "OPEN":
@@ -2034,6 +2047,44 @@ class GridBot:
             )
         self._alert_realized_sell(row["order_id"], sell_price, sell_filled, profit)
 
+    def _bot_btc_balance(self, *, refresh: bool = True) -> Decimal:
+        """Actual tracked inventory, including locked BTC and partial executions.
+
+        Use commission-adjusted ledger quantities, never the wallet's free BTC
+        or the conservative SELL sizing reserve. Unknown exposure is not flat.
+        """
+        if refresh:
+            for row in self.database.fetch_active_grids():
+                self._fetch_order(row)
+        balance = _portfolio_wallet(self.database)["btc_held"]
+        if balance is None:
+            raise TradingHalt("Bot BTC exposure cannot be verified from the fill ledger.")
+        amount = Decimal(str(balance))
+        if not amount.is_finite() or amount < 0:
+            raise TradingHalt("Bot BTC exposure is invalid.")
+        return amount
+
+    def _evaluate_automatic_stop(self, price: Decimal, *,
+                                 bot_btc_balance: Optional[Decimal] = None) -> bool:
+        """Evaluate price protection only while inventory is exposed."""
+        with self._cycle_lock:
+            self.assert_runner_lease()
+            mode = self.database.get_state(SAFETY_MODE_KEY)
+            if mode == LIQUIDATING:
+                self._liquidate_locked(price)  # Finish an already durable risk exit.
+                return True
+            if mode in (LIQUIDATED, LIQUIDATION_HALTED):
+                return False
+            if bot_btc_balance is None:
+                bot_btc_balance = self._bot_btc_balance()
+            if bot_btc_balance <= 0:
+                return False
+            self.advance_trailing_stop(price, bot_btc_balance=bot_btc_balance)
+            if price < self.config.stop_loss_price:
+                self._liquidate_locked(price, bot_btc_balance=bot_btc_balance)
+                return True
+            return False
+
     def _bot_base_exposure(self) -> Decimal:
         """Estimate only this bot's acquired base, including partial fills."""
         net_base = Decimal(0)
@@ -2167,8 +2218,8 @@ class GridBot:
                 LOGGER.warning("Queued manual recenter withdrawn: trailing floor rose.")
                 return False
             if request.get("source") == "breakout":
-                if self._compare_grid_prices(
-                        self._ticker_price(), Decimal(request["previous_upper"])) <= 0:
+                if (self._bot_btc_balance() <= 0 or self._compare_grid_prices(
+                        self._ticker_price(), Decimal(request["previous_upper"])) <= 0):
                     self.database.clear_state("grid_reset")
                     self.pending_grid_bounds = None
                     self.grid_needs_reset = False
@@ -2196,9 +2247,7 @@ class GridBot:
                 raise TradingHalt("Old grid cancellation could not be verified.")
             carry_amount, carry_cost = self._carry_inventory()
             price = self._ticker_price()
-            self.advance_trailing_stop(price)
-            if price < self.config.stop_loss_price:
-                self._liquidate_locked(price)
+            if self._evaluate_automatic_stop(price, bot_btc_balance=carry_amount):
                 return False
             if request.get("source") == "breakout":
                 if self._compare_grid_prices(price, Decimal(request["previous_upper"])) <= 0:
@@ -2684,9 +2733,15 @@ class GridBot:
             return False
         raise TradingHalt("Unknown hard-stop liquidation phase.")
 
-    def _liquidate_locked(self, price: Decimal, *, trigger_event: str = "HARD_STOP") -> None:
+    def _liquidate_locked(self, price: Decimal, *, trigger_event: str = "HARD_STOP",
+                          bot_btc_balance: Optional[Decimal] = None) -> None:
         """Cancel, verify, sell only bot inventory, and persist a terminal state."""
         state_text = self.database.get_state(LIQUIDATION_KEY)
+        if state_text is None and trigger_event == "HARD_STOP":
+            if bot_btc_balance is None:
+                bot_btc_balance = self._bot_btc_balance()
+            if bot_btc_balance <= 0:
+                return  # Flat inventory must not start a price-triggered exit.
         state = json.loads(state_text) if state_text else {
             "phase": "canceling", "trigger_price": str(price), "trigger_event": trigger_event,
         }
@@ -3142,20 +3197,35 @@ class GridBot:
         self.database.set_state(LAST_MARKET_PRICE_KEY, str(current_price))
         if mode in (LIQUIDATED, LIQUIDATION_HALTED):
             return []
-        if mode != LIQUIDATING:
-            self.advance_trailing_stop(current_price)
-        if mode == LIQUIDATING or current_price < self.config.stop_loss_price:
-            self._liquidate_locked(current_price)
-            return []
+        events: List[Tuple[str, Tuple[str, ...]]] = []
+        # A final SELL or a partial BUY may have executed since the last tick.
+        # Refresh fills before deciding risk, then process lane status changes.
+        # An unexpected cancellation must not interrupt an exposed hard-stop exit.
+        observed_orders = []
+        for row in self.database.fetch_active_grids():
+            if self.stop_controller.stop_requested.is_set():
+                return events
+            observed_orders.append((row, self._fetch_order(row)))
+        bot_btc_balance = self._bot_btc_balance(refresh=False)
+        if self._evaluate_automatic_stop(current_price, bot_btc_balance=bot_btc_balance):
+            return events
+        for row, order in observed_orders:
+            if self.stop_controller.stop_requested.is_set():
+                return events
+            event = self._reconcile_order(row, order=order)
+            if event:
+                events.append(event)
         if mode == PAUSED_RESET:
-            events, complete = self._cancel_bot_orders()
+            cancel_events, complete = self._cancel_bot_orders()
+            events.extend(cancel_events)
             if not complete or self.database.fetch_active_grids():
                 LOGGER.warning("Bot order cleanup for factory reset will retry next cycle.")
             return events
-        self._cancel_buys_below_stop()
-        if mode != PAUSED_SIZING and self._observe_upper_breakout(current_price):
-            return []
-        events: List[Tuple[str, Tuple[str, ...]]] = []
+        if bot_btc_balance > 0:
+            self._cancel_buys_below_stop()
+        if mode != PAUSED_SIZING and self._observe_upper_breakout(
+                current_price, bot_btc_balance=bot_btc_balance):
+            return events
         if self.is_paused:
             pause_events, cancellations_complete = self._cancel_buy_orders_for_pause()
             events.extend(pause_events)
@@ -3170,13 +3240,6 @@ class GridBot:
                 self.is_paused = False
                 LOGGER.info("Safety pause lifted after recovery to %s %s.",
                             current_price, self.config.symbol)
-        for row in self.database.fetch_active_grids():
-            if self.stop_controller.stop_requested.is_set():
-                return events
-            event = self._reconcile_order(row)
-            if event:
-                events.append(event)
-
         if self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING:
             return events
 
@@ -3199,7 +3262,8 @@ class GridBot:
         if seed_row is None:
             if cover_text:
                 raise TradingHalt("Inventory cover has no saved seed lot; manual review required.")
-            if not self.is_paused:
+            if (not self.is_paused and self._within_grid_bounds(current_price)
+                    and current_price > self.config.stop_loss_price):
                 self._check_grid_buy_capital(
                     self.config, self.levels, self.config.stop_loss_price,
                     seed_required=True,
@@ -3389,9 +3453,7 @@ class GridBot:
                         continue
                     if self.grid_needs_reset:
                         price = await asyncio.to_thread(self._ticker_price)
-                        await asyncio.to_thread(self.advance_trailing_stop, price)
-                        if price < self.config.stop_loss_price:
-                            await asyncio.to_thread(self.liquidate, price)
+                        if await asyncio.to_thread(self._evaluate_automatic_stop, price):
                             await self._notify_liquidation(notifier)
                             continue
                         complete = await asyncio.to_thread(self.reset_grid)

@@ -130,6 +130,8 @@ class PriceBoundaryTests(unittest.TestCase):
         self.assertTrue(self.bot._within_grid_bounds(Decimal('85067.41'), strict=True))
 
     def test_ceiling_float_artifact_does_not_start_breakout_timer(self):
+        self.bot.prepare(persist=True)
+        self.bot.run_cycle()  # Hold seed BTC so breakout tracking is enabled.
         self.assertFalse(self.bot._observe_upper_breakout(Decimal('85401.37'), now=1))
         self.assertIsNone(self.bot.database.get_state(BREAKOUT_TIMER_KEY))
         self.assertFalse(self.bot._observe_upper_breakout(Decimal('85401.38'), now=2))
