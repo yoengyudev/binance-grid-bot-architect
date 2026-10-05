@@ -125,6 +125,49 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             overrides.clear()
             overrides.update(previous)
 
+    async def test_status_exposes_durable_liquidation_result_without_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
+            previous = (grid_api.app.state.grid_bot, grid_api.app.state.standby,
+                        grid_api.app.state.monitor_only)
+            grid_api.app.state.grid_bot = None
+            grid_api.app.state.standby = False
+            grid_api.app.state.monitor_only = False
+            database_patch = patch.object(grid_api, "GridDatabase", return_value=database)
+            database_patch.start()
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=grid_api.app),
+                    base_url="http://testserver",
+                ) as client:
+                    for phase in ("canceling", "confirming", "complete", "failed", "dust_acknowledged"):
+                        state = {"phase": phase, "trigger_event": "MANUAL_PANIC_LIQUIDATION",
+                                 "residual_base": "0" if phase == "complete" else "0.00001",
+                                 "sold_base": "0.0025", "completed_at": "2026-10-05T13:17:28+00:00",
+                                 "failure_reason": "Below MARKET minimums" if phase == "failed" else None,
+                                 "client_order_id": "internal-order-id"}
+                        database.set_state(grid_settings.LIQUIDATION_KEY, json.dumps(state))
+                        with database._connection() as connection:
+                            saved = list(connection.execute("SELECT * FROM bot_state ORDER BY key"))
+                        response = await self.authenticated_status(client)
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(response.headers["cache-control"], "no-store")
+                        self.assertEqual(response.json()["liquidation"], {
+                            key: state[key] for key in ("phase", "trigger_event", "residual_base",
+                                                       "sold_base", "completed_at", "failure_reason")
+                        })
+                        with database._connection() as connection:
+                            self.assertEqual(list(connection.execute("SELECT * FROM bot_state ORDER BY key")), saved)
+                    for malformed in ("null", "[]", "bad JSON", '{"phase":true}'):
+                        database.set_state(grid_settings.LIQUIDATION_KEY, malformed)
+                        self.assertIsNone(grid_api._liquidation_status(database))
+                    database.clear_state(grid_settings.LIQUIDATION_KEY)
+                    self.assertIsNone(grid_api._liquidation_status(database))
+            finally:
+                database_patch.stop()
+                (grid_api.app.state.grid_bot, grid_api.app.state.standby,
+                 grid_api.app.state.monitor_only) = previous
+
     async def test_status_exposes_recorded_realized_pnl(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
@@ -311,6 +354,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                     "trading_state": "IDLE", "engine_status": "IDLE",
                     "engine_fault": None, "pending_grid": None,
                     "can_reset_liquidation": False,
+                    "liquidation": None,
                     "dust_recovery": None, "dust_reserves": [],
                     "order_cleanup_required": False, "unresolved_order_alarm": None,
                     "ghost_order_alarm": None,
@@ -418,6 +462,7 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "trading_state": "ACTIVE", "engine_status": "RUNNING",
             "engine_fault": None, "pending_grid": None,
             "can_reset_liquidation": False,
+            "liquidation": None,
             "dust_recovery": None, "dust_reserves": [],
             "order_cleanup_required": False, "unresolved_order_alarm": None,
             "ghost_order_alarm": None,

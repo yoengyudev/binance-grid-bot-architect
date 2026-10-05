@@ -360,6 +360,20 @@ def _unprotected_exposure_payload(bot: Optional["GridBot"],
             "has_unprotected_exposure": exposure > protected}
 
 
+def _liquidation_status(database: GridDatabase) -> Optional[Dict[str, Any]]:
+    """Expose the durable exit result so clients can recover a lost POST response."""
+    try:
+        state = json.loads(database.get_state("hard_stop_liquidation") or "null")
+        if not isinstance(state, dict) or not isinstance(state.get("phase"), str):
+            return None
+        return {key: state.get(key) for key in (
+            "phase", "trigger_event", "residual_base", "sold_base",
+            "completed_at", "failure_reason",
+        )}
+    except (ValueError, TypeError):
+        return None
+
+
 def _dust_recovery_payload(database: GridDatabase) -> Dict[str, Any]:
     recovery = None
     text = database.get_state("hard_stop_liquidation")
@@ -408,6 +422,7 @@ def bot_status(response: Response,
             "ghost_order_alarm": bot.database.get_state(GHOST_ORDER_ALARM_KEY),
             "has_grid_run": False, "grid_levels": 0,
             "can_reset_liquidation": False,
+            "liquidation": _liquidation_status(bot.database),
             **_dust_recovery_payload(bot.database),
             "exact_grid_recenter_supported": True,
             "lower_bound": None, "upper_bound": None,
@@ -433,6 +448,7 @@ def bot_status(response: Response,
             "ghost_order_alarm": None,
             "has_grid_run": False, "grid_levels": 0,
             "can_reset_liquidation": False,
+            "liquidation": None,
             "exact_grid_recenter_supported": False,
             "lower_bound": None, "upper_bound": None,
             "last_exchange_audit_time": None,
@@ -526,6 +542,7 @@ def bot_status(response: Response,
         "ghost_order_alarm": database.get_state(GHOST_ORDER_ALARM_KEY),
         "pending_grid": pending_grid,
         "can_reset_liquidation": can_reset_liquidation,
+        "liquidation": _liquidation_status(database),
         **_dust_recovery_payload(database),
         "has_grid_run": database.get_state("grid_run") is not None,
         "trading_state": "ACCOUNT_CLEARED" if manual_account_exit else safety_mode if safety_mode in (
