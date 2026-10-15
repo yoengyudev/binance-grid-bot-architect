@@ -329,37 +329,57 @@ class GridBot:
                     restored[row["order_id"]] = order
 
                 locked = balances[base]["used"]
-                if locked is not None:
-                    bot_sell_remaining = sum((
-                        _order_decimal(order.get("remaining"),
-                                       str(order.get("amount") or "0"))
-                        for order in restored.values()
-                        if str(order.get("side", "")).lower() == "sell"
-                    ), Decimal(0))
-                    if bot_sell_remaining > locked:
-                        raise TradingHalt(
-                            "Binance locked BTC is below the saved SELL order total."
-                        )
+                bot_sell_remaining = sum((
+                    _order_decimal(order.get("remaining"),
+                                   str(order.get("amount") or "0"))
+                    for order in restored.values()
+                    if str(order.get("side", "")).lower() == "sell"
+                ), Decimal(0))
+                if locked is not None and bot_sell_remaining > locked:
+                    raise TradingHalt(
+                        "Binance locked BTC is below the saved SELL order total."
+                    )
                 self.reconciled_orders = restored
-                # Only a sellable free balance is actionable. Binance can leave
-                # precision dust after a filled SELL.
+                # A saved grid reserves the wallet's pre-existing BTC outside
+                # its allocation. Restore that boundary from SQLite even on a
+                # ready-mode restart, where prepare() has not run yet.
+                baseline = Decimal(0)
+                saved_run = self.database.get_state("grid_run")
+                if saved_run is not None:
+                    try:
+                        run = json.loads(saved_run)
+                        baseline = Decimal(str(run["baseline_base"]))
+                        if not baseline.is_finite() or baseline < 0:
+                            raise ValueError("Invalid starting balance")
+                    except (KeyError, ValueError, TypeError, InvalidOperation) as error:
+                        raise TradingHalt(
+                            "Saved starting BTC balance is invalid; review the saved run."
+                        ) from error
+                    if run.get("fingerprint") != self.config.fingerprint():
+                        raise TradingHalt(
+                            "Grid settings changed since the saved run; reconcile orders first."
+                        )
+                uncovered = max(free - baseline, Decimal(0))
+                if baseline > 0:
+                    # A withdrawal from the reserved wallet must not hide BTC
+                    # the fill ledger still identifies as bot-owned inventory.
+                    owned_free = max(self._bot_btc_balance(refresh=False) -
+                                     bot_sell_remaining, Decimal(0))
+                    uncovered = max(uncovered, min(free, owned_free))
+                # Only a sellable uncovered balance needs SELL protection.
+                # Keep unexplained deposits actionable; never enlarge baseline.
                 unhedged = Decimal(0)
-                if free > 0:
+                if uncovered > 0:
                     price = self._ticker_price()
-                    if self._sellable_hard_stop_amount(free, price) > 0:
-                        unhedged = free
+                    if self._sellable_hard_stop_amount(uncovered, price) > 0:
+                        unhedged = uncovered
                         LOGGER.critical(
                             "Unhedged %s BTC in Spot wallet; START needs "
-                            "manual clearance or explicit auto_cover_inventory.", free,
+                            "manual clearance or explicit auto_cover_inventory.", uncovered,
                         )
                 self._record_exchange_audit()
                 return {"resumable": bool(restored), "unhedged_btc": unhedged,
-                        "covered_btc": bot_sell_remaining if locked is not None else sum((
-                            _order_decimal(order.get("remaining"),
-                                           str(order.get("amount") or "0"))
-                            for order in restored.values()
-                            if str(order.get("side", "")).lower() == "sell"
-                        ), Decimal(0))}
+                        "covered_btc": bot_sell_remaining}
             except RunnerLeaseLost:
                 raise
             except Exception as error:
@@ -3231,7 +3251,9 @@ class GridBot:
                 carried, _ = self._carry_inventory(require_available=False)
                 if carried < unhedged * (1 - SELL_AMOUNT_BUFFER):
                     raise TradingHalt(
-                        "BTC has no complete bot cost-basis history; clear it manually."
+                        "BTC above the grid's recorded starting balance has no complete "
+                        "bot cost-basis history. Review wallet deposits and the saved "
+                        "ledger before START; unknown BTC cannot be auto-covered."
                     )
             current, _, _ = self.prepare(persist=False)
             if not self._within_grid_bounds(current, strict=True):
