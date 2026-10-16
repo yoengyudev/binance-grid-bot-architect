@@ -98,7 +98,7 @@ class FlatInventoryRiskTests(unittest.TestCase):
         exchange.price = Decimal('105')
         bot.run_cycle()
         self.assertGreater(bot._bot_btc_balance(refresh=False), 0)
-        self.assertEqual(bot.config.stop_loss_price, Decimal('75'))
+        self.assertEqual(bot.config.stop_loss_price, Decimal('70'))
         self.assertEqual(bot.database.fetch_latest_orders_by_level()[-1]['side'], 'SELL')
 
     def test_partial_buy_reactivates_the_existing_hard_stop(self):
@@ -110,6 +110,7 @@ class FlatInventoryRiskTests(unittest.TestCase):
         buy = bot.database.fetch_latest_orders_by_level()[1]
         exchange.orders[buy['client_order_id']].update(filled='1', cost=str(Decimal(buy['price'])))
         exchange.base_free += 1
+        exchange.price = Decimal('69')  # Partial exposure is subject to the fixed floor.
         bot.run_cycle()
         self.assertEqual(bot.database.get_state(SAFETY_MODE_KEY), LIQUIDATED)
         self.assertEqual(bot.database.get_state(ENGINE_STATUS_KEY), ENGINE_HALTED)
@@ -126,7 +127,7 @@ class FlatInventoryRiskTests(unittest.TestCase):
                 exchange.fill(row['client_order_id'])
         self.assertGreater(bot._bot_btc_balance(), 0)
         bot.advance_trailing_stop(Decimal('110'))
-        self.assertEqual(bot.config.stop_loss_price, Decimal('80'))
+        self.assertEqual(bot.config.stop_loss_price, Decimal('70'))
 
     def test_unexpected_cancel_does_not_interrupt_an_exposed_hard_stop(self):
         bot, exchange = self.grid()

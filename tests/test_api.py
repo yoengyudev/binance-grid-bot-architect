@@ -348,6 +348,11 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(grid_api, "GridDatabase", return_value=database):
                     offline = await self.authenticated_status(client)
                 self.assertEqual(offline.json(), {
+            "strategy_version": "iteration2", "stop_mode": "fixed",
+            "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.8,
+            "macro_trend_timeframe": "1d", "macro_trend_period": 200,
+            "automatic_post_stop_restart": False,
+            "macro_sma": None, "macro_entry_block_reason": None,
                     "trading_environment": "TESTNET",
                     "status": "Offline", "pair": "BTC/USDT",
                     "safety_pause": "Normal", "pause_mode": None,
@@ -456,6 +461,11 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "http://localhost:5173",
         )
         self.assertEqual(response.json(), {
+            "strategy_version": "iteration2", "stop_mode": "fixed",
+            "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.8,
+            "macro_trend_timeframe": "1d", "macro_trend_period": 200,
+            "automatic_post_stop_restart": False,
+            "macro_sma": None, "macro_entry_block_reason": None,
             "trading_environment": "TESTNET",
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "pause_mode": grid_settings.PAUSED_DOWNSIDE,

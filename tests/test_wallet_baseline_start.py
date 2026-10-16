@@ -69,7 +69,7 @@ class WalletBaselineStartTests(unittest.TestCase):
         self.assertGreaterEqual(self.exchange.base_free, Decimal('1'))
         self.assertEqual(self.bot.baseline_base, Decimal('1'))
         # Emergency exit still sells only the bot's new inventory.
-        self.exchange.price = Decimal('70000')
+        self.exchange.price = self.bot.config.stop_loss_price - 1
         self.bot.run_cycle()
         self.assertEqual(self.exchange.base_free, Decimal('1'))
 
@@ -87,7 +87,7 @@ class WalletBaselineStartTests(unittest.TestCase):
         self.bot.start_engine(pending_grid_token=self.save())
         self.bot.reset_grid()
         self.bot.run_cycle()
-        self.exchange.price = Decimal('70000')
+        self.exchange.price = self.bot.config.stop_loss_price - 1
         self.bot.run_cycle()
         self.exchange.price = Decimal('81260')
         trades = self.database.fetch_trade_history()

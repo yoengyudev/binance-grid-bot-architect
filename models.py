@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 from pydantic import BaseModel, Field, FiniteFloat, StrictBool, StrictInt
 from exchange_handler import load_config
+from strategy_policy import catastrophic_stop
 from settings import (
     MAX_LEVELS,
 )
@@ -125,7 +126,7 @@ class GridConfig:
     sell_grid_levels: Optional[int] = None
 
     @classmethod
-    def load(cls, path: Optional[Path] = None) -> "GridConfig":
+    def load(cls, path: Optional[Path] = None, *, preserve_stop: bool = False) -> "GridConfig":
         raw = load_config(path)
         grid = raw["grid"]
         investment = _decimal(grid.get("investment_quote"), "investment_quote")
@@ -135,7 +136,10 @@ class GridConfig:
         inventory_percent = _decimal(
             grid.get("initial_inventory_percent", 50), "initial_inventory_percent"
         )
-        stop_loss = _decimal(grid.get("stop_loss_price"), "stop_loss_price")
+        # Fresh campaigns use Iteration 2; saved active configuration is restored
+        # separately and must never have its retained protection silently lowered.
+        stop_loss = (_decimal(grid.get("stop_loss_price"), "stop_loss_price")
+                     if preserve_stop else catastrophic_stop(lower))
         poll_seconds = grid.get("poll_seconds", 10)
         if isinstance(poll_seconds, bool) or not isinstance(poll_seconds, int):
             raise ValueError("grid.poll_seconds must be an integer.")

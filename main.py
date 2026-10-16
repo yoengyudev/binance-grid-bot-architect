@@ -13,7 +13,7 @@ import ccxt
 import uvicorn
 from api import app
 from database import GridDatabase
-from exchange_handler import create_exchange
+from exchange_handler import create_exchange, create_macro_exchange
 from notifier import TelegramNotifier, bind_notification_loop, close_notifications, schedule_telegram_alert
 from settings import (
     ENGINE_FAULT_KEY,
@@ -291,9 +291,9 @@ def main() -> int:
                     "grid_reset", "active_grid_config", SAFETY_MODE_KEY,
                     LIQUIDATION_KEY, TRAILING_STOP_KEY)) or database.fetch_all_orders()):
                 raise TradingHalt("A saved bot state exists without a grid run; review it first.")
-            config = (_apply_active_grid_config(GridConfig.load(), database)
+            config = (_apply_active_grid_config(GridConfig.load(preserve_stop=True), database)
                       if existing_run else GridConfig.load())
-            bot = GridBot(config, exchange, database)
+            bot = GridBot(config, exchange, database, macro_exchange=create_macro_exchange())
             bot.ready_mode = True
             asyncio.run(_run_services(bot, None, ready=True))
             return 0
@@ -303,8 +303,8 @@ def main() -> int:
             database = GridDatabase()
             existing_run = database.get_state("grid_run") is not None
             if existing_run:
-                config = _apply_active_grid_config(GridConfig.load(), database)
-                bot = GridBot(config, exchange, database)
+                config = _apply_active_grid_config(GridConfig.load(preserve_stop=True), database)
+                bot = GridBot(config, exchange, database, macro_exchange=create_macro_exchange())
                 bot.ready_mode = True
                 asyncio.run(_run_services(bot, None, ready=True))
             else:
@@ -313,7 +313,7 @@ def main() -> int:
                         LIQUIDATION_KEY, TRAILING_STOP_KEY)) or
                         database.fetch_all_orders()):
                     raise TradingHalt("Standby requires a fresh, empty bot database.")
-                bot = GridBot(GridConfig.load(), exchange, database)
+                bot = GridBot(GridConfig.load(), exchange, database, macro_exchange=create_macro_exchange())
                 if bot._live_open_orders():
                     raise TradingHalt("Standby requires no open BTC/USDT orders.")
                 asyncio.run(_run_standby_services(bot))
@@ -329,8 +329,10 @@ def main() -> int:
             raise RunnerLeaseLost("Another process holds the trading runner lease.")
         try:
             _center_config_at_current_price(exchange, database)
-            config = _apply_active_grid_config(GridConfig.load(), database)
-            bot = GridBot(config, exchange, database, runner_token=runner_token)
+            config = _apply_active_grid_config(GridConfig.load(
+                preserve_stop=database.get_state('grid_run') is not None), database)
+            bot = GridBot(config, exchange, database, runner_token=runner_token,
+                          macro_exchange=create_macro_exchange())
             bot._runner_epoch = runner_epoch
             bot._lease_required = True
             if arguments.check:

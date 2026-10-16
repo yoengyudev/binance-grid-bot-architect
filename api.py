@@ -407,10 +407,20 @@ def bot_status(response: Response,
     """Summarize the bot or report the read-only monitor's stopped state."""
     response.headers["Cache-Control"] = "no-store"
     bot = app.state.grid_bot
+    strategy = {
+        "strategy_version": "iteration2", "stop_mode": "fixed",
+        "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.8,
+        "macro_trend_timeframe": "1d", "macro_trend_period": 200,
+        "automatic_post_stop_restart": False,
+        "macro_sma": (float(bot.macro_sma) if isinstance(bot, GridBot)
+                      and bot.macro_sma is not None else None),
+        "macro_entry_block_reason": (bot.macro_entry_error if isinstance(bot, GridBot) else None),
+    }
     if app.state.standby and bot is not None:
         atr = app.state.atr_snapshot
         order_book = app.state.order_book_snapshot
         return {
+            **strategy,
             "trading_environment": TRADING_SETTINGS.environment.value,
             "status": "Online", "pair": bot.config.symbol,
             "safety_pause": "Idle", "pause_mode": None,
@@ -440,6 +450,7 @@ def bot_status(response: Response,
         }
     if app.state.monitor_only and bot is None:
         return {
+            **strategy,
             "trading_environment": TRADING_SETTINGS.environment.value,
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Stopped", "pause_mode": None,
@@ -527,6 +538,7 @@ def bot_status(response: Response,
     return {
         "trading_environment": TRADING_SETTINGS.environment.value,
         "status": "Online" if bot is not None else "Offline",
+        **strategy,
         "pair": bot.config.symbol if bot is not None else "BTC/USDT",
         "safety_pause": (
             "Active" if safety_mode is not None
@@ -898,7 +910,7 @@ def recenter_grid(payload: RecenterRequest,
         requested_stop = Decimal(str(payload.center_price)) * (
             1 - Decimal(str(stop_distance)) / 100
         )
-        if requested_stop < bot.grid_configuration()[3]:
+        if requested_stop < bot.grid_configuration()[3] - Decimal('0.000001'):
             raise HTTPException(status_code=400, detail=RISK_OVERRIDE_DENIED)
     try:
         if payload.allocated_capital is not None:

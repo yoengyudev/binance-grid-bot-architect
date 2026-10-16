@@ -2,6 +2,12 @@
 
 Grid Master is a human-directed BTC/USDT grid-trading system for **Binance Spot**. A Python engine manages orders and persistent risk state; a FastAPI service exposes telemetry and authenticated controls; a React dashboard presents the account, grid, and market data. Telegram is an outbound alert channel only.
 
+**Iteration 2:** Daily SMA200 gates START and automatic re-anchors; rounded grid
+cycles require at least 0.8% gross spacing; new campaigns have a fixed stop 15%
+below the lower bound, with price trailing disabled. Liquidations require human
+review and manual START. See [the production policy](ITERATION2.md) for retained
+legacy floors, explicit tightening overrides and Testnet macro-data sourcing.
+
 The selected trading environment controls execution, database state, and browser market feeds. The backend publishes `trading_environment` in every `/api/bot/status` response. Mainnet routing is covered by automated isolation tests; those tests do not place real orders.
 
 ## Environment configuration and isolation
@@ -74,7 +80,7 @@ SQLite records orders, fills, trades, active settings, trailing-stop state, paus
 
 If a raised trailing stop overtakes a saved exact BUY level, START remains blocked. The API returns `GRID_STOP_CONFLICT` with the lowest BUY and current stop prices; the dashboard's **Review grid settings** action opens re-anchor controls. Keep all new BUY levels above the retained stop. Saving while IDLE queues settings for review; it does not start trading. The stop cannot be lowered to revive a stale grid.
 
-Small carried BTC can also limit the number of SELL lanes: each exchange-rounded SELL must meet the minimum notional. Explicitly select fewer levels if the retained inventory cannot fund every SELL lane. Increasing quote allocation alone does not enlarge carried BTC. Re-anchor validation may advance the trailing floor using the latest price, so a fixed stop copied from an earlier snapshot can become stale.
+Small carried BTC can also limit the number of SELL lanes: each exchange-rounded SELL must meet the minimum notional. Explicitly select fewer levels if the retained inventory cannot fund every SELL lane. Increasing quote allocation alone does not enlarge carried BTC. Re-anchors preserve any tighter saved floor; price observations do not ratchet it upward.
 
 ### Start and trade lifecycle
 
@@ -98,12 +104,16 @@ The backend fetches 15 one-hour Testnet candles and computes 14-period Average T
 
 | Proposed value | Formula |
 | --- | --- |
-| Ceiling | `C + 2A` |
-| Projected lower bound | `C - 2A` |
-| Initial hard stop | `C - 2.2A` |
+| Ceiling | `C + max(2A, fee-defended half-width)` |
+| Projected lower bound | `2C - ceiling` |
+| Initial hard stop | `floor_to_tick(lower * 0.85)` |
 | Width per side | `(ceiling - C) / C × 100` |
 
-The proposed stop is therefore **0.2 ATR below the projected lower bound** at entry. The form previews the width, lower bound, stop distance, and estimated order size. Auto-Fill only populates fields; the operator must review them and explicitly save settings, then press **START**. Manual values can create a wider gap, subject to backend validation, so the tight stop is a template rather than a global guarantee. ATR is descriptive market data, not an automatic trade signal.
+The stop is fixed **15% below the projected lower bound** for a fresh campaign.
+Existing tighter floors remain retained. Fee defense widens narrow ATR proposals
+until every rounded adjacent cycle clears 0.8% gross return. Auto-Fill creates a
+draft only; review and save it, then press **START**. START also requires price
+strictly above the last closed Daily SMA200. ATR is not itself an entry signal.
 
 ## Capital and order-risk controls
 
@@ -118,13 +128,20 @@ The proposed stop is therefore **0.2 ATR below the projected lower bound** at en
 
 The frontend estimate is deliberately coarse. Binance filters, precision rounding, seed allocation, and the size of the reverse order are decided by the backend's more exact checks. A green UI preview is **not** a guarantee that an exchange request will be accepted.
 
-## Trailing protection, pauses, and liquidation
+## Fixed protection, pauses, and liquidation
 
-### Auto-trailing hard stop
+### Fixed catastrophic hard stop
 
-When a grid is anchored, the bot persists a `high_water_mark` initialized to the center and a `stop_loss_distance = center - initial_stop`. On each newly observed Testnet price above the high-water mark, it updates the mark and raises the stop to at least `high_water_mark - stop_loss_distance`. The floor never moves downward. The dashboard displays both values. Raising the floor can cause BUY limits at or below it to be canceled; those prices cannot be repopulated while beneath the active stop.
+When a new campaign is anchored, its stop is calculated 15% below the lower
+bound. Higher market prices update high-water telemetry only and never raise
+the floor. A successful re-anchor may raise the fixed floor from its new lower
+bound, but never lowers retained protection. Existing tighter legacy floors
+remain protected. Liquidation requires manual recovery and START.
 
-**Raise Hard Stop** is a separate authenticated control. It only accepts a value above the current floor and below the grid's lower bound, updates persisted trailing state, and does not rebuild the grid. A manual re-anchor is rejected if its proposed hard stop would lower the active trailing floor.
+**Raise Hard Stop** remains an explicit authenticated tightening override. It
+accepts a value above the current floor and below the grid's lower bound, updates
+saved risk state, and does not rebuild the grid or enable automatic trailing.
+Re-anchors cannot lower the retained floor.
 
 ### Safety pause
 

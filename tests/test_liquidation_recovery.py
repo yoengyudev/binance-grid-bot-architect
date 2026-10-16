@@ -139,7 +139,7 @@ class LiquidationRecoveryTests(unittest.TestCase):
                 self.assertFalse(after['can_reset_liquidation'])
                 self.assertEqual(after['pending_grid']['source'], 'manual_liquidation_reset')
                 self.assertEqual(Decimal(after['pending_grid']['center']), Decimal('100'))
-                self.assertEqual(Decimal(after['pending_grid']['stop_loss']), Decimal('70'))
+                self.assertEqual(Decimal(after['pending_grid']['stop_loss']), Decimal('68'))
                 self.assertEqual(self.exchange.next_id, next_id)
                 self.assertEqual(self.bot.database.fetch_trade_history(), trades)
                 self.assertEqual(self.bot.database.fetch_transition_journal()[:len(journal)], journal)

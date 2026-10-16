@@ -8,6 +8,7 @@ __pycache__/
 *.log
 bot.pid
 docker-data/
+backtest_results/
 
 *.sqlite
 *.sqlite-shm

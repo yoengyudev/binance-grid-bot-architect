@@ -181,6 +181,17 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     return config
 
 
+def create_macro_exchange() -> ccxt.binance:
+    """Credential-free production Spot history, including when trading on Testnet.
+
+    Testnet resets do not supply the 200-day macro warm-up. This client is used
+    exclusively for public OHLCV; order and account I/O use create_exchange().
+    """
+    exchange = ccxt.binance({"enableRateLimit": True, "timeout": 10000,
+                             "options": {"defaultType": "spot"}})
+    return install_circuit_breaker(exchange)
+
+
 def create_exchange() -> ccxt.binance:
     """Create a rate-limited spot client; sandbox must be its first method call."""
     settings = get_trading_settings()

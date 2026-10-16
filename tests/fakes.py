@@ -1,6 +1,9 @@
 """Deterministic Spot exchange and engine fixtures; no network calls."""
 
 from decimal import Decimal, ROUND_DOWN
+import time
+import json
+from dataclasses import replace
 
 import ccxt
 
@@ -44,6 +47,13 @@ class FakeSpotExchange:
 
     def fetch_ticker(self, _symbol: str) -> dict:
         return {"last": str(self.price)}
+
+    def fetch_ohlcv(self, _symbol, timeframe='1d', since=None, limit=201):
+        if timeframe != '1d':
+            raise ValueError('Fake only supplies daily macro history.')
+        day = int(time.time() * 1000) // 86_400_000 * 86_400_000
+        return [[day - i * 86_400_000, 50, 51, 49, 50, 1000]
+                for i in range(limit - 1, -1, -1)]
 
     def price_to_precision(self, _symbol: str, price: str) -> str:
         return str(Decimal(price).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
@@ -238,3 +248,20 @@ def make_bot(path, *, width=None, initial_base=Decimal("1"), exchange=None):
     bot = GridBot(config, exchange, GridDatabase(path))
     bot.prepare(persist=True)
     return bot, exchange
+
+
+def restore_retained_floor(bot, floor, high):
+    """Model a durable pre-Iteration-2 floor; price changes cannot create one now."""
+    floor, high = Decimal(str(floor)), Decimal(str(high))
+    config = replace(bot.config, stop_loss_price=floor)
+    run = json.loads(bot.database.get_state('grid_run'))
+    run['fingerprint'] = config.fingerprint()
+    active = dict(lower=str(config.lower_price), upper=str(config.upper_price),
+                  spacing=str(config.spacing_percent), investment_quote=str(config.investment_quote),
+                  stop_loss_price=str(floor))
+    if config.buy_grid_levels is not None:
+        active.update(buy_levels=config.buy_grid_levels, sell_levels=config.sell_grid_levels)
+    risk = dict(high_water_mark=str(high), stop_loss_distance=str(high - floor))
+    bot.database.update_runtime_grid_settings(json.dumps(run), json.dumps(active),
+                                              trailing_stop=json.dumps(risk), allow_pending_reset=True)
+    bot.config, bot.high_water_mark, bot.stop_loss_distance = config, high, high - floor

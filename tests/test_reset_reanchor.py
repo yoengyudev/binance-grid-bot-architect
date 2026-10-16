@@ -24,7 +24,7 @@ from settings import (
     ORDER_CLEANUP_ALARM_KEY, PAUSED_MANUAL, PAUSED_RESET, RISK_OVERRIDE_DENIED,
     SAFETY_MODE_KEY, SAFETY_PAUSE_NOTICE_KEY, TRAILING_STOP_KEY,
 )
-from tests.fakes import FakeSpotExchange, make_bot
+from tests.fakes import FakeSpotExchange, make_bot, restore_retained_floor
 
 
 class ResetReanchorTests(unittest.TestCase):
@@ -144,11 +144,12 @@ class ResetReanchorTests(unittest.TestCase):
                 self.assertIsNone(reopened.high_water_mark)
         self.bot.database.set_state(TRAILING_STOP_KEY, original)
 
-    def test_ready_restart_reanchor_keeps_trailing_floor_monotonic(self):
+    def test_ready_restart_reanchor_keeps_retained_floor_monotonic(self):
         reopened = GridBot(self.bot.config, self.exchange, GridDatabase(self.path))
         reopened.ready_mode = True
         asyncio.run(_reconcile_service_boot(reopened, ready=True))
         self.exchange.price = Decimal('110')
+        restore_retained_floor(reopened, 80, 110)
         with self.assertRaisesRegex(ValueError, RISK_OVERRIDE_DENIED):
             reopened.request_manual_recenter('110', '20', '30', '1000', 10)
         self.assertEqual(reopened.high_water_mark, Decimal('110'))
@@ -338,8 +339,8 @@ class ResetReanchorTests(unittest.TestCase):
             bot.prepare_factory_reset()
             bot.stop_engine()
             self.assertEqual(exchange.base_free, Decimal('0.00048'))
-            width = str(Decimal('335.91') * 100 / Decimal('84812'))
-            stop = str(Decimal('369.50') * 100 / Decimal('84812'))
+            width = '5'
+            stop = '5.8'
             for capital in ('150', '1500'):
                 with self.subTest(capital=capital):
                     with self.assertRaisesRegex(GridSizingError, r'Existing BTC .*5 SELL levels'):
