@@ -276,6 +276,17 @@ class MacroBuyPauseTests(unittest.TestCase):
         self.assertEqual(self.bot.database.get_state(SAFETY_MODE_KEY), LIQUIDATED)
         self.assertEqual(self.exchange.market_sell_calls, 1)
 
+    def test_macro_refresh_finishing_mid_cycle_cannot_replay_stopped_lanes(self):
+        self.bot.stop_engine()
+        self.bot.start_engine(auto_cover_inventory=True)
+        self.trend.side_effect = [False, True]
+        self.assertFalse(self.bot.reset_grid())
+        self.assertTrue(self.bot.grid_needs_reset)
+        self.assertEqual(self.exchange.fetch_open_orders('BTC/USDT'), [])
+        self.trend.side_effect = None
+        self.trend.return_value = True
+        self.assertTrue(self.bot.reset_grid())
+
     def test_deferred_reanchor_protects_new_buy_fill_and_accounts_sell_fill(self):
         self.bot._macro_trend_provider = lambda: True
         self.bot.request_manual_recenter('100','20','30','1000',8)

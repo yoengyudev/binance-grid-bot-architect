@@ -3626,7 +3626,7 @@ class GridBot:
         macro_buys_allowed, macro_events = self._sync_macro_buy_pause()
         events.extend(macro_events)
         pending_reset = (self.database.get_state("grid_reset")
-                         if not macro_buys_allowed and self.grid_needs_reset else None)
+                         if self.grid_needs_reset else None)
         if pending_reset and json.loads(pending_reset)["phase"] == "canceling":
             # A deferred rebuild still owns the old ledger. STOP/reset may have
             # deliberately canceled its lanes; do not replay them as a working
