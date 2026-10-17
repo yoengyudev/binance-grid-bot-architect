@@ -3625,6 +3625,22 @@ class GridBot:
             self._cancel_buys_below_stop()
         macro_buys_allowed, macro_events = self._sync_macro_buy_pause()
         events.extend(macro_events)
+        pending_reset = (self.database.get_state("grid_reset")
+                         if not macro_buys_allowed and self.grid_needs_reset else None)
+        if pending_reset and json.loads(pending_reset)["phase"] == "canceling":
+            # A deferred rebuild still owns the old ledger. STOP/reset may have
+            # deliberately canceled its lanes; do not replay them as a working
+            # grid until complete_grid_reset atomically installs the new ledger.
+            # Risk checks and BUY cancellation above remain active. Protect fills
+            # observed this cycle without reopening any historical canceled lane.
+            for observed_row, _ in observed_orders:
+                row = self.database.get_order(observed_row["order_id"])
+                if row["side"] == "SELL" and row["status"] == "FILLED":
+                    self._record_filled_sell(row)
+                elif row["side"] == "BUY" and row["status"] in ("FILLED", "CANCELED"):
+                    if _order_decimal(self._fetch_order(row).get("filled")) > 0:
+                        self._place_sell(row)
+            return events
         if macro_buys_allowed and mode != PAUSED_SIZING and self._observe_upper_breakout(
                 current_price, bot_btc_balance=bot_btc_balance):
             return events

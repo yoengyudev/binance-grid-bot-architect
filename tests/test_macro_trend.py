@@ -14,6 +14,7 @@ import engine
 from database import GridDatabase
 from engine import GridBot
 from macro_trend import MacroTrendMonitor, MacroTrendSnapshot, fetch_macro_trend
+from models import TradingHalt
 from settings import (MACRO_BUY_PAUSE_KEY, SAFETY_MODE_KEY, PAUSED_MANUAL,
                       PAUSED_RESET, LIQUIDATED, ENGINE_RUNNING, ENGINE_STATUS_KEY)
 from tests.fakes import make_bot
@@ -245,6 +246,58 @@ class MacroBuyPauseTests(unittest.TestCase):
         self.assertFalse(self.bot.reset_grid())
         self.assertTrue(self.bot.grid_needs_reset)
         self.assertEqual({r['order_id'] for r in self.bot.database.fetch_active_grids() if r['side']=='SELL'},sells)
+
+    def test_stopped_grid_restart_waits_for_cold_macro_cache_then_rebuilds(self):
+        self.bot.stop_engine()
+        held = self.bot._bot_btc_balance()
+        submissions = len(self.exchange.orders)
+        self.bot.start_engine(auto_cover_inventory=True)
+        self.assertTrue(self.bot.grid_needs_reset)
+        # These are deliberate STOP cancellations, not failed working lanes.
+        self.assertTrue(any(r['side'] == 'SELL' and r['status'] == 'CANCELED'
+                            for r in self.bot.database.fetch_all_orders()))
+        for _ in range(2):
+            self.assertFalse(self.bot.reset_grid())
+        self.assertEqual(len(self.exchange.orders), submissions)
+        self.assertEqual(self.bot._bot_btc_balance(), held)
+        self.assertEqual(self.bot.database.get_state(ENGINE_STATUS_KEY), ENGINE_RUNNING)
+        self.trend.return_value = True
+        self.assertTrue(self.bot.reset_grid())
+        self.assertFalse(self.bot.grid_needs_reset)
+        self.assertTrue(any(r['side'] == 'SELL' for r in self.bot.database.fetch_active_grids()))
+        self.assertTrue(any(r['side'] == 'BUY' for r in self.bot.database.fetch_active_grids()))
+        self.assertEqual(self.exchange.market_sell_calls, 0)
+
+    def test_stopped_grid_with_pending_reset_still_liquidates_below_hard_stop(self):
+        self.bot.stop_engine()
+        self.bot.start_engine(auto_cover_inventory=True)
+        self.exchange.price = D(69)
+        self.assertFalse(self.bot.reset_grid())
+        self.assertEqual(self.bot.database.get_state(SAFETY_MODE_KEY), LIQUIDATED)
+        self.assertEqual(self.exchange.market_sell_calls, 1)
+
+    def test_deferred_reanchor_protects_new_buy_fill_and_accounts_sell_fill(self):
+        self.bot._macro_trend_provider = lambda: True
+        self.bot.request_manual_recenter('100','20','30','1000',8)
+        self.bot._macro_trend_provider = self.trend
+        buy = next(r for r in self.bot.database.fetch_active_grids() if r['side'] == 'BUY')
+        sell = next(r for r in self.bot.database.fetch_active_grids() if r['side'] == 'SELL')
+        self.exchange.fill(buy['client_order_id'])
+        self.exchange.fill(sell['client_order_id'])
+        self.assertFalse(self.bot.reset_grid())
+        replacement = self.bot.database.fetch_latest_orders_by_level()[buy['level']]
+        self.assertEqual((replacement['side'], replacement['status']), ('SELL', 'OPEN'))
+        self.assertIsNotNone(self.bot.database.get_trade_by_sell_order_id(sell['order_id']))
+        count = len(self.exchange.orders)
+        self.assertFalse(self.bot.reset_grid())
+        self.assertEqual(len(self.exchange.orders), count)
+
+    def test_unexpected_cancellation_outside_rebuild_still_faults(self):
+        sell = next(r for r in self.bot.database.fetch_active_grids() if r['side'] == 'SELL')
+        self.exchange.cancel_order(sell['order_id'], self.bot.config.symbol,
+                                   {'origClientOrderId': sell['client_order_id']})
+        with self.assertRaisesRegex(TradingHalt, 'ended as canceled'):
+            self.bot.run_cycle()
 
     def test_provider_exception_suspends_buys_without_stopping_sells(self):
         self.trend.side_effect = RuntimeError('Yahoo cache failure')
