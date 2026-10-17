@@ -61,6 +61,7 @@ from settings import (
     SAFETY_RECOVERY_NOTICE_KEY,
     SAFETY_RESUME_NOTICE_KEY,
     SELL_AMOUNT_BUFFER,
+    SPOT_FEE_RATE,
     SIZING_PAUSE_NOTICE_KEY,
     SIZING_PAUSE_REASON_KEY,
     TRADING_SETTINGS,
@@ -2065,8 +2066,7 @@ class GridBot:
         amount = self._seed_upper_sell_amount(seed_row, level)
         if amount is None:
             return
-        target = (self.config.upper_price if self.database.get_state(RECONCILE_COVER_KEY)
-                  else self.upper_levels[-level - 1])
+        target = self.upper_levels[-level - 1]
         price = self._grid_order_price(target, "SELL")
         self._check_order_size(price, amount)
         if self._free_bot_base() < amount:
@@ -2173,8 +2173,6 @@ class GridBot:
                       else self.levels[row["level"] - 2])
         else:
             target = self.upper_levels[-row["level"] - 1]
-        if self.database.get_state(RECONCILE_COVER_KEY):
-            target = self.config.upper_price
         price = self._grid_order_price(target, "SELL")
         free_bot_base = self._free_bot_base()
         if amount > free_bot_base:
@@ -2349,6 +2347,23 @@ class GridBot:
             raise TradingHalt("Tracked BTC is not fully available after cancellation.")
         return amount, cost
 
+    def _validate_recovery_sell_prices(self, uppers: List[Decimal],
+                                       amount: Decimal, cost: Decimal) -> None:
+        """Reject an unfundable recovery ladder before canceling/placing orders."""
+        if amount <= 0:
+            return
+        if not amount.is_finite() or not cost.is_finite() or cost <= 0:
+            raise TradingHalt("Recovered BTC has no valid cost basis; review the ledger.")
+        lowest = min(self._price(price) for price in uppers)
+        unit_cost = cost / amount  # Includes known acquisition commissions.
+        if lowest * (1 - SPOT_FEE_RATE) <= unit_cost:
+            raise TradingHalt(
+                f"Cannot resume this SELL ladder: lowest SELL {lowest:,.2f} USDT "
+                f"does not cover carried BTC cost plus the estimated SELL fee "
+                f"(break-even {unit_cost / (1 - SPOT_FEE_RATE):,.2f} USDT). "
+                "Review the saved grid and cost basis; re-anchor before START."
+            )
+
     def _validate_reset_grid(self, new_config: GridConfig, price: Decimal,
                              carry_amount: Decimal) -> Tuple[List[Decimal], List[Decimal]]:
         lowers, uppers = configured_grid_levels(price, new_config)
@@ -2456,6 +2471,10 @@ class GridBot:
                     self.grid_needs_reset = False
                     LOGGER.info("Manual recenter withdrawn because market moved away.")
                     return False
+            if request.get("source") == "engine_resume":
+                _, uppers = configured_grid_levels(self.anchor, self.config)
+                amount, cost = self._carry_inventory(require_available=False)
+                self._validate_recovery_sell_prices(uppers, amount, cost)
             _, complete = self._cancel_bot_orders()
             if not complete or self.database.fetch_active_grids():
                 raise TradingHalt("Old grid cancellation could not be verified.")
@@ -2493,7 +2512,10 @@ class GridBot:
                         return False
                     request["lower"] = str(candidate.lower_price)
                     request["upper"] = str(candidate.upper_price)
-            anchor = price
+            # Resuming the same reviewed grid must not move its ladder to the
+            # latest ticker. Re-anchoring is a separate, explicit reset workflow.
+            resuming = request.get("source") == "engine_resume"
+            anchor = self.anchor if resuming else price
             if request.get("source") == "manual_recenter":
                 center = Decimal(request["center_price"])
                 candidate = replace(
@@ -2524,7 +2546,7 @@ class GridBot:
                         "Market left both grids during cancellation; inspect orders before restart."
                     )
             stop_loss = self.config.stop_loss_price
-            if request.get('source') not in ('breakout_faded', 'manual_initial', 'manual_liquidation_reset'):
+            if request.get('source') not in ('engine_resume', 'breakout_faded', 'manual_initial', 'manual_liquidation_reset'):
                 stop_loss = max(stop_loss, self._fixed_catastrophic_stop(Decimal(request['lower'])))
             if request.get("source") == "manual_recenter" and "stop_loss_price" in request:
                 requested_stop = Decimal(request["stop_loss_price"])
@@ -2547,6 +2569,8 @@ class GridBot:
                 raise TradingHalt("Price left the requested bounds during reset.")
             try:
                 lowers, uppers = self._validate_reset_grid(new_config, anchor, carry_amount)
+                if resuming:
+                    self._validate_recovery_sell_prices(uppers, carry_amount, carry_cost)
             except GridStopConflict:
                 if request.get('source') not in ('breakout', 'breakout_faded'):
                     raise
@@ -2578,7 +2602,7 @@ class GridBot:
             if new_config.buy_grid_levels is not None:
                 active["buy_levels"] = new_config.buy_grid_levels
                 active["sell_levels"] = new_config.sell_grid_levels
-            trailing = {
+            trailing = None if resuming else {
                 "high_water_mark": str(anchor),
                 "stop_loss_distance": str(anchor - new_config.stop_loss_price),
                 "stop_mode": "fixed", "strategy_version": STRATEGY_VERSION,
@@ -2611,8 +2635,9 @@ class GridBot:
                 self.anchor = anchor
                 self.baseline_base = baseline
                 self.levels, self.upper_levels = lowers, uppers
-                self.high_water_mark = anchor
-                self.stop_loss_distance = anchor - new_config.stop_loss_price
+                if not resuming:
+                    self.high_water_mark = anchor
+                    self.stop_loss_distance = anchor - new_config.stop_loss_price
                 if request.get("source") == "manual_recenter":
                     self.breakout_width_percent = Decimal(request["width_percent"])
                     self.high_water_mark = anchor
@@ -3433,8 +3458,9 @@ class GridBot:
                 raise TradingHalt("Market price is at or below the hard stop.")
             request = None
             if not state["resumable"] and not self.grid_needs_reset:
-                carry_amount, _ = self._carry_inventory()
-                self._validate_reset_grid(self.config, current, carry_amount)
+                carry_amount, carry_cost = self._carry_inventory()
+                _, uppers = self._validate_reset_grid(self.config, self.anchor, carry_amount)
+                self._validate_recovery_sell_prices(uppers, carry_amount, carry_cost)
                 request = {
                     "phase": "canceling", "source": "engine_resume",
                     "lower": str(self.config.lower_price),
@@ -3716,8 +3742,7 @@ class GridBot:
                 return events
             required_base = sum((sell_amounts[level] for level in missing_upper), Decimal(0))
             for level in missing_upper:
-                target = (self.config.upper_price if cover_text
-                          else self.upper_levels[-level - 1])
+                target = self.upper_levels[-level - 1]
                 self._check_order_size(self._grid_order_price(target, "SELL"), sell_amounts[level])
             if self._free_bot_base() < required_base:
                 LOGGER.warning(

@@ -1253,7 +1253,7 @@ class GridBotTests(unittest.TestCase):
             placed = [order for client_id, order in exchange.orders.items()
                       if client_id not in prior_order_ids]
             self.assertEqual(placed[0]["side"], "sell")
-            self.assertEqual(Decimal(placed[0]["price"]), bot.config.upper_price)
+            self.assertEqual(Decimal(placed[0]["price"]), reopened._price(bot.upper_levels[0]))
             self.assertLess(
                 min(i for i, order in enumerate(placed) if order["side"] == "sell"),
                 min(i for i, order in enumerate(placed) if order["side"] == "buy"),
