@@ -18,6 +18,7 @@ SPOT_FEE_RATE = Decimal("0.001")  # Standard 0.1% per execution side.
 MIN_GRID_ORDER_NOTIONAL = Decimal("7")
 RESET_SPACING_PERCENT = Decimal("2.5")
 SAFETY_MODE_KEY = "safety_mode"
+MACRO_BUY_PAUSE_KEY = "macro_buy_pause"
 ENGINE_STATUS_KEY = "engine_status"
 ENGINE_IDLE = "IDLE"
 ENGINE_RUNNING = "RUNNING"

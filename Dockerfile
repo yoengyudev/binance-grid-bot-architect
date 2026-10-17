@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && mkdir /data \
     && chown bot:bot /data
 
-COPY --chown=bot:bot main.py api.py engine.py models.py settings.py portfolio.py market_data.py telemetry.py notifier.py database.py exchange_handler.py trading_environment.py stop_controller.py telegram_bot.py docker_runner.py config.json ./
+COPY --chown=bot:bot main.py api.py engine.py models.py settings.py portfolio.py market_data.py telemetry.py notifier.py database.py exchange_handler.py trading_environment.py stop_controller.py telegram_bot.py docker_runner.py grid_geometry.py strategy_policy.py macro_trend.py config.json ./
 
 USER bot
 CMD ["python", "docker_runner.py"]

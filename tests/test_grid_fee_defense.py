@@ -11,7 +11,7 @@ import pandas as pd
 from tests.fakes import make_bot, restore_retained_floor
 from tests.test_backtest_grid import START
 from tests.test_price_boundaries import TickSizeExchange
-from engine import GridBot
+from tests.fakes import OfflineGridBot as GridBot
 from database import GridDatabase
 import json
 from unittest.mock import patch

@@ -8,8 +8,15 @@ from dataclasses import replace
 import ccxt
 
 from database import GridDatabase
-from engine import GridBot
+from engine import GridBot as ProductionGridBot
 from models import GridConfig
+
+
+class OfflineGridBot(ProductionGridBot):
+    """Explicit deterministic Yahoo dependency for exchange/accounting regressions."""
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('macro_trend_provider', lambda: True)
+        super().__init__(*args, **kwargs)
 
 
 class FakeSpotExchange:
@@ -245,7 +252,7 @@ def make_bot(path, *, width=None, initial_base=Decimal("1"), exchange=None):
     )
     exchange = exchange if exchange is not None else FakeSpotExchange()
     exchange.base_free = initial_base
-    bot = GridBot(config, exchange, GridDatabase(path))
+    bot = OfflineGridBot(config, exchange, GridDatabase(path))
     bot.prepare(persist=True)
     return bot, exchange
 

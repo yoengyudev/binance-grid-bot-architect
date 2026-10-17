@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import engine
 from database import GridDatabase
-from engine import GridBot
+from tests.fakes import OfflineGridBot as GridBot
 from models import GridConfig, TradingHalt
 from settings import ENGINE_RUNNING, ENGINE_STATUS_KEY, LIQUIDATION_KEY
 from tests.fakes import FakeSpotExchange

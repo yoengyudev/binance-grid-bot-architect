@@ -24,7 +24,8 @@ import settings as grid_settings
 from tests.fakes import FakeSpotExchange, make_bot, restore_retained_floor
 from database import GridDatabase
 from exchange_handler import ApiCircuitBreaker, CircuitOpenError, install_circuit_breaker
-from engine import GridBot, _apply_active_grid_config, geometric_levels
+from tests.fakes import OfflineGridBot as GridBot
+from engine import _apply_active_grid_config, geometric_levels
 from models import GridConfig, TradingHalt, UncertainOrderError
 
 

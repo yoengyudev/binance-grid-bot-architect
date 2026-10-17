@@ -12,5 +12,16 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - ./docker-data:/data
-      - ./.env:/app/.env:ro
+      # Persist config.json, grid_testnet.sqlite, grid_mainnet.sqlite and their
+      # SQLite WAL/SHM files together. TRADING_ENVIRONMENT selects one ledger.
+      - type: bind
+        source: ./docker-data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
+        bind:
+          create_host_path: false

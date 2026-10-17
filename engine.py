@@ -44,6 +44,7 @@ from settings import (
     LIQUIDATION_NOTICE_KEY,
     MAX_LEVELS,
     MIN_GRID_ORDER_NOTIONAL,
+    MACRO_BUY_PAUSE_KEY,
     ORDER_CLIENT_PREFIX,
     ORDER_CLIENT_PREFIX_KEY,
     ORDER_CLEANUP_ALARM_KEY,
@@ -91,6 +92,7 @@ from portfolio import (
 )
 from grid_geometry import MIN_GRID_RETURN, defended_bounds, validate_grid_returns
 from strategy_policy import STRATEGY_VERSION, catastrophic_stop, closed_daily_sma, DAILY_MS
+from macro_trend import get_macro_trend
 
 LOGGER = logging.getLogger(__name__)
 
@@ -156,13 +158,16 @@ def configured_grid_levels(
 
 class GridBot:
     def __init__(self, config: GridConfig, exchange: Any, database: GridDatabase,
-                 *, runner_token: Optional[str] = None, macro_exchange: Any = None) -> None:
+                 *, runner_token: Optional[str] = None, macro_exchange: Any = None,
+                 macro_trend_provider: Any = None) -> None:
         self.config = config
         self.exchange = exchange
         self.macro_exchange = macro_exchange if macro_exchange is not None else exchange
         self.macro_sma: Optional[Decimal] = None
         self._macro_signal_day: Optional[int] = None
         self.macro_entry_error: Optional[str] = None
+        self._macro_trend_provider = macro_trend_provider or get_macro_trend
+        self._macro_provider_error = None
         self.database = database
         order_prefix = self.database.get_or_create_state(
             ORDER_CLIENT_PREFIX_KEY, ORDER_CLIENT_PREFIX + uuid.uuid4().hex[:8]
@@ -1249,6 +1254,8 @@ class GridBot:
 
     def _request_breakout_reset(self, price: Decimal) -> None:
         """Persist a macro-approved reset intent before any cancellation begins."""
+        if not self._macro_buys_allowed():
+            return  # Yahoo BUY pause never cancels protective SELLs for a rebuild.
         if not self._macro_entry_allowed(price):
             return  # Preserve existing orders and hard-stop monitoring.
         candidate = self._breakout_candidate(price, self.breakout_width_percent)
@@ -1849,7 +1856,8 @@ class GridBot:
         if status in ("canceled", "expired", "rejected"):
             self._persist_order_response(row, order, status.upper())
             if (status == "canceled" and row["side"] == "BUY" and
-                    self.database.get_state(f"safety_pause_buy:{row['order_id']}") == "1"):
+                    (self.database.get_state(f"safety_pause_buy:{row['order_id']}") == "1" or
+                     self.database.get_state(f"macro_pause_buy:{row['order_id']}") == "1")):
                 return None
             raise TradingHalt(f"Tracked order {row['order_id']} ended as {status}.")
         raise TradingHalt("Exchange returned an unknown order status.")
@@ -1864,6 +1872,9 @@ class GridBot:
         client_id = self.order_client_prefix + uuid.uuid4().hex[:20]
         with self.exchange_lock:
             self.assert_runner_lease()
+            if side == 'BUY' and not self._macro_buys_allowed():
+                self._set_macro_buy_pause(True)
+                return None  # No durable intent or exchange write, including seed MARKET BUY.
             check_exchange_circuit(self.exchange)
             liquidation = order_type == "MARKET" and side == "SELL" and level == -1
             if self.stop_controller.stop_requested.is_set() and not liquidation:
@@ -2391,6 +2402,9 @@ class GridBot:
         request = json.loads(request_text)
         if self.stop_controller.stop_requested.is_set():
             raise TradingHalt("Stop requested during grid reset.")
+        if not self._macro_buys_allowed():
+            self.run_cycle()  # Reconcile/cancel BUYs, retain SELLs, and evaluate the hard stop.
+            return False
         if request["phase"] == "canceling":
             if not self._macro_entry_allowed(self._ticker_price()):
                 return False  # Do not cancel a working grid below the macro gate.
@@ -2451,6 +2465,10 @@ class GridBot:
                 self.database.set_state('grid_reset', json.dumps(request, sort_keys=True))
             price = self._ticker_price()
             if self._evaluate_automatic_stop(price, bot_btc_balance=carry_amount):
+                return False
+            if not self._macro_buys_allowed():
+                request['cancellation_verified'] = True
+                self.database.set_state('grid_reset', json.dumps(request, sort_keys=True))
                 return False
             if not self._macro_entry_allowed(price):
                 request['cancellation_verified'] = True
@@ -3461,6 +3479,60 @@ class GridBot:
             side="buy", marker_prefix="safety_pause_buy", limit_only=True
         )
 
+    def _macro_buys_allowed(self) -> bool:
+        """Non-blocking cached Yahoo gate; provider failures never relax protection."""
+        try:
+            result = self._macro_trend_provider() is True
+            self._macro_provider_error = None
+            return result
+        except Exception as error:
+            details = f'{type(error).__name__}: {error}'
+            if details != self._macro_provider_error:
+                LOGGER.warning('Macro trend unavailable; BUY orders suspended: %s', details)
+            self._macro_provider_error = details
+            return False
+
+    def _set_macro_buy_pause(self, paused: bool) -> None:
+        prior = self.database.get_state(MACRO_BUY_PAUSE_KEY) == '1'
+        if prior == paused:
+            return
+        with self.database.transaction():
+            if paused:
+                self.database.set_state(MACRO_BUY_PAUSE_KEY, '1')
+            else:
+                self.database.clear_state(MACRO_BUY_PAUSE_KEY)
+            state = self.database.get_state(ENGINE_STATUS_KEY)
+            self.database.record_transition(state, state,
+                'MACRO_BUYS_SUSPENDED' if paused else 'MACRO_BUYS_RESUMED',
+                'Yahoo BTC-USD close <= Daily SMA200, or signal unavailable/stale.' if paused else None)
+        if paused:
+            LOGGER.warning('Price below/equal SMA 200 or macro data unavailable. '
+                           'Buy orders suspended to protect capital; SELLs and hard stop remain active.')
+        else:
+            LOGGER.info('Yahoo BTC-USD close above SMA 200. Eligible BUY lanes may resume.')
+
+    def _sync_macro_buy_pause(self) -> Tuple[bool, List[Tuple[str, Tuple[str, ...]]]]:
+        allowed = self._macro_buys_allowed()
+        self._set_macro_buy_pause(not allowed)
+        if allowed:
+            return True, []
+        # Persist all cancellation intents before HTTP. If a cancellation response
+        # is lost, the next cycle/restart recognizes its late CANCELED status.
+        with self.database.transaction():
+            for row in self.database.fetch_active_grids():
+                if row['side'] == 'BUY' and row['order_type'] == 'LIMIT':
+                    self.database.set_state(f"macro_pause_buy:{row['order_id']}", '1')
+        try:
+            events, complete = self._cancel_bot_orders(
+                side='buy', marker_prefix='macro_pause_buy', limit_only=True)
+            if not complete:
+                LOGGER.warning('Macro BUY cancellation remains unverified; retrying next cycle.')
+            return False, events
+        except (ccxt.BaseError, OSError) as error:
+            _journal_fault(self.database, error, 'MACRO_BUY_CANCEL_RETRY')
+            LOGGER.warning('Macro BUY cancellation will retry; SELLs remain active: %s', error)
+            return False, []
+
     def _missing_paused_buys(self) -> bool:
         return any(
             row["side"] == "BUY" and row["status"] == "CANCELED" and
@@ -3551,7 +3623,9 @@ class GridBot:
             return events
         if bot_btc_balance > 0:
             self._cancel_buys_below_stop()
-        if mode != PAUSED_SIZING and self._observe_upper_breakout(
+        macro_buys_allowed, macro_events = self._sync_macro_buy_pause()
+        events.extend(macro_events)
+        if macro_buys_allowed and mode != PAUSED_SIZING and self._observe_upper_breakout(
                 current_price, bot_btc_balance=bot_btc_balance):
             return events
         if self.is_paused:
@@ -3590,7 +3664,7 @@ class GridBot:
         if seed_row is None:
             if cover_text:
                 raise TradingHalt("Inventory cover has no saved seed lot; manual review required.")
-            if (not self.is_paused and self._within_grid_bounds(current_price)
+            if (macro_buys_allowed and not self.is_paused and self._within_grid_bounds(current_price)
                     and current_price > self.config.stop_loss_price):
                 self._check_grid_buy_capital(
                     self.config, self.levels, self.config.stop_loss_price,
@@ -3605,7 +3679,7 @@ class GridBot:
 
         latest = self.database.fetch_latest_orders_by_level()
         in_bounds = (
-            not self.is_paused and not cover_text and
+            macro_buys_allowed and not self.is_paused and not cover_text and
             self._within_grid_bounds(current_price)
         )
         if in_bounds and all(
@@ -3660,7 +3734,9 @@ class GridBot:
                   (self.database.get_state(
                       f"safety_pause_buy:{row['order_id']}") == "1" or
                    self.database.get_state(
-                      f"trailing_stop_buy:{row['order_id']}") == "1")):
+                      f"trailing_stop_buy:{row['order_id']}") == "1" or
+                   self.database.get_state(
+                      f"macro_pause_buy:{row['order_id']}") == "1")):
                 canceled_buy = self._fetch_order(row)
                 if _order_decimal(canceled_buy.get("filled")) > 0:
                     self._place_sell(row)

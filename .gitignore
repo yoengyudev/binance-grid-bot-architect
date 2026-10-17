@@ -9,6 +9,8 @@ __pycache__/
 bot.pid
 docker-data/
 backtest_results/
+hybrid_backtest_results/
+stop_loss_results/
 
 *.sqlite
 *.sqlite-shm

@@ -9,7 +9,7 @@ from pathlib import Path
 import ccxt
 
 from database import GridDatabase
-from engine import GridBot
+from tests.fakes import OfflineGridBot as GridBot
 from models import GridConfig, TradingHalt
 from settings import BREAKOUT_TIMER_KEY
 from tests.fakes import FakeSpotExchange

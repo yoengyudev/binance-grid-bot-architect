@@ -8,6 +8,10 @@ below the lower bound, with price trailing disabled. Liquidations require human
 review and manual START. See [the production policy](ITERATION2.md) for retained
 legacy floors, explicit tightening overrides and Testnet macro-data sourcing.
 
+The [runtime Yahoo SMA200 BUY kill switch](MACRO_TREND.md) also suspends and
+cancels bot BUY limits when the latest completed `BTC-USD` daily close is not
+strictly above SMA200. SELL orders and catastrophic protection remain active.
+
 The selected trading environment controls execution, database state, and browser market feeds. The backend publishes `trading_environment` in every `/api/bot/status` response. Mainnet routing is covered by automated isolation tests; those tests do not place real orders.
 
 ## Environment configuration and isolation

@@ -12,7 +12,8 @@ import ccxt
 import engine
 from backtest_grid import Config
 from database import GridDatabase
-from engine import GridBot, _apply_active_grid_config
+from tests.fakes import OfflineGridBot as GridBot
+from engine import _apply_active_grid_config
 from exchange_handler import create_macro_exchange
 from models import GridConfig, TradingHalt
 from notifier import TelegramNotifier

@@ -15,7 +15,8 @@ import ccxt
 import httpx
 
 from database import GridDatabase
-from engine import GridBot, _reconcile_service_boot
+from tests.fakes import OfflineGridBot as GridBot
+from engine import _reconcile_service_boot
 from models import GridConfig, GridSizingError, TradingHalt
 from settings import (
     BREAKOUT_TIMER_KEY, ENGINE_FAULT_KEY, ENGINE_HALTED, ENGINE_IDLE,

@@ -20,9 +20,11 @@ This is the selected operational policy, not a claim of demonstrated profitabili
   START and reset execution recheck the live gate. A gate failure before re-anchor
   cancellation preserves the working grid. A failure after cancellation retains
   the durable reset intent while hard-stop checks continue.
-- The SMA is an entry/redeployment filter. Crossing below it during an active
-  grid does not cancel ordinary BUYs or disable the stop. The no-stop BUY-pause
-  experiment is not production policy.
+- The Binance SMA remains an entry/redeployment filter. The runtime BUY kill
+  switch additionally uses Yahoo `BTC-USD` daily closes via `yfinance`; see
+  [MACRO_TREND.md](MACRO_TREND.md). A downtrend, missing/stale history or Yahoo
+  failure cancels bot BUY limits and blocks new BUYs while retaining SELLs and
+  the fixed catastrophic stop. This does not adopt the no-stop experiment.
 - A completed or failed liquidation remains HALTED. Recovery requires human
   review, resolution of any dust/cleanup alarm, saving/reviewing a new grid, then
   manual START with SMA approval. There is no automatic post-stop restart or timer.

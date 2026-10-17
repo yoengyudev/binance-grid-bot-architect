@@ -17,7 +17,8 @@ import ccxt
 
 import engine
 from database import GridDatabase
-from engine import GridBot, _reconcile_service_boot
+from tests.fakes import OfflineGridBot as GridBot
+from engine import _reconcile_service_boot
 from models import TradingHalt
 from portfolio import _portfolio_wallet
 from settings import (

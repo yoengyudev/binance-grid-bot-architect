@@ -15,7 +15,8 @@ import httpx
 import api
 import engine
 from database import GridDatabase
-from engine import GridBot, _reconcile_service_boot
+from tests.fakes import OfflineGridBot as GridBot
+from engine import _reconcile_service_boot
 from models import TradingHalt
 from portfolio import _portfolio_wallet
 from settings import ENGINE_HALTED, ENGINE_IDLE, ENGINE_STATUS_KEY, ENGINE_STOP_CLEANUP_KEY, LIQUIDATION_KEY, SAFETY_MODE_KEY

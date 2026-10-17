@@ -257,7 +257,7 @@ def main() -> int:
     LOGGER.addHandler(handler)
     LOGGER.setLevel(logging.INFO)
     LOGGER.propagate = False
-    for module_name in ("engine", "api", "market_data", "portfolio", "stop_controller"):
+    for module_name in ("engine", "api", "market_data", "portfolio", "stop_controller", "macro_trend"):
         module_logger = logging.getLogger(module_name)
         module_logger.setLevel(logging.INFO)
         for previous_handler in list(module_logger.handlers):
