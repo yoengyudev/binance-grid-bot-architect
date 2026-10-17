@@ -31,7 +31,8 @@ def _realized_pnl_payload(database: Optional[GridDatabase]) -> Dict[str, Optiona
     return {key: float(totals[key]) for key in ("today", "seven_day", "total")}
 
 
-def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
+def _portfolio_wallet(database: GridDatabase, *,
+                      include_verifying_inventory: bool = False) -> Dict[str, Optional[float]]:
     """Value the current run's remaining BTC lots from persisted fill snapshots."""
     try:
         if database.get_state("halt_reason") == MANUAL_ACCOUNT_EXIT_REASON:
@@ -39,8 +40,12 @@ def _portfolio_wallet(database: GridDatabase) -> Dict[str, Optional[float]]:
             # Preserve historical fills while clearing current exposure.
             return {"btc_held": 0.0, "average_cost": None, "unrealized_pnl": 0.0}
         liquidation = database.get_state(LIQUIDATION_KEY)
-        if liquidation:
-            state = json.loads(liquidation)
+        state = json.loads(liquidation) if liquidation else None
+        if liquidation and not isinstance(state, dict):
+            return _unavailable_wallet()
+        # Only the risk verifier opts in, after refreshing every tracked order.
+        # UI readers keep reporting unknown inventory until verification finishes.
+        if state is not None and not (include_verifying_inventory and state.get('phase') == 'verifying'):
             if state.get("phase") == "dust_acknowledged":
                 # The residual has its own persistent reserve ledger and warning.
                 if not any(row["id"] == state.get("dust_reserve_id") and

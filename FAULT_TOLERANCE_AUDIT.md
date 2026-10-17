@@ -76,3 +76,32 @@ Reference: [Binance Spot account trade list](https://developers.binance.com/docs
 documents the 500-trade default and supported `symbol + orderId + fromId`
 pagination. [CCXT Manual](https://docs.ccxt.com/docs/manual) documents unified
 order lookup and exchange-specific trade pagination.
+
+## Follow-up: hard-stop priority and uncertain inventory
+
+Routine full-book audits now run after the cycle's price/inventory risk check,
+including the asynchronous service and pending-reset paths. If an observed
+below-stop price is followed by an order-read failure, the engine atomically
+persists `hard_stop_liquidation.phase = verifying` and `safety_mode = LIQUIDATING`,
+records the error and exposes the existing liquidation alarm. New grid orders
+and START are blocked. The existing outer backoff/circuit policy retries this
+verification before routine audits, placement or a fresh ticker request.
+
+Every tracked active order must refresh before exposure is classified. Positive
+verified BTC enters the existing cancel/reconcile/market-sell protocol, retaining
+the original witnessed trigger even after a price bounce. Verified zero BTC
+clears the provisional state and restores the previous pause mode without
+canceling BUYs, selling reserved BTC or declaring a terminal liquidation.
+Unknown inventory is never treated as zero. Normal dashboard wallet reads remain
+unavailable while verification is pending. Lease loss propagates without stale
+ownership rewriting a liquidation failure state.
+
+The full local suite passed **498 tests**, including **16 new tests** in
+`tests/test_risk_read_failures.py`. They cover persistent/repeated failures,
+restart, price bounce, missing public ticker, failing audits, unobserved final
+SELL fills, reserved BTC, START/submission interlocks, manual-panic override,
+manual-pause restoration, strict stop comparison and lease fencing.
+
+This does not guarantee an exit during an exchange outage. No sale is submitted
+until inventory and cancellation can be verified; existing exchange orders can
+still execute during uncertainty. No live deployment was performed in this follow-up.

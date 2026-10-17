@@ -1947,6 +1947,8 @@ class GridBot:
         client_id = self.order_client_prefix + uuid.uuid4().hex[:20]
         with self.exchange_lock:
             self.assert_runner_lease()
+            if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
+                raise TradingHalt('Risk exit verification is pending; new grid orders are blocked.')
             if side == 'BUY' and not self._macro_buys_allowed():
                 self._set_macro_buy_pause(True)
                 return None  # No durable intent or exchange write, including seed MARKET BUY.
@@ -2331,7 +2333,8 @@ class GridBot:
             )
         self._alert_realized_sell(row["order_id"], sell_price, sell_filled, profit)
 
-    def _bot_btc_balance(self, *, refresh: bool = True) -> Decimal:
+    def _bot_btc_balance(self, *, refresh: bool = True,
+                         verify_pending_stop: bool = False) -> Decimal:
         """Actual tracked inventory, including locked BTC and partial executions.
 
         Use commission-adjusted ledger quantities, never the wallet's free BTC
@@ -2340,7 +2343,8 @@ class GridBot:
         if refresh:
             for row in self.database.fetch_active_grids():
                 self._fetch_order(row)
-        balance = _portfolio_wallet(self.database)["btc_held"]
+        balance = _portfolio_wallet(self.database,
+            include_verifying_inventory=verify_pending_stop)["btc_held"]
         if balance is None:
             raise TradingHalt("Bot BTC exposure cannot be verified from the fill ledger.")
         amount = Decimal(str(balance))
@@ -2360,7 +2364,12 @@ class GridBot:
             if mode in (LIQUIDATED, LIQUIDATION_HALTED):
                 return False
             if bot_btc_balance is None:
-                bot_btc_balance = self._bot_btc_balance()
+                try:
+                    bot_btc_balance = self._bot_btc_balance()
+                except (ccxt.NetworkError, ccxt.ExchangeError, OSError) as error:
+                    if price < self.config.stop_loss_price:
+                        self._queue_stop_verification(price, error)
+                    raise
             if bot_btc_balance <= 0:
                 return False
             self.advance_trailing_stop(price, bot_btc_balance=bot_btc_balance)
@@ -2778,6 +2787,62 @@ class GridBot:
                 return True
         raise TradingHalt("Replacement grid did not finish placing orders.")
 
+    def _queue_stop_verification(self, price: Decimal, error: Exception) -> None:
+        """Latch a witnessed breach without assuming that stale BTC still exists."""
+        with self.database.transaction():
+            if self.database.get_state(LIQUIDATION_KEY) is None:
+                state = dict(phase='verifying', trigger_price=str(price), trigger_event='HARD_STOP',
+                             observed_at=datetime.now(timezone.utc).isoformat(),
+                             previous_safety_mode=self.database.get_state(SAFETY_MODE_KEY))
+                self._save_liquidation(state)
+                self.database.set_state(SAFETY_MODE_KEY, LIQUIDATING,
+                                        trigger_event='HARD_STOP_VERIFICATION_PENDING',
+                                        error_details=_exception_details(error))
+            self.database.set_state(LIQUIDATION_ALARM_KEY,
+                f'Hard stop observed at {price}; inventory verification pending: '
+                f'{type(error).__name__}: {error}')
+        self.is_paused = True
+        LOGGER.error('Hard-stop inventory verification pending (%s); new orders blocked.',
+                     type(error).__name__)
+
+    def _verify_pending_stop(self, state: Dict[str, Any]) -> bool:
+        """Return true only with refreshed positive exposure; flat keeps its BUYs."""
+        try:
+            for row in self.database.fetch_active_grids():
+                self._fetch_order(row)
+            held = self._bot_btc_balance(refresh=False, verify_pending_stop=True)
+        except (ccxt.NetworkError, ccxt.ExchangeError, OSError) as error:
+            self.database.set_state(LIQUIDATION_ALARM_KEY,
+                f'Hard-stop inventory verification pending: {type(error).__name__}: {error}')
+            _journal_fault(self.database, error, 'HARD_STOP_VERIFICATION_RETRY')
+            raise  # The outer loop applies bounded exponential/circuit backoff.
+        if held <= 0:
+            previous = state.get('previous_safety_mode')
+            with self.database.transaction():
+                self.database.clear_state(LIQUIDATION_KEY)
+                self.database.clear_state(LIQUIDATION_ALARM_KEY)
+                if previous is None:
+                    self.database.clear_state(SAFETY_MODE_KEY)
+                else:
+                    self.database.set_state(SAFETY_MODE_KEY, previous)
+                self.database.record_transition(LIQUIDATING, previous,
+                    'HARD_STOP_VERIFIED_FLAT', 'No bot BTC remains; existing BUY orders preserved.')
+            self.is_paused = previous is not None
+            return False
+        # Cancellation and cost-basis reconciliation still precede every sale.
+        state['phase'] = 'canceling'
+        with self.database.transaction():
+            self._save_liquidation(state)
+            self.database.clear_state(LIQUIDATION_ALARM_KEY)
+            self.database.record_transition(LIQUIDATING, LIQUIDATING,
+                'HARD_STOP_VERIFICATION_CONFIRMED', f'Verified bot BTC: {held}')
+        LOGGER.critical('Confirmed %s bot BTC after deferred hard-stop verification.', held)
+        schedule_telegram_alert(
+            f'🚨 *HARD STOP CONFIRMED — MARKET LIQUIDATION*'
+            f'\nPair: {markdown_text(self.config.symbol)}'
+            f'\nTrigger price: {markdown_text(state["trigger_price"])}')
+        return True
+
     def _save_liquidation(self, state: Dict[str, Any]) -> None:
         self.database.set_state(LIQUIDATION_KEY, json.dumps(state, sort_keys=True))
 
@@ -3112,6 +3177,20 @@ class GridBot:
         state = json.loads(state_text) if state_text else {
             "phase": "canceling", "trigger_price": str(price), "trigger_event": trigger_event,
         }
+        if state['phase'] == 'verifying':
+            if trigger_event == 'MANUAL_PANIC_LIQUIDATION':
+                # Explicit panic also cancels/halts a verified flat grid.
+                state.update(phase='canceling', trigger_event=trigger_event)
+                self._save_liquidation(state)
+            else:
+                try:
+                    if not self._verify_pending_stop(state):
+                        return
+                except RunnerLeaseLost:
+                    raise
+                except (TradingHalt, ValueError, KeyError, TypeError) as error:
+                    self._fail_liquidation(state, error)
+                    return
         if state["phase"] == "dust_acknowledged":
             return  # This closed grid's residual is explicitly reserved outside risk monitoring.
         if state_text is None:
@@ -3158,6 +3237,8 @@ class GridBot:
                 if state["phase"] == "submitting":
                     retry_delay = 1
                     continue  # A terminal partial fill needs the next MARKET sale now.
+            except RunnerLeaseLost:
+                raise
             except permanent_errors as error:
                 self._fail_liquidation(state, error)
                 return
@@ -3491,6 +3572,8 @@ class GridBot:
         """Reconcile first; resume matched orders or queue a guarded rebuild."""
         with self._cycle_lock:
             self.assert_runner_lease()
+            if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
+                raise TradingHalt('Hard-stop verification or liquidation must finish before START.')
             if self.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
                 raise TradingHalt("A prior stop still needs Binance order cleanup.")
             state = self._reconcile_state()
@@ -3686,7 +3769,6 @@ class GridBot:
             if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_IDLE:
                 return []
             try:
-                self._audit_full_book_if_due()
                 return self._run_cycle_locked()
             except GridSizingError as error:
                 self._pause_for_order_sizing(error)
@@ -3725,10 +3807,17 @@ class GridBot:
         for row in self.database.fetch_active_grids():
             if self.stop_controller.stop_requested.is_set():
                 return events
-            observed_orders.append((row, self._fetch_order(row)))
+            try:
+                observed_orders.append((row, self._fetch_order(row)))
+            except (ccxt.NetworkError, ccxt.ExchangeError, OSError) as error:
+                if current_price < self.config.stop_loss_price:
+                    self._queue_stop_verification(current_price, error)
+                raise
         bot_btc_balance = self._bot_btc_balance(refresh=False)
         if self._evaluate_automatic_stop(current_price, bot_btc_balance=bot_btc_balance):
             return events
+        # Routine account audits cannot gate a witnessed emergency price exit.
+        self._audit_full_book_if_due()
         for row, order in observed_orders:
             if self.stop_controller.stop_requested.is_set():
                 return events
@@ -3967,7 +4056,8 @@ class GridBot:
                 self.database.get_state(SAFETY_MODE_KEY) not in
                 (LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED)):
             raise TradingHalt("Saved stop state requires manual review before a new run.")
-        await asyncio.to_thread(self._backfill_portfolio_snapshots)
+        if self.database.get_state(SAFETY_MODE_KEY) != LIQUIDATING:
+            await asyncio.to_thread(self._backfill_portfolio_snapshots)
         try:
             if self.database.get_state(SAFETY_MODE_KEY) not in (
                     LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED):
@@ -3984,7 +4074,6 @@ class GridBot:
                         self.database.get_state(ENGINE_STATUS_KEY) != ENGINE_RUNNING):
                     return
                 try:
-                    await asyncio.to_thread(self._audit_full_book_if_due)
                     mode = self.database.get_state(SAFETY_MODE_KEY)
                     if mode in (LIQUIDATED, LIQUIDATION_HALTED):
                         await self._notify_liquidation(notifier)
@@ -4007,6 +4096,7 @@ class GridBot:
                         if await asyncio.to_thread(self._evaluate_automatic_stop, price):
                             await self._notify_liquidation(notifier)
                             continue
+                        await asyncio.to_thread(self._audit_full_book_if_due)
                         complete = await asyncio.to_thread(self.reset_grid)
                         await self._notify_safety_state(notifier)
                         failures = 0
