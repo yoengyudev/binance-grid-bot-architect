@@ -13,7 +13,7 @@ import ccxt
 import uvicorn
 from api import app
 from database import GridDatabase
-from exchange_handler import create_exchange, create_macro_exchange
+from exchange_handler import create_exchange, create_macro_exchange, exchange_retry_delay, network_backoff
 from notifier import TelegramNotifier, bind_notification_loop, close_notifications, schedule_telegram_alert
 from settings import (
     ENGINE_FAULT_KEY,
@@ -138,6 +138,7 @@ async def _run_services_owned(bot: GridBot, notifier: Optional[TelegramNotifier]
                 await _ensure_fault_cleanup(bot, error)
                 raise
         else:
+            idle_failures = 0
             while True:
                 bot.assert_runner_lease()
                 if api_task.done():
@@ -160,12 +161,17 @@ async def _run_services_owned(bot: GridBot, notifier: Optional[TelegramNotifier]
                         await _ensure_fault_cleanup(bot, error)
                         bot.database.set_state(ENGINE_FAULT_KEY, type(error).__name__)
                 else:
+                    delay = max(bot.config.poll_seconds, 5)
                     try:
                         await asyncio.to_thread(bot.reconcile_idle_orders)
+                        idle_failures = 0
                     except (ccxt.BaseError, OSError, RuntimeError, sqlite3.Error) as error:
                         LOGGER.warning("Idle order cleanup will retry: %s",
                                        type(error).__name__)
-                    await asyncio.sleep(max(bot.config.poll_seconds, 5))
+                        delay = exchange_retry_delay(bot.exchange, error,
+                            max(delay, network_backoff(idle_failures)))
+                        idle_failures += 1
+                    await asyncio.sleep(delay)
     finally:
         market_data_task.cancel()
         await asyncio.gather(market_data_task, return_exceptions=True)

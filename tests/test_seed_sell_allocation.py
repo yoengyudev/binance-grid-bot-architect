@@ -37,7 +37,7 @@ class BinanceStepExchange(FakeSpotExchange):
             order = dict(self.orders[order['clientOrderId']])
         return order
 
-    def fetch_order_trades(self, order_id, symbol):
+    def fetch_order_trades(self, order_id, symbol, since=None, limit=None, params=None):
         order = next(order for order in self.orders.values() if order['id'] == order_id)
         fee = sum((Decimal(item['cost']) for item in order['fees']
                    if item['currency'] == 'BTC'), Decimal(0))

@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import random
 import sys
 import time
 from collections import deque
@@ -155,6 +156,12 @@ def exchange_retry_delay(exchange: Any, error: Exception, default: float) -> flo
     return max(default, remaining, local_delay)
 
 
+def network_backoff(attempt: int, *, cap: float = 60) -> float:
+    """Capped exponential delay with jitter; server penalties remain a minimum."""
+    ceiling = min(cap, 2 ** min(attempt, 10))
+    return random.uniform(ceiling / 2, ceiling)
+
+
 def config_path() -> Path:
     """Allow container deployments to keep mutable config outside the image."""
     return Path(os.getenv("GRID_BOT_CONFIG_PATH", str(BASE_DIR / "config.json")))
@@ -203,6 +210,8 @@ def create_exchange() -> ccxt.binance:
             "timeout": 10000,
             "options": {
                 "defaultType": "spot",
+                # Writes are recovered by client ID, never replayed by CCXT.
+                "maxRetriesOnFailure": 0,
                 # The 5-minute account-wide audit deliberately uses Binance's
                 # higher-weight no-symbol open-orders endpoint.
                 "fetchOpenOrders": {"warnWithoutSymbol": False},

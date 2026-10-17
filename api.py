@@ -11,6 +11,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from threading import RLock
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 import ccxt
 import jwt
@@ -18,6 +19,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from database import GridDatabase
 from exchange_handler import check_exchange_circuit, create_exchange
+from dashboard_reads import DashboardReadDeferred, DashboardReads
 from notifier import markdown_text, schedule_telegram_alert
 from settings import (
     AUTH_COOKIE_NAME,
@@ -238,6 +240,23 @@ def _exchange_audit_telemetry(bot: Optional["GridBot"],
     }
 
 
+_monitor_dashboard_reader = None
+_monitor_dashboard_lock = RLock()
+
+
+def _monitor_account_reader() -> Tuple[Optional[DashboardReads], Any]:
+    """Reuse the immutable environment's reader throughout monitor-only mode."""
+    global _monitor_dashboard_reader
+    with _monitor_dashboard_lock:
+        if _monitor_dashboard_reader is not None:
+            return _monitor_dashboard_reader, _monitor_dashboard_reader.exchange
+        _credentials()
+        exchange = create_exchange()
+        if isinstance(exchange, ccxt.Exchange):
+            _monitor_dashboard_reader = DashboardReads(exchange)
+        return _monitor_dashboard_reader, exchange
+
+
 def _unprotected_exposure_payload(bot: Optional["GridBot"],
                                   database: Optional[GridDatabase],
                                   engine_status: str) -> Dict[str, Any]:
@@ -254,9 +273,9 @@ def _unprotected_exposure_payload(bot: Optional["GridBot"],
         return result
 
     try:
+        reader = None
         if bot is None:
-            _credentials()
-            exchange = create_exchange()
+            reader, exchange = _monitor_account_reader()
             lock = RLock()
             symbol = "BTC/USDT"
         else:
@@ -265,22 +284,30 @@ def _unprotected_exposure_payload(bot: Optional["GridBot"],
                 return unavailable
             lock = bot.exchange_lock
             symbol = bot.config.symbol
-        # One read-only snapshot under the exchange lock, separate from ledger P&L.
+        snapshot = None
+        if isinstance(bot, GridBot):
+            reader = bot.dashboard_reads()
+        if reader is not None:
+            snapshot = reader.snapshot(symbol)
+            exchange = reader.exchange
+            lock = nullcontext()
+        # Legacy monitor/test adapters retain their direct read-only path.
         with lock:
-            check_exchange_circuit(exchange)
-            exchange.load_markets()
-            market = exchange.market(symbol)
+            if snapshot is None:
+                check_exchange_circuit(exchange)
+                exchange.load_markets()
+            market = snapshot['market'] if snapshot is not None else exchange.market(symbol)
             if (not isinstance(market, dict) or market.get("base") != "BTC"
                     or not market.get("spot") or market.get("active") is False):
                 raise ValueError("BTC Spot market metadata is unavailable.")
-            balances = exchange.fetch_balance({"type": "spot"})
+            balances = snapshot['balances'] if snapshot is not None else exchange.fetch_balance({"type": "spot"})
             if not isinstance(balances, dict):
                 raise ValueError("Spot balance is unavailable.")
             btc = balances.get("BTC") or {}
             free = btc.get("free", (balances.get("free") or {}).get("BTC"))
             used = btc.get("used", (balances.get("used") or {}).get("BTC"))
             total = quantity(free) + quantity(used)
-            live_orders = exchange.fetch_open_orders()
+            live_orders = snapshot['orders'] if snapshot is not None else exchange.fetch_open_orders()
             if not isinstance(live_orders, list):
                 raise ValueError("Spot open orders are unavailable.")
             locked = bot_locked = Decimal(0)
@@ -304,7 +331,8 @@ def _unprotected_exposure_payload(bot: Optional["GridBot"],
             uncovered = max(total - locked, Decimal(0))
             exposure = Decimal(0)
             if uncovered > 0:
-                price = quantity(exchange.fetch_ticker(symbol).get("last"))
+                ticker = snapshot['ticker'] if snapshot is not None else exchange.fetch_ticker(symbol)
+                price = quantity(ticker.get("last"))
                 if price <= 0:
                     raise ValueError("BTC price is unavailable.")
                 limits = market.get("limits") or {}
@@ -340,7 +368,8 @@ def _unprotected_exposure_payload(bot: Optional["GridBot"],
                     exposure = tradable
     except (ccxt.BaseError, TradingHalt, OSError, ValueError, TypeError,
             AttributeError, InvalidOperation) as error:
-        LOGGER.warning("Spot BTC exposure unavailable: %s", type(error).__name__)
+        if not isinstance(error, DashboardReadDeferred):
+            LOGGER.warning("Spot BTC exposure unavailable: %s", type(error).__name__)
         return unavailable
 
     protected = Decimal(0)
@@ -642,9 +671,9 @@ def wallet_balance(response: Response,
         raise HTTPException(status_code=503, detail="The trading bot is offline.")
     try:
         if bot is None:
-            _credentials()
-            exchange = create_exchange()
-            balances = exchange.fetch_balance({"type": "spot"})
+            reader, exchange = _monitor_account_reader()
+            balances = (reader.snapshot('BTC/USDT')['balances'] if reader is not None
+                        else exchange.fetch_balance({"type": "spot"}))
             asset = balances.get("USDT") if isinstance(balances, dict) else None
             free = asset.get("free") if isinstance(asset, dict) else None
             if free is None:
@@ -652,11 +681,20 @@ def wallet_balance(response: Response,
             free_usdt = _order_decimal(free)
             if not free_usdt.is_finite() or free_usdt < 0:
                 raise TradingHalt("Exchange returned an invalid free USDT balance.")
+        elif isinstance(bot, GridBot):
+            balances = bot.dashboard_reads().snapshot(bot.config.symbol)['balances']
+            free = (balances.get('USDT') or {}).get('free')
+            if free is None:
+                free = (balances.get('free') or {}).get('USDT')
+            free_usdt = Decimal(str(free))
+            if not free_usdt.is_finite() or free_usdt < 0:
+                raise TradingHalt('Exchange returned an invalid free USDT balance.')
         else:
             free_usdt = bot._free_balance("USDT")
     except (ccxt.BaseError, TradingHalt, OSError, ValueError, TypeError,
             InvalidOperation) as error:
-        LOGGER.warning("Spot USDT balance fetch failed: %s", type(error).__name__)
+        if not isinstance(error, DashboardReadDeferred):
+            LOGGER.warning("Spot USDT balance fetch failed: %s", type(error).__name__)
         raise HTTPException(
             status_code=502, detail="Could not fetch the Spot USDT balance."
         ) from error

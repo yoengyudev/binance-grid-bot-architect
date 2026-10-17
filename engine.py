@@ -17,7 +17,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import ccxt
 from fastapi import status
 from database import GridDatabase
-from exchange_handler import CircuitOpenError, check_exchange_circuit, config_path, exchange_retry_delay, exchange_write_attempts, load_config
+from exchange_handler import CircuitOpenError, check_exchange_circuit, config_path, exchange_retry_delay, exchange_write_attempts, load_config, network_backoff
+from execution_history import ExecutionHistoryPending, verified_execution_order
+from dashboard_reads import DashboardReads
 from stop_controller import StopController
 from notifier import TelegramNotifier, markdown_text, schedule_telegram_alert
 from settings import (
@@ -179,6 +181,8 @@ class GridBot:
             raise TradingHalt("Saved order namespace is invalid; inspect SQLite state.")
         self.order_client_prefix = order_prefix
         self.exchange_lock = RLock()
+        self._dashboard_reads = None
+        self._dashboard_init_lock = RLock()
         self.stop_controller = StopController(
             exchange, database, config.symbol, self.exchange_lock,
             exchange_guard=self.assert_runner_lease,
@@ -340,6 +344,7 @@ class GridBot:
                                                             str(order["id"]))
                     restored[row["order_id"]] = order
 
+                restored = self._recover_execution_ledger()
                 locked = balances[base]["used"]
                 bot_sell_remaining = sum((
                     _order_decimal(order.get("remaining"),
@@ -570,6 +575,20 @@ class GridBot:
                     raise ValueError("Exchange returned an invalid balance value.")
                 balances[asset][field] = value
         return balances
+
+    def dashboard_reads(self) -> DashboardReads:
+        """Lazily own one read-only dashboard client, separate from trading I/O."""
+        with self._dashboard_init_lock:
+            if self._dashboard_reads is None:
+                from exchange_handler import create_exchange
+                exchange = create_exchange() if isinstance(self.exchange, ccxt.Exchange) else self.exchange
+                self._dashboard_reads = DashboardReads(exchange)
+            return self._dashboard_reads
+
+    def invalidate_dashboard_reads(self) -> None:
+        with self._dashboard_init_lock:
+            if self._dashboard_reads is not None:
+                self._dashboard_reads.invalidate()
 
     def grid_configuration(self) -> Tuple[Decimal, Decimal, int, Decimal]:
         """Read the active settings without making an exchange request."""
@@ -1324,11 +1343,62 @@ class GridBot:
     def _call(self, method: Any, *args: Any) -> Any:
         if self.database.in_transaction:
             raise RuntimeError("Exchange I/O must occur outside SQLite transactions.")
-        self.assert_runner_lease()
-        with self.exchange_lock:
+        # Retry only reads. A timed-out mutation may already have executed.
+        readable = getattr(method, "__name__", "").startswith(("fetch_", "load_"))
+        for attempt in range(3 if readable else 1):
             self.assert_runner_lease()
-            check_exchange_circuit(self.exchange)
-            return method(*args)
+            try:
+                with self.exchange_lock:
+                    self.assert_runner_lease()
+                    check_exchange_circuit(self.exchange)
+                    try:
+                        return method(*args)
+                    finally:
+                        if not readable:
+                            self.invalidate_dashboard_reads()
+            except (ccxt.RateLimitExceeded, ccxt.DDoSProtection):
+                raise  # The outer loop waits out the shared circuit's penalty.
+            except ccxt.NetworkError as error:
+                if not readable or attempt == 2:
+                    raise
+                delay = network_backoff(attempt, cap=2)
+                LOGGER.warning("Exchange read %s failed (%s); retrying in %.2fs.",
+                               method.__name__, type(error).__name__, delay)
+                # Release the exchange lock during backoff so STOP can proceed.
+                if self.stop_controller.stop_requested.wait(delay):
+                    raise
+
+    def _recover_execution_ledger(self) -> Dict[str, Dict[str, Any]]:
+        """Recover crash-window fills/fees and missing realized P&L before START."""
+        restored = {}
+        for row in self.database.fetch_all_orders():
+            if not row.get("client_order_id"):
+                continue  # Synthetic carry inventory has no exchange execution ID.
+            snapshot = json.loads(self.database.get_state(FILL_SNAPSHOT_PREFIX + row["order_id"]) or "{}")
+            active = row["status"] in ("OPEN", "PARTIALLY_FILLED")
+            missing_pnl = (row["side"] == "SELL" and row["status"] == "FILLED" and
+                           self.database.get_trade_by_sell_order_id(row["order_id"]) is None)
+            if not active and not missing_pnl and (snapshot.get("fee_source") == "trades" or
+                    snapshot.get("filled_base") is not None and Decimal(snapshot["filled_base"]) == 0):
+                continue
+            order = self._fetch_order(row, persist=False)
+            order = verified_execution_order(self._call, self.exchange, self.config.symbol, order)
+            with self.database.transaction():
+                if active:
+                    self._reconcile_order(row, order=order)
+                else:
+                    self._persist_order_response(row, order)
+                if getattr(self.exchange, "has", {}).get("fetchOrderTrades") and _order_decimal(order.get("filled")) > 0:
+                    self._save_fill_snapshot(row["order_id"], order, verified_fees=(
+                        _fees_in_asset(order, self.market["base"]),
+                        _fees_in_asset(order, self.market["quote"])))
+            updated = self.database.get_order(row["order_id"])
+            if updated["status"] in ("OPEN", "PARTIALLY_FILLED"):
+                restored[row["order_id"]] = order
+            if (updated["side"] == "SELL" and updated["status"] == "FILLED" and
+                    self.database.get_trade_by_sell_order_id(row["order_id"]) is None):
+                self._record_filled_sell(updated, sell_order=order)
+        return restored
 
     def _ticker_price(self) -> Decimal:
         ticker = self._call(self.exchange.fetch_ticker, self.config.symbol)
@@ -1717,7 +1787,9 @@ class GridBot:
             self._save_fill_snapshot(row["order_id"], order)
             if status is not None:
                 changed = self.database.update_order_status(row["order_id"], status)
-                if changed and status == "FILLED" and row["side"] == "BUY":
+                if (changed and row["side"] == "BUY" and (status == "FILLED" or
+                        status == "CANCELED" and _order_decimal(order.get("filled")) > 0 and
+                        self.database.get_state(f"partial_fill_buy:{row['order_id']}") == "1")):
                     self.database.set_state(f"telegram_buy_pending:{row['order_id']}", "1")
                 return changed
         return False
@@ -1726,10 +1798,11 @@ class GridBot:
         self, order_id: str, order: Dict[str, Any],
         *, verified_fees: Optional[Tuple[Decimal, Decimal]] = None,
     ) -> None:
-        save_fill_snapshot(
-            self.database, self.market["base"], self.market["quote"],
-            order_id, order, verified_fees=verified_fees,
-        )
+        with self.database.transaction():
+            save_fill_snapshot(
+                self.database, self.market["base"], self.market["quote"],
+                order_id, order, verified_fees=verified_fees,
+            )
 
     def _buy_fee_in_asset(
         self, row: Dict[str, Any], buy: Dict[str, Any], asset: str,
@@ -1858,7 +1931,8 @@ class GridBot:
             self._persist_order_response(row, order, status.upper())
             if (status == "canceled" and row["side"] == "BUY" and
                     (self.database.get_state(f"safety_pause_buy:{row['order_id']}") == "1" or
-                     self.database.get_state(f"macro_pause_buy:{row['order_id']}") == "1")):
+                     self.database.get_state(f"macro_pause_buy:{row['order_id']}") == "1" or
+                     self.database.get_state(f"partial_fill_buy:{row['order_id']}") == "1")):
                 return None
             raise TradingHalt(f"Tracked order {row['order_id']} ended as {status}.")
         raise TradingHalt("Exchange returned an unknown order status.")
@@ -1939,6 +2013,24 @@ class GridBot:
                     level,
                 )
                 return None
+            except ccxt.NetworkError as error:
+                # Recover acceptance using the SAME client ID; never POST again.
+                row = self.database.get_order(client_id)
+                try:
+                    response = self._fetch_order(row, persist=False)
+                    if (self._client_order_id(response) != client_id or
+                            response.get("symbol") not in (None, self.config.symbol) or
+                            str(response.get("side", "")).upper() != side or
+                            _order_decimal(response.get("amount")) != amount):
+                        raise TradingHalt("Order recovery returned conflicting identity.")
+                except RunnerLeaseLost:
+                    raise
+                except Exception as lookup_error:
+                    raise UncertainOrderError(
+                        f"Order {client_id} submission failed ({error}); exact-ID recovery "
+                        f"is unconfirmed ({lookup_error}). Intent retained; no resubmission."
+                    ) from error
+                LOGGER.warning("Recovered submitted order %s after %s.", client_id, type(error).__name__)
             except Exception as error:
                 raise UncertainOrderError(
                     f"Order {client_id} may have been accepted; inspect it before restarting."
@@ -1947,7 +2039,11 @@ class GridBot:
             raise UncertainOrderError(
                 f"Order {client_id} returned no exchange ID; inspect it before restarting."
             )
-        self.database.set_exchange_order_id(client_id, str(response["id"]))
+        with self.database.transaction():
+            self.database.set_exchange_order_id(client_id, str(response["id"]))
+            if _order_decimal(response.get("filled")) > 0:
+                self._save_fill_snapshot(client_id, response)
+        self.invalidate_dashboard_reads()
         LOGGER.info(
             "Spot submitted %s %s %s %s at %s (grid level %s).",
             order_type, side, amount, self.config.symbol, price, level,
@@ -1993,50 +2089,14 @@ class GridBot:
             exchange_id = row.get("exchange_order_id") or buy.get("id")
             if not exchange_id:
                 raise TradingHalt("Filled buy has no exchange ID for commission lookup.")
-            trades = self._call(
-                self.exchange.fetch_order_trades, str(exchange_id), self.config.symbol
-            )
-            if not isinstance(trades, list):
-                raise TradingHalt("Exchange returned invalid BUY execution details.")
-            executed = base_fee = quote_fee = Decimal(0)
-            for trade in trades:
-                if not isinstance(trade, dict):
-                    raise TradingHalt("Exchange returned an invalid BUY execution.")
-                trade_order = trade.get("order")
-                if trade_order is not None and str(trade_order) != str(exchange_id):
-                    raise TradingHalt("BUY execution belongs to another order.")
-                info = trade.get("info") or {}
-                if not isinstance(info, dict):
-                    raise TradingHalt("BUY execution has invalid exchange details.")
-                # Binance's raw strings retain the full commission and fill
-                # precision even when CCXT's unified fields are floats.
-                quantity = _order_decimal(info.get("qty", trade.get("amount")))
-                if not quantity.is_finite() or quantity <= 0:
-                    raise TradingHalt("BUY execution has an invalid amount.")
-                if "commission" in info and "commissionAsset" in info:
-                    commission = (_order_decimal(info["commission"])
-                                  if info["commissionAsset"] == base else Decimal(0))
-                    quote_commission = (_order_decimal(info["commission"])
-                                        if info["commissionAsset"] == self.market["quote"]
-                                        else Decimal(0))
-                elif trade.get("fee") or trade.get("fees"):
-                    commission = _fees_in_asset(trade, base)
-                    quote_commission = _fees_in_asset(trade, self.market["quote"])
-                else:
-                    LOGGER.info("BUY commission is not available yet for %s.", row["order_id"])
-                    return None
-                if (not commission.is_finite() or commission < 0 or
-                        not quote_commission.is_finite() or quote_commission < 0):
-                    raise TradingHalt("BUY execution has an invalid commission.")
-                executed += quantity
-                base_fee += commission
-                quote_fee += quote_commission
-            if executed == 0 or (executed < filled and
-                                  self._amount(executed) < self._amount(filled)):
-                LOGGER.info("Waiting for all BUY executions for %s.", row["order_id"])
+            try:
+                buy = verified_execution_order(self._call, self.exchange, self.config.symbol,
+                                               dict(buy, id=str(exchange_id)))
+            except ExecutionHistoryPending as error:
+                LOGGER.info("Waiting for complete BUY executions for %s: %s", row["order_id"], error)
                 return None
-            if executed > filled and self._amount(executed) > self._amount(filled):
-                raise TradingHalt("BUY executions exceed the confirmed filled amount.")
+            base_fee = _fees_in_asset(buy, base)
+            quote_fee = _fees_in_asset(buy, self.market["quote"])
             self._save_fill_snapshot(
                 row["order_id"], buy, verified_fees=(base_fee, quote_fee)
             )
@@ -2166,14 +2226,7 @@ class GridBot:
         amount = self._amount(net_base)
         if amount > net_base:
             raise TradingHalt("Exchange precision rounded a SELL above net received BTC.")
-        if row["level"] > 0:
-            # Exact-level grids derive their own geometric spacing; the legacy
-            # configured percentage is not the distance to the next SELL.
-            target = (self.anchor if row["level"] == 1
-                      else self.levels[row["level"] - 2])
-        else:
-            target = self.upper_levels[-row["level"] - 1]
-        price = self._grid_order_price(target, "SELL")
+        price = self._paired_sell_price(row)
         free_bot_base = self._free_bot_base()
         if amount > free_bot_base:
             LOGGER.info(
@@ -2188,16 +2241,56 @@ class GridBot:
                 parent_order_id=row["order_id"],
             )
 
-    def _record_filled_sell(self, row: Dict[str, Any]) -> None:
+    def _paired_sell_price(self, row: Dict[str, Any]) -> Decimal:
+        if row["level"] > 0:
+            # Exact-level grids derive their own geometric spacing; the legacy
+            # configured percentage is not the distance to the next SELL.
+            target = (self.anchor if row["level"] == 1
+                      else self.levels[row["level"] - 2])
+        else:
+            target = self.upper_levels[-row["level"] - 1]
+        return self._grid_order_price(target, "SELL")
+
+    def _settle_partial_buys(self) -> None:
+        """Release a sellable partial BUY without duplicating its unfilled remainder.
+
+        Small fragments stay resting until sellable. SELL partials stay on the
+        exchange, covering the remainder; other grid lanes continue independently.
+        """
+        for row in self.database.fetch_active_grids():
+            if (row["side"] != "BUY" or row["order_type"] != "LIMIT" or
+                    row["status"] != "PARTIALLY_FILLED" or row["level"] == 0):
+                continue
+            buy = self._fetch_order(row)
+            net_base = self._net_buy_fill_base(row, buy)
+            if net_base is None:
+                continue
+            try:
+                self._check_order_size(self._paired_sell_price(row), self._amount(net_base))
+            except GridSizingError:
+                continue  # Do not strand a below-minimum fragment by canceling it.
+            _, complete = self._cancel_bot_orders(
+                side="buy", selected_ids={row["order_id"]}, marker_prefix="partial_fill_buy")
+            if not complete:
+                LOGGER.warning("Partial BUY %s cancellation pending; no SELL yet.", row["order_id"])
+
+    def _record_filled_sell(self, row: Dict[str, Any], *,
+                            sell_order: Optional[Dict[str, Any]] = None) -> None:
         parent_id = row.get("parent_order_id")
         parent = self.database.get_order(parent_id) if parent_id else None
         if parent is None or parent["side"] != "BUY":
             raise TradingHalt("Filled sell has no tracked parent buy.")
         buy = self._fetch_order(parent, persist=False)
-        sell = self._fetch_order(row, persist=False)
+        sell = sell_order if sell_order is not None else self._fetch_order(row, persist=False)
+        if sell_order is None:
+            sell = verified_execution_order(self._call, self.exchange, self.config.symbol, sell)
         with self.database.transaction():
             self._persist_order_response(parent, buy)
             self._persist_order_response(row, sell, "FILLED")
+            if getattr(self.exchange, "has", {}).get("fetchOrderTrades"):
+                self._save_fill_snapshot(row["order_id"], sell, verified_fees=(
+                    _fees_in_asset(sell, self.market["base"]),
+                    _fees_in_asset(sell, self.market["quote"])))
             buy_filled = _order_decimal(buy.get("filled"))
             sell_filled = _order_decimal(sell.get("filled"))
             if buy_filled <= 0 or sell_filled <= 0:
@@ -3390,6 +3483,7 @@ class GridBot:
                     "bot_orders_cleared": True,
                     "remaining_exchange_orders": len(self._live_open_orders())}
         finally:
+            self.invalidate_dashboard_reads()
             self._cycle_lock.release()
 
     def start_engine(self, *, auto_cover_inventory: bool = False,
@@ -3687,6 +3781,7 @@ class GridBot:
         if self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING:
             return events
 
+        self._settle_partial_buys()
         latest = self.database.fetch_latest_orders_by_level()
         seed_row = latest.get(0)
         cover_text = self.database.get_state(RECONCILE_COVER_KEY)
@@ -3777,7 +3872,9 @@ class GridBot:
                    self.database.get_state(
                       f"trailing_stop_buy:{row['order_id']}") == "1" or
                    self.database.get_state(
-                      f"macro_pause_buy:{row['order_id']}") == "1")):
+                      f"macro_pause_buy:{row['order_id']}") == "1" or
+                   self.database.get_state(
+                      f"partial_fill_buy:{row['order_id']}") == "1")):
                 canceled_buy = self._fetch_order(row)
                 if _order_decimal(canceled_buy.get("filled")) > 0:
                     self._place_sell(row)
@@ -3878,7 +3975,7 @@ class GridBot:
                     await notifier.notify_startup(self.config.symbol)
                 except Exception as error:
                     LOGGER.warning("Startup alert failed: %s", type(error).__name__)
-            backoff = 1
+            failures = 0
             while True:
                 self.assert_runner_lease()
                 if self.stop_controller.stop_requested.is_set():
@@ -3912,7 +4009,7 @@ class GridBot:
                             continue
                         complete = await asyncio.to_thread(self.reset_grid)
                         await self._notify_safety_state(notifier)
-                        backoff = 1
+                        failures = 0
                         if not complete:
                             await asyncio.to_thread(
                                 self.stop_controller.stop_requested.wait,
@@ -3952,18 +4049,20 @@ class GridBot:
                     # Raw fills are local logs; trade alerts wait for committed
                     # BUY cost/commission or SELL realized-P&L accounting.
                     await self._notify_safety_state(notifier)
-                    backoff = 1
+                    failures = 0
                     delay = 0 if self.grid_needs_reset else self.config.poll_seconds
                 except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as error:
                     _journal_fault(self.database, error, "API_CIRCUIT_OPEN" if
                                    isinstance(error, CircuitOpenError) else "API_RATE_LIMIT")
-                    delay = exchange_retry_delay(self.exchange, error, min(backoff, 60))
-                    backoff = min(backoff * 2, 60)
-                except ccxt.NetworkError:
+                    delay = exchange_retry_delay(self.exchange, error, network_backoff(failures))
+                    failures = min(failures + 1, 10)
+                except ccxt.NetworkError as error:
                     if self.is_paused:
                         await self._notify_safety_state(notifier)
-                    delay = min(backoff, 60)
-                    backoff = min(backoff * 2, 60)
+                    delay = network_backoff(failures)
+                    failures = min(failures + 1, 10)
+                    LOGGER.warning("Trading cycle exchange read failed (%s); retrying in %.2fs.",
+                                   error, delay)
                 except RunnerLeaseLost:
                     raise
                 except Exception as error:

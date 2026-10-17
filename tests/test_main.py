@@ -940,7 +940,7 @@ class GridBotTests(unittest.TestCase):
             self.assertEqual(sell["side"], "SELL")
             self.assertEqual(Decimal(sell["amount"]), expected)
             self.assertLessEqual(expected, free_before_sell)
-            executions.assert_called_with(buy["exchange_order_id"], "BTC/USDT")
+            executions.assert_called_with(buy["exchange_order_id"], "BTC/USDT", None, 500, {"fromId": 0})
             bot._fetch_order(buy)
             snapshot = json.loads(bot.database.get_state(
                 grid_settings.FILL_SNAPSHOT_PREFIX + buy["order_id"]

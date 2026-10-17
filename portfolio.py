@@ -13,6 +13,7 @@ from settings import (
     SPOT_FEE_RATE,
 )
 from models import (
+    TradingHalt,
     _order_decimal,
 )
 
@@ -178,11 +179,13 @@ def save_fill_snapshot(
         key = FILL_SNAPSHOT_PREFIX + order_id
         previous_text = database.get_state(key)
         previous = json.loads(previous_text) if previous_text else {}
+        if filled < Decimal(previous.get("filled_base", "0")):
+            raise TradingHalt(f"Cumulative execution regressed for {order_id}; ledger retained.")
         if verified_fees is not None:
             base_fee, quote_fee = verified_fees
             fee_source = "trades"
         elif (previous.get("fee_source") == "trades" and
-              previous.get("filled_base") == str(filled)):
+              Decimal(previous["filled_base"]) == filled):
             base_fee = Decimal(previous["base_fee"])
             quote_fee = Decimal(previous["quote_fee"])
             fee_source = "trades"
