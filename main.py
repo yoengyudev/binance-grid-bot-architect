@@ -283,6 +283,8 @@ def main() -> int:
                       help="Serve the dashboard; trading starts only from the web UI")
     arguments = parser.parse_args()
     try:
+        if not TRADING_SETTINGS.sandbox and not (arguments.ready or arguments.monitor_only):
+            raise TradingHalt('MAINNET requires --ready and a reviewed dashboard START; direct execution is disabled.')
         if arguments.monitor_only:
             app.state.grid_bot = None
             app.state.monitor_only = True

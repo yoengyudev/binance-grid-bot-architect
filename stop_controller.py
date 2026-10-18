@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Optional
 from database import GridDatabase
 from models import StopResult
 from portfolio import save_fill_snapshot
-from exchange_handler import CircuitOpenError, check_exchange_circuit
+from exchange_handler import CircuitOpenError, check_exchange_circuit, exchange_request
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ class StopController:
             if self.exchange_guard is not None:
                 self.exchange_guard()
             check_exchange_circuit(self.exchange)
-            return method(*args)
+            return exchange_request(method, *args)
 
     def _record_error(self, order_id: str, event: str, error: Exception) -> None:
         state = self.database.get_state("engine_status")

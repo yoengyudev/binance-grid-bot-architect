@@ -8,6 +8,7 @@ import math
 import os
 import secrets
 import sqlite3
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from threading import RLock
@@ -20,6 +21,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import GridDatabase
 from exchange_handler import check_exchange_circuit, create_exchange
 from dashboard_reads import DashboardReadDeferred, DashboardReads
+from dashboard_snapshot import exposure_summary
+from budget_policy import CAP_EXHAUSTED, CAP_STATE_KEY, CAP_REASON_KEY, CAP_ORDER_KEY
+from macro_trend import get_macro_status
+from production_baseline import BASELINE_ID
 from notifier import markdown_text, schedule_telegram_alert
 from settings import (
     AUTH_COOKIE_NAME,
@@ -37,6 +42,9 @@ from settings import (
     JWT_LIFETIME_SECONDS,
     JWT_REFRESH_GRACE_SECONDS,
     LAST_EXCHANGE_AUDIT_TIME_KEY,
+    LAST_MARKET_PRICE_KEY,
+    LAST_MARKET_PRICE_TIME_KEY,
+    MACRO_BUY_PAUSE_KEY,
     LIQUIDATED,
     LIQUIDATING,
     LIQUIDATION_ALARM_KEY,
@@ -433,14 +441,25 @@ def _dust_recovery_payload(database: GridDatabase) -> Dict[str, Any]:
 @app.get("/api/bot/status")
 def bot_status(response: Response,
                _: str = Depends(get_current_user)) -> Dict[str, Any]:
+    return _bot_status_payload(response)
+
+
+def _bot_status_payload(response: Response, *, account_exposure=None) -> Dict[str, Any]:
     """Summarize the bot or report the read-only monitor's stopped state."""
     response.headers["Cache-Control"] = "no-store"
     bot = app.state.grid_bot
+    def exposure(database, engine_status):
+        return (account_exposure if account_exposure is not None else
+                _unprotected_exposure_payload(bot, database, engine_status))
     strategy = {
-        "strategy_version": "iteration2", "stop_mode": "fixed",
-        "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.8,
+        "strategy_version": BASELINE_ID, "stop_mode": "fixed",
+        "strategy_baseline_locked": (isinstance(bot, GridBot) and bot.config.strategy_baseline == BASELINE_ID),
+        "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.4,
         "macro_trend_timeframe": "1d", "macro_trend_period": 200,
         "automatic_post_stop_restart": False,
+        "macro_buy_paused": (bot.database.get_state(MACRO_BUY_PAUSE_KEY) == '1'
+                             if isinstance(bot, GridBot) else False),
+        "macro_buy_filter": get_macro_status() if isinstance(bot, GridBot) else None,
         "macro_sma": (float(bot.macro_sma) if isinstance(bot, GridBot)
                       and bot.macro_sma is not None else None),
         "macro_entry_block_reason": (bot.macro_entry_error if isinstance(bot, GridBot) else None),
@@ -466,7 +485,7 @@ def bot_status(response: Response,
             "exact_grid_recenter_supported": True,
             "lower_bound": None, "upper_bound": None,
             **_exchange_audit_telemetry(bot, bot.database),
-            **_unprotected_exposure_payload(bot, bot.database, ENGINE_IDLE),
+            **exposure(bot.database, ENGINE_IDLE),
             "wallet": {"btc_held": 0.0, "average_cost": None,
                        "unrealized_pnl": 0.0},
             "realized_pnl": _realized_pnl_payload(bot.database),
@@ -493,7 +512,7 @@ def bot_status(response: Response,
             "lower_bound": None, "upper_bound": None,
             "last_exchange_audit_time": None,
             "configured_lower_bound": None, "configured_upper_bound": None,
-            **_unprotected_exposure_payload(None, None, ENGINE_IDLE),
+            **exposure(None, ENGINE_IDLE),
             "wallet": {"btc_held": 0.0, "average_cost": None,
                        "unrealized_pnl": 0.0},
             "realized_pnl": _realized_pnl_payload(None),
@@ -509,6 +528,9 @@ def bot_status(response: Response,
     ]
     prices = [Decimal(order["price"]) for order in orders]
     safety_mode = database.get_state(SAFETY_MODE_KEY)
+    allocation_state = database.get_state(CAP_STATE_KEY)
+    cap_exhausted = allocation_state == CAP_EXHAUSTED
+    display_pause = safety_mode or (CAP_EXHAUSTED if cap_exhausted else None)
     manual_account_exit = (database.get_state("halt_reason") ==
                            MANUAL_ACCOUNT_EXIT_REASON)
     engine_status = (database.get_state(ENGINE_STATUS_KEY) or
@@ -570,10 +592,13 @@ def bot_status(response: Response,
         **strategy,
         "pair": bot.config.symbol if bot is not None else "BTC/USDT",
         "safety_pause": (
-            "Active" if safety_mode is not None
+            "Active" if display_pause is not None
             else "Normal"
         ),
-        "pause_mode": safety_mode,
+        "pause_mode": display_pause,
+        "allocation_state": allocation_state,
+        "allocation_pause_reason": database.get_state(CAP_REASON_KEY),
+        "final_residual_buy_id": database.get_state(CAP_ORDER_KEY),
         "engine_status": engine_status,
         "engine_fault": (database.get_state(ENGINE_FAULT_KEY) or
                          database.get_state(ORDER_CLEANUP_ALARM_KEY) or
@@ -589,7 +614,7 @@ def bot_status(response: Response,
         "trading_state": "ACCOUNT_CLEARED" if manual_account_exit else safety_mode if safety_mode in (
             LIQUIDATING, LIQUIDATED, LIQUIDATION_HALTED, PAUSED_SIZING,
             PAUSED_RESET) else (engine_status if engine_status in
-                                   (ENGINE_IDLE, ENGINE_HALTED) else "ACTIVE"),
+                                   (ENGINE_IDLE, ENGINE_HALTED) else CAP_EXHAUSTED if cap_exhausted else "ACTIVE"),
         **({"pause_reason": database.get_state(SIZING_PAUSE_REASON_KEY)}
            if safety_mode == PAUSED_SIZING else {}),
         "grid_levels": len(orders),
@@ -597,7 +622,7 @@ def bot_status(response: Response,
         "lower_bound": float(min(prices)) if prices else None,
         "upper_bound": float(max(prices)) if prices else None,
         **_exchange_audit_telemetry(bot, database),
-        **_unprotected_exposure_payload(bot, database, engine_status),
+        **exposure(database, engine_status),
         "wallet": _portfolio_wallet(database) if bot is not None
                   else _unavailable_wallet(),
         "realized_pnl": _realized_pnl_payload(database),
@@ -659,6 +684,77 @@ def live_orders(response: Response,
     ]
     active.sort(key=lambda row: (row["timestamp"], row["id"]), reverse=True)
     return {"open_limits": active, "filled_trades": recent}
+
+
+_dashboard_snapshot_cache = None
+_dashboard_snapshot_cache_lock = RLock()
+
+
+@app.get('/api/dashboard/snapshot')
+def dashboard_snapshot(response: Response,
+                       _: str = Depends(get_current_user)) -> Dict[str, Any]:
+    """One local view of portfolio, mark price and ledger; never wait on a cycle."""
+    global _dashboard_snapshot_cache
+    response.headers['Cache-Control'] = 'no-store'
+    bot = app.state.grid_bot
+    lock = bot._cycle_lock if isinstance(bot, GridBot) else None
+
+    def busy():
+        with _dashboard_snapshot_cache_lock:
+            if _dashboard_snapshot_cache is not None and _dashboard_snapshot_cache[0] is bot:
+                cached = deepcopy(_dashboard_snapshot_cache[1])
+                cached['reconciling'] = True
+                with bot.database.read_snapshot():
+                    mode = bot.database.get_state(SAFETY_MODE_KEY)
+                    cap = bot.database.get_state(CAP_STATE_KEY)
+                    engine_status = bot.database.get_state(ENGINE_STATUS_KEY)
+                    cached['control_state'] = {
+                        'engine_status': engine_status, 'pause_mode': mode or cap,
+                        'allocation_state': cap,
+                        'engine_fault': (bot.database.get_state(ENGINE_FAULT_KEY) or
+                                         bot.database.get_state(LIQUIDATION_ALARM_KEY)),
+                        'trading_state': (mode if mode in (LIQUIDATING, LIQUIDATED,
+                            LIQUIDATION_HALTED, PAUSED_SIZING, PAUSED_RESET) else
+                            engine_status if engine_status in (ENGINE_IDLE, ENGINE_HALTED) else cap or 'ACTIVE')}
+                return cached
+        raise HTTPException(status_code=409, headers={'Retry-After': '1'},
+                            detail={'code': 'ENGINE_RECONCILING',
+                                    'message': 'Engine reconciliation in progress; retain previous snapshot.'})
+
+    if lock is not None:
+        if not lock.acquire(blocking=False):
+            return busy()
+        lock.release()
+    # Account-only warnings are independently sampled outside the cycle lock.
+    # Active trading snapshots need no exchange I/O at all.
+    exposure = {'unprotected_btc_exposure': None, 'has_unprotected_exposure': False}
+    if bot is None or bot.database.get_state(ENGINE_STATUS_KEY) != ENGINE_RUNNING:
+        exposure = _unprotected_exposure_payload(bot, bot.database if bot else None, ENGINE_IDLE)
+    if lock is not None and not lock.acquire(blocking=False):
+        return busy()
+    try:
+        if app.state.grid_bot is not bot:
+            raise HTTPException(status_code=409, detail={'code': 'ENGINE_RECONCILING'})
+        database = bot.database if bot is not None else None
+        with database.read_snapshot() if database is not None else nullcontext():
+            status_payload = _bot_status_payload(response, account_exposure=exposure)
+            if isinstance(bot, GridBot):
+                status_payload['exposure'] = exposure_summary(bot, status_payload['wallet'])
+            orders = live_orders(response, _='snapshot')
+            price = database.get_state(LAST_MARKET_PRICE_KEY) if database is not None else None
+            price_at = database.get_state(LAST_MARKET_PRICE_TIME_KEY) if database is not None else None
+            captured = datetime.now(timezone.utc).isoformat()
+            token = hashlib.sha256(json.dumps([status_payload, orders, price, price_at],
+                                              sort_keys=True).encode()).hexdigest()
+            snapshot = {'snapshot_id': token, 'captured_at': captured,
+                        'mark_price': price, 'mark_price_at': price_at,
+                        'bot': status_payload, 'orders': orders, 'reconciling': False}
+            with _dashboard_snapshot_cache_lock:
+                _dashboard_snapshot_cache = (bot, deepcopy(snapshot))
+            return snapshot
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 @app.get("/api/wallet-balance")

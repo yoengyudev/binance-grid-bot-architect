@@ -1,10 +1,12 @@
 """Environment-isolated Binance Spot client and read-only connection check."""
 
+import errno
 import json
 import logging
 import math
 import os
 import random
+import socket
 import sys
 import time
 from collections import deque
@@ -19,6 +21,27 @@ from trading_environment import get_trading_settings
 
 BASE_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger(__name__)
+
+
+def exchange_request(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Normalize raw transport failures at exchange I/O, without replaying writes.
+
+    Do not catch OSError around an entire cycle: SQLite/filesystem failures must
+    still halt. Explicit local file/device errno values also remain fatal here.
+    """
+    try:
+        return method(*args, **kwargs)
+    except OSError as error:
+        network_errnos = {
+            errno.ECONNABORTED, errno.ECONNREFUSED, errno.ECONNRESET,
+            errno.EHOSTUNREACH, errno.ENETDOWN, errno.ENETRESET,
+            errno.ENETUNREACH, errno.ENOTCONN, errno.EPIPE, errno.ETIMEDOUT,
+        }
+        if (error.errno is not None and error.errno not in network_errnos and
+                not isinstance(error, (ConnectionError, TimeoutError,
+                                       socket.gaierror, socket.herror))):
+            raise
+        raise ccxt.NetworkError(f'{type(error).__name__}: {error}') from error
 
 
 class CircuitOpenError(ccxt.RateLimitExceeded):

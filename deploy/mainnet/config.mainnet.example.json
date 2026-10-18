@@ -1,0 +1,16 @@
+{
+  "strategy_baseline": "sma200-compressed-atr-v1",
+  "exchange": {"name": "binance", "market_type": "spot"},
+  "grid": {
+    "symbol": "BTC/USDT",
+    "investment_quote": 500,
+    "grid_levels": 5,
+    "initial_inventory_percent": 50,
+    "spacing_percent": 0.4,
+    "lower_price": 1,
+    "upper_price": 3,
+    "stop_loss_price": 0.85,
+    "auto_center_percent": null,
+    "poll_seconds": 10
+  }
+}

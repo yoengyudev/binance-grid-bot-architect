@@ -12,7 +12,12 @@ ATR grid only after an 8h cooldown AND price > the last closed daily SMA200.
 Initial entry and automatic re-anchors also require price > that SMA.
 Default Iteration 2 policy: fixed 15% catastrophic stop below the lower bound,
 with no trailing, Daily SMA200 deployment gate and manual recovery after a stop.
-No-stop BUY-pause and trailing modes remain explicit research comparisons.
+Ongoing BUYs require Yahoo's completed daily BTC-USD close > its SMA200.
+--buy-trend-policy legacy reproduces the earlier entry-only fixed-stop studies.
+New campaigns enforce the production cost-basis plus pending BUY notional cap.
+--allocation-policy legacy_cash preserves the older cash-only sizing model.
+--replacement-buy-policy budget_aware is an opt-in research policy, not live behavior.
+No-stop and trailing modes remain explicit research comparisons.
 
 OHLC paths, instantaneous full limit fills, constant historical filters, and
 interpolated breakout continuity are assumptions, not tick-level replay.
@@ -33,6 +38,7 @@ import time
 import ccxt
 import pandas as pd
 from grid_geometry import MIN_GRID_RETURN, defended_bounds, validate_grid_returns
+from budget_policy import CAP_EXHAUSTED, residual_quantity
 
 D = Decimal
 ZERO = D(0)
@@ -46,6 +52,10 @@ COLUMNS = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
 
 class SizingError(ValueError):
     """A strategy order is below its minimum; keep inventory risk monitoring."""
+
+
+class AllocationCapError(SizingError):
+    """A proposed BUY commitment exceeds the campaign's total purchase-cost cap."""
 
 
 def decimal(value) -> Decimal:
@@ -82,11 +92,16 @@ class Config:
     trend_timeframe: str = '1d'
     trend_period: int = 200
     stop_mode: str = 'fixed'
+    buy_trend_policy: str = 'production'
+    allocation_policy: str = 'total_cost_cap'
+    replacement_buy_policy: str = 'fixed'
+    atr_multiple: Decimal = D('2')
 
     def __post_init__(self):
         values = (self.capital, self.fee, self.slippage_bps, self.seed_fraction,
                   self.price_tick, self.amount_step, self.min_notional,
-                  self.stop_gap, self.breakout_hours, self.cooldown_hours, self.min_grid_return)
+                  self.stop_gap, self.breakout_hours, self.cooldown_hours, self.min_grid_return,
+                  self.atr_multiple)
         if not all(v.is_finite() for v in values):
             raise ValueError('Configuration must contain finite numbers.')
         if (isinstance(self.levels, bool) or not isinstance(self.levels, int)
@@ -97,14 +112,30 @@ class Config:
                 or self.min_notional <= 0 or not 0 <= self.stop_gap < 1
                 or self.breakout_hours < 0 or self.cooldown_hours < 0
                 or not 0 <= self.min_grid_return < 1
+                or self.atr_multiple <= 0
                 or self.execution_timeframe not in ('1m', '5m', '1h')
                 or self.indicator_timeframe not in ('1h', '4h')
                 or self.trend_timeframe not in ('1h', '4h', '1d')
                 or isinstance(self.trend_period, bool) or not isinstance(self.trend_period, int)
                 or not 2 <= self.trend_period <= 1000
                 or self.stop_mode not in ('none', 'fixed', 'trailing')
+                or self.buy_trend_policy not in ('production', 'legacy')
+                or self.allocation_policy not in ('total_cost_cap', 'legacy_cash')
+                or self.replacement_buy_policy not in ('fixed', 'budget_aware', 'residual')
+                or (self.replacement_buy_policy in ('budget_aware', 'residual')
+                    and self.allocation_policy != 'total_cost_cap')
+                or (self.replacement_buy_policy == 'residual' and self.restart_after_stop)
                 or self.buy_fee_asset not in ('base', 'quote')):
             raise ValueError('Invalid capital, levels, fees, precision, or risk settings.')
+
+
+def prepare_buy_signals(frame: pd.DataFrame) -> pd.DataFrame:
+    """Yahoo's last 200 completed daily closes, observable next UTC midnight."""
+    daily = validate_candles(frame, '1d')
+    signals = pd.DataFrame({'buy_close': daily.close,
+                            'buy_sma': daily.close.rolling(200, min_periods=200).mean()})
+    signals.index += TIMEFRAMES['1d']
+    return signals
 
 
 def closed_atr(frame: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -162,7 +193,7 @@ def prepare_indicators(frame: pd.DataFrame, execution_timeframe='5m',
 
 def atr_bounds(center: Decimal, atr: Decimal, config: Config):
     """Fee-defended ATR width and the selected fixed or legacy trailing buffer."""
-    lower, ceiling = defended_bounds(center, 2 * atr, (config.levels + 1) // 2,
+    lower, ceiling = defended_bounds(center, config.atr_multiple * atr, (config.levels + 1) // 2,
                                      config.levels // 2, minimum=config.min_grid_return,
                                      tick=config.price_tick)
     if config.stop_mode == 'none':
@@ -248,6 +279,8 @@ class GridBacktest:
         self.max_dd = self.max_dd_quote = ZERO
         self.last_stop_at: pd.Timestamp | None = None
         self.macro_sma: Decimal | None = None
+        self.buy_macro_close: Decimal | None = None
+        self.buy_macro_sma: Decimal | None = None
         self.entry_trend_blocked_bars = self.cooldown_blocked_bars = 0
         self.reanchor_trend_blocks = 0
         self._reanchor_block_logged = False
@@ -258,15 +291,33 @@ class GridBacktest:
         self.buy_paused = False
         self.buy_pause_episodes = self.buy_resume_episodes = self.buy_pause_bars = 0
         self.sma_canceled_buys = 0
+        self.allocation_cap_buy_pauses = self.allocation_cap_reanchor_deferrals = 0
+        self.budget_buy_resizes = self.budget_buy_deferrals = 0
+        self.budget_deferred_lanes: set[int] = set()
+        self.cap_exhausted_at = None
+        self.residual_buy_count = 0
 
     def _trend_allows(self, price):
         return not self.c.trend_filter or (self.macro_sma is not None and price > self.macro_sma)
 
+    def _buys_allowed(self, price):
+        if not self.c.trend_filter:
+            return True
+        if self.c.buy_trend_policy == 'production':
+            return (self.buy_macro_close is not None and self.buy_macro_sma is not None
+                    and self.buy_macro_close > self.buy_macro_sma)
+        return self.c.stop_mode != 'none' or self._trend_allows(price)
+
     def _sync_buy_pause(self, price, at):
-        if self.c.stop_mode != 'none' or self.mode not in ('RUNNING', 'SIZING_PAUSED'):
+        if self.mode not in ('RUNNING', 'SIZING_PAUSED', CAP_EXHAUSTED):
+            self.buy_paused = False  # HALT is not an active BUY-pause episode.
             return
-        paused = not self._trend_allows(price)
+        paused = not self._buys_allowed(price)
+        if paused and self.c.buy_trend_policy == 'production':
+            # Production expires continuity when macro-off observations stop.
+            self.above_since = None
         if paused:
+            self.budget_deferred_lanes.clear()
             canceled = sum(o.side == 'BUY' for o in self.orders.values())
             self.sma_canceled_buys += canceled
             self.orders = {key: o for key, o in self.orders.items() if o.side == 'SELL'}
@@ -279,6 +330,7 @@ class GridBacktest:
                 self.buy_resume_episodes += 1
             self._event(at, 'SMA_BUYS_PAUSED' if paused else 'SMA_BUYS_RESUMED',
                         price=price, macro_sma=self.macro_sma, canceled_buys=canceled,
+                        buy_macro_close=self.buy_macro_close, buy_macro_sma=self.buy_macro_sma,
                         held_btc=self.held)
         self.buy_paused = paused
 
@@ -290,6 +342,28 @@ class GridBacktest:
         extra = self.c.fee if self.c.buy_fee_asset == 'quote' else ZERO
         return self.cash - sum((o.price * o.quantity * (1 + extra)
                                 for o in self.orders.values() if o.side == 'BUY'), ZERO)
+
+    def position_cost(self):
+        # Acknowledged dust/reserved wallet BTC belongs outside this campaign.
+        return sum((lot.cost for lot in self.lots.values()), ZERO)
+
+    def buy_commitment(self):
+        # Resting simulator orders are unfilled; fees are not part of commitment.
+        return sum((o.price * o.quantity for o in self.orders.values() if o.side == 'BUY'), ZERO)
+
+    def _require_total_cap(self, position_cost, buy_commitment, *, allocation=None):
+        if self.c.allocation_policy == 'legacy_cash':
+            return
+        allocation = self.allocation if allocation is None else allocation
+        if (not position_cost.is_finite() or not buy_commitment.is_finite()
+                or position_cost < 0 or buy_commitment < 0):
+            raise ValueError('Total allocation cost is invalid.')
+        # Match production's float-projection tolerance; do not use market value.
+        if position_cost + buy_commitment - allocation > D('0.000001'):
+            raise AllocationCapError(
+                f'Total allocation cap exceeded: bot BTC cost {position_cost:.2f} + '
+                f'BUY commitments {buy_commitment:.2f} = {position_cost + buy_commitment:.2f} USDT, '
+                f'above {allocation:.2f}. Future fees and price appreciation are excluded.')
 
     def _event(self, at, kind, **values):
         self.events.append({'timestamp': pd.Timestamp(at).isoformat(), 'event': kind,
@@ -343,13 +417,33 @@ class GridBacktest:
         fee_factor = 1 + self.c.fee if self.c.buy_fee_asset == 'quote' else D(1)
         return floor_step(budget / (price * fee_factor), self.c.amount_step)
 
+    def _budget_buy_quantity(self, requested, price, sell_price):
+        """Research only: fit a replacement to remaining cost/cash, never enlarge it.
+
+        Reserve quote-denominated BUY fees for resting BUYs as well as this one.
+        This is conservative sizing; the underlying production cap still excludes
+        future fees. Both the BUY and its net, rounded reverse SELL must be valid.
+        An unfundable lane waits for later SELL proceeds rather than pausing peers.
+        """
+        fee_factor = 1 + self.c.fee if self.c.buy_fee_asset == 'quote' else D(1)
+        room = self.allocation - self.position_cost() - self.buy_commitment() * fee_factor
+        budget = max(ZERO, min(room, self.free_quote()))
+        quantity = min(requested, self._quantity_for_budget(budget, price))
+        received = quantity * (1 - self.c.fee) if self.c.buy_fee_asset == 'base' else quantity
+        reverse = floor_step(received, self.c.amount_step)
+        if not self._valid_order(quantity, price) or not self._valid_order(reverse, sell_price):
+            return ZERO
+        return quantity
+
     def _pause_sizing(self, at, reason):
         self.orders = {key: order for key, order in self.orders.items() if order.side == 'SELL'}
+        self.budget_deferred_lanes.clear()
         self.mode, self.reason = 'SIZING_PAUSED', reason
         self.above_since = None
         self._event(at, 'SIZING_PAUSE', reason=reason)
 
-    def _plan(self, anchor, lower, upper, stop, allocation, inventory):
+    def _plan(self, anchor, lower, upper, stop, allocation, inventory, *,
+              position_cost=None, seed_quote=ZERO):
         nb, ns = (self.c.levels + 1) // 2, self.c.levels // 2
         buys = geometric_levels(anchor, lower, nb, self.c.price_tick)
         sells = geometric_levels(anchor, upper, ns, self.c.price_tick)
@@ -360,6 +454,9 @@ class GridBacktest:
         lower_budget = allocation * (1 - self.c.seed_fraction) / nb
         if any(not self._valid_order(self._quantity_for_budget(lower_budget, p), p) for p in buys):
             raise SizingError('A lower BUY is below exchange/grid order minimums.')
+        commitment = sum((self._quantity_for_budget(lower_budget, p) * p for p in buys), ZERO)
+        self._require_total_cap(self.position_cost() if position_cost is None else position_cost,
+                                commitment + seed_quote, allocation=allocation)
         amounts = split_amount(inventory, ns, self.c.amount_step)
         if any(not self._valid_order(q, p) for q, p in zip(amounts, sells)):
             raise SizingError('Carried/seed BTC is too small for the upper SELL lanes.')
@@ -374,6 +471,7 @@ class GridBacktest:
         self.lower = round_tick(lower, self.c.price_tick)
         self.upper = round_tick(upper, self.c.price_tick)
         self.lanes = {}
+        self.budget_deferred_lanes.clear()
         for index, price in enumerate(buys):
             self.lanes[index + 1] = Lane(index + 1, price,
                                          round_tick(anchor, self.c.price_tick) if index == 0 else buys[index - 1],
@@ -387,13 +485,17 @@ class GridBacktest:
         self.above_since = None
 
     def start_grid(self, at, center, atr):
+        if self.c.buy_trend_policy == 'production' and not self._buys_allowed(center):
+            raise ValueError('Completed Yahoo SMA200 BUY approval is required before the seed.')
         lower, upper, stop = atr_bounds(center, atr, self.c)
         execution = center * (1 + self.c.slippage_bps / 10_000)
         # Restarts use remaining cash only: no hidden account top-ups.
         allocation = self.cash if self.c.restart_after_stop else self.c.capital
         seed_qty = self._quantity_for_budget(allocation * self.c.seed_fraction, execution)
         net = seed_qty * (1 - self.c.fee) if self.c.buy_fee_asset == 'base' else seed_qty
-        buys, sells, amounts, budget = self._plan(center, lower, upper, stop, allocation, net)
+        buys, sells, amounts, budget = self._plan(
+            center, lower, upper, stop, allocation, net,
+            position_cost=ZERO, seed_quote=allocation * self.c.seed_fraction)
         if not self._valid_order(seed_qty, execution, market=True):
             raise ValueError('Initial market BUY is below exchange minimums.')
         self.allocation, self.stop = allocation, stop
@@ -410,14 +512,16 @@ class GridBacktest:
         self._maintain(center, at)
 
     def _maintain(self, price, at):
-        if self.mode != 'RUNNING':
+        if self.mode not in ('RUNNING', CAP_EXHAUSTED):
             return
         for lane in sorted(self.lanes.values(), key=lambda lane: (lane.level > 0, abs(lane.level))):
             if lane.level in self.orders:
                 continue
             target = lane.buy_price if lane.next_side == 'BUY' else lane.sell_price
             if lane.next_side == 'BUY':
-                if self.c.stop_mode == 'none' and not self._trend_allows(price):
+                if self.mode == CAP_EXHAUSTED:
+                    continue
+                if not self._buys_allowed(price):
                     continue
                 if (not self.lower <= price <= self.upper or target >= price
                         or (self.stop is not None and target <= self.stop)):
@@ -433,8 +537,39 @@ class GridBacktest:
                 return
             if lane.next_side == 'BUY':
                 fee_factor = 1 + self.c.fee if self.c.buy_fee_asset == 'quote' else D(1)
+                requested = quantity
+                final_residual = False
+                if self.c.replacement_buy_policy == 'residual':
+                    room = self.allocation-self.position_cost()-self.buy_commitment()
+                    if quantity*target > room:
+                        quantity = residual_quantity(quantity, target, room,
+                            lambda value: floor_step(value, self.c.amount_step))
+                        received = quantity*(1-self.c.fee) if self.c.buy_fee_asset == 'base' else quantity
+                        reverse = floor_step(received,self.c.amount_step)
+                        if not self._valid_order(quantity,target) or not self._valid_order(reverse,lane.sell_price):
+                            self._exhaust_cap(at, 'Residual cannot fund a valid BUY and reverse SELL.')
+                            continue
+                        final_residual = True
+                if self.c.replacement_buy_policy == 'budget_aware':
+                    quantity = self._budget_buy_quantity(quantity, target, lane.sell_price)
+                    if quantity == ZERO:
+                        if lane.level not in self.budget_deferred_lanes:
+                            self.budget_buy_deferrals += 1
+                            self.budget_deferred_lanes.add(lane.level)
+                            self._event(at, 'BUY_BUDGET_DEFERRED', level=lane.level,
+                                        requested=requested, price=target,
+                                        position_cost=self.position_cost(),
+                                        buy_commitment=self.buy_commitment(),
+                                        free_quote=self.free_quote(), allocation=self.allocation)
+                        continue
                 if quantity * target * fee_factor > self.free_quote() + EPS:
                     continue
+                try:
+                    self._require_total_cap(self.position_cost(), self.buy_commitment() + quantity * target)
+                except AllocationCapError as error:
+                    self.allocation_cap_buy_pauses += 1
+                    self._pause_sizing(at, str(error))
+                    return  # Keep existing SELLs and risk checks; do not resize/market-sell BTC.
             else:
                 lot = self.lots[lane.lot_id]
                 locked = sum((o.quantity for o in self.orders.values()
@@ -442,6 +577,28 @@ class GridBacktest:
                 if quantity > lot.quantity - locked + EPS:
                     raise AssertionError('SELL allocation exceeds its parent lot.')
             self.orders[lane.level] = Order(lane.level, lane.next_side, target, quantity, lane.lot_id)
+            if lane.next_side == 'BUY' and self.c.replacement_buy_policy == 'residual' and final_residual:
+                self.residual_buy_count += 1
+                self._event(at,'FINAL_RESIDUAL_BUY',level=lane.level,price=target,
+                            quantity=quantity,requested=requested,remaining=room)
+                self._exhaust_cap(at, 'Final residual BUY reserved; no automatic BUY restart.')
+            if lane.next_side == 'BUY' and self.c.replacement_buy_policy == 'budget_aware':
+                if lane.level in self.budget_deferred_lanes:
+                    self.budget_deferred_lanes.remove(lane.level)
+                    self._event(at, 'BUY_BUDGET_RESUMED', level=lane.level, quantity=quantity)
+                if quantity < requested:
+                    self.budget_buy_resizes += 1
+                    self._event(at, 'BUY_BUDGET_RESIZED', level=lane.level, price=target,
+                                requested=requested, quantity=quantity,
+                                position_cost=self.position_cost(),
+                                buy_commitment=self.buy_commitment(), allocation=self.allocation)
+
+    def _exhaust_cap(self, at, reason):
+        if self.cap_exhausted_at is None:
+            self.cap_exhausted_at = pd.Timestamp(at)
+            self._event(at,CAP_EXHAUSTED,reason=reason)
+        self.mode,self.reason = CAP_EXHAUSTED,reason
+        self.above_since = None
 
     def _fill(self, order, at):
         del self.orders[order.level]
@@ -469,6 +626,8 @@ class GridBacktest:
         self.stop_count += 1
         self.last_stop_at = pd.Timestamp(at)
         self.orders.clear()
+        self.buy_paused = False
+        self.budget_deferred_lanes.clear()
         self.above_since = None
         held, cost = self.held, sum((lot.cost for lot in self.lots.values()), ZERO)
         execution = price * (1 - self.c.slippage_bps / 10_000)
@@ -495,7 +654,7 @@ class GridBacktest:
     def _risk(self, price, at):
         if self.c.stop_mode == 'none':
             return
-        if self.mode not in ('RUNNING', 'SIZING_PAUSED') or self.held <= EPS:
+        if self.mode not in ('RUNNING', 'SIZING_PAUSED', CAP_EXHAUSTED) or self.held <= EPS:
             return  # No stop/trailing activity when bot BTC is actually flat.
         if price > self.high_water:
             self.high_water = price
@@ -508,6 +667,9 @@ class GridBacktest:
                        if o.side != 'BUY' or o.price > self.stop}
 
     def _breakout(self, price, at):
+        if self.c.buy_trend_policy == 'production' and not self._buys_allowed(price):
+            self.above_since = None
+            return
         if (self.mode != 'RUNNING' or self.held <= EPS
                 or price <= self.upper or self.c.breakout_hours == 0):
             self.above_since = None
@@ -548,6 +710,12 @@ class GridBacktest:
                 self._event(at, 'REANCHOR_CAPITAL_DEFERRED', required=needed, cash=self.cash)
                 self.above_since = at
                 return
+        except AllocationCapError as error:
+            self.allocation_cap_reanchor_deferrals += 1
+            self._event(at, 'REANCHOR_ALLOCATION_CAP_DEFERRED', reason=error,
+                        carried_cost=cost, allocation=self.allocation)
+            self.above_since = at
+            return
         except SizingError as error:
             self._event(at, 'REANCHOR_SIZING_DEFERRED', reason=error)
             self.above_since = at
@@ -578,7 +746,7 @@ class GridBacktest:
     def _segment(self, start_price, end_price, start_time, end_time):
         price, at = start_price, start_time
         self._point(price, at)
-        while price != end_price and self.mode in ('RUNNING', 'SIZING_PAUSED'):
+        while price != end_price and self.mode in ('RUNNING', 'SIZING_PAUSED', CAP_EXHAUSTED):
             ascending = end_price > price
             candidates = []
             for order in self.orders.values():
@@ -587,7 +755,8 @@ class GridBacktest:
                     candidates.append(order.price)
             # Observe entry/exit of the grid even if there are no open orders.
             boundaries = [self.lower, self.upper, self.upper + self.c.price_tick]
-            if self.c.stop_mode == 'none' and self.c.trend_filter and self.macro_sma is not None:
+            if (self.c.buy_trend_policy == 'legacy' and self.c.stop_mode == 'none'
+                    and self.c.trend_filter and self.macro_sma is not None):
                 # Observe both sides of the threshold so cancellations/resumptions
                 # happen within the chosen OHLC route, not only at bar extrema.
                 boundaries.extend([self.macro_sma,
@@ -623,7 +792,7 @@ class GridBacktest:
             if self.last_stop_at is not None and at < self.last_stop_at + pd.Timedelta(hours=float(self.c.cooldown_hours)):
                 self.cooldown_blocked_bars += 1
                 return
-            if not self._trend_allows(price):
+            if not self._trend_allows(price) or not self._buys_allowed(price):
                 self.entry_trend_blocked_bars += 1
                 return
             if self.mode == 'HALTED_DUST':
@@ -639,7 +808,8 @@ class GridBacktest:
                 self.mode, self.reason = 'HALTED_CONFIG', str(error)
                 self._event(at, 'GRID_REJECTED', reason=error)
 
-    def run(self, frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, *, trend_frame=None):
+    def run(self, frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, *,
+            trend_frame=None, buy_signal_frame=None):
         indicators = prepare_indicators(frame, self.c.execution_timeframe, self.c.indicator_timeframe,
                                         trend_timeframe=self.c.trend_timeframe,
                                         trend_period=self.c.trend_period, trend_frame=trend_frame)
@@ -647,6 +817,16 @@ class GridBacktest:
         test = frame.loc[(frame.index >= start) & (frame.index < end)]
         if test.empty:
             raise ValueError('No candles in the requested test window.')
+        buy_signals = None
+        if self.c.buy_trend_policy == 'production' and self.c.trend_filter:
+            if buy_signal_frame is None:
+                raise ValueError('Production BUY policy requires Yahoo daily buy_signal_frame '
+                                 '(CLI: --buy-signal-csv for offline replay).')
+            buy_signals = prepare_buy_signals(buy_signal_frame)
+            required = pd.date_range(test.index[0].normalize(), test.index[-1].normalize(), freq='D')
+            if buy_signals.reindex(required).isna().any().any():
+                raise ValueError('Yahoo BUY signal needs 200 completed days and coverage through every test day.')
+            buy_signals = buy_signals.reindex(test.index, method='ffill')
         if self.c.trend_filter and trend_frame is not None:
             trend = validate_candles(trend_frame, self.c.trend_timeframe)
             trend_step = TIMEFRAMES[self.c.trend_timeframe]
@@ -662,6 +842,10 @@ class GridBacktest:
             at = row.Index
             signal = indicators.loc[at]
             self.macro_sma = decimal(signal.macro_sma) if math.isfinite(signal.macro_sma) else None
+            if buy_signals is not None:
+                buy_signal = buy_signals.loc[at]
+                self.buy_macro_close = decimal(buy_signal.buy_close)
+                self.buy_macro_sma = decimal(buy_signal.buy_sma)
             prices = {key: decimal(getattr(row, key)) for key in ('open', 'high', 'low', 'close')}
             self.mark(at, prices['open'], 'bar_open_before_fills')
             # At an opening gap, pre-existing marketable exchange limits may
@@ -685,7 +869,7 @@ class GridBacktest:
             if self.cash < -EPS or self.free_quote() < -EPS:
                 raise AssertionError('Negative cash/free quote after candle.')
             self.state_bar_counts[self.mode] = self.state_bar_counts.get(self.mode, 0) + 1
-            if self.buy_paused:
+            if self.buy_paused and self.mode in ('RUNNING', 'SIZING_PAUSED', CAP_EXHAUSTED):
                 self.buy_pause_bars += 1
             if bar_index and bar_index % 20_000 == 0:
                 print(f'{self.path}: {bar_index:,}/{len(test):,} execution bars; '
@@ -703,7 +887,19 @@ class GridBacktest:
             'stop_mode': self.c.stop_mode,
             'stop_gap_pct': float(self.c.stop_gap * 100) if self.c.stop_mode != 'none' else None,
             'hard_stop_enabled': self.c.stop_mode != 'none',
-            'buy_trend_policy': 'pause_resting_and_new_buys' if self.c.stop_mode == 'none' else 'entry_only',
+            'allocation_policy': self.c.allocation_policy,
+            'replacement_buy_policy': self.c.replacement_buy_policy,
+            'atr_multiple': float(self.c.atr_multiple),
+            'residual_buy_count': self.residual_buy_count,
+            'cap_exhausted_at': self.cap_exhausted_at.isoformat() if self.cap_exhausted_at is not None else None,
+            'budget_buy_resizes': self.budget_buy_resizes,
+            'budget_buy_deferrals': self.budget_buy_deferrals,
+            'budget_deferred_lanes_at_end': sorted(self.budget_deferred_lanes),
+            'allocation_cap_buy_pauses': self.allocation_cap_buy_pauses,
+            'allocation_cap_reanchor_deferrals': self.allocation_cap_reanchor_deferrals,
+            'buy_trend_policy': ('completed_Yahoo_daily_close_gt_Yahoo_SMA200'
+                                 if self.c.buy_trend_policy == 'production' else
+                                 'pause_resting_and_new_buys' if self.c.stop_mode == 'none' else 'entry_only'),
             'buy_pause_episodes': self.buy_pause_episodes, 'buy_resume_episodes': self.buy_resume_episodes,
             'buy_pause_bars': self.buy_pause_bars, 'sma_canceled_buys': self.sma_canceled_buys,
             'final_buy_paused': self.buy_paused,
@@ -731,6 +927,9 @@ class GridBacktest:
             'hard_stop_triggers': self.stop_count, 'breakout_reanchors': self.breakout_count,
             'fees_quote_value': float(self.fees), 'ending_cash': float(self.cash),
             'ending_bot_btc': float(self.held),
+            'ending_position_cost': float(self.position_cost()),
+            'ending_buy_commitment': float(self.buy_commitment()),
+            'ending_position_plus_buy_cost': float(self.position_cost() + self.buy_commitment()),
             'reserved_dust_btc': float(sum((lot.quantity for lot in self.reserves), ZERO)),
             'final_state': self.mode, 'final_reason': self.reason,
         }
@@ -763,6 +962,37 @@ def read_candles(path: Path, timeframe='5m') -> pd.DataFrame:
     timestamp = (pd.to_datetime(numeric, unit='ms', utc=True) if numeric.notna().all()
                  else pd.to_datetime(raw.timestamp, utc=True, format='mixed'))
     return validate_candles(raw.drop(columns='timestamp').set_axis(pd.DatetimeIndex(timestamp), axis=0), timeframe)
+
+
+def yahoo_candles(raw: pd.DataFrame) -> pd.DataFrame:
+    """Normalize one Yahoo ticker without importing live code or reading .env."""
+    if isinstance(raw.columns, pd.MultiIndex):
+        if set(raw.columns.get_level_values(1)) != {'BTC-USD'}:
+            raise ValueError('Ambiguous Yahoo ticker columns.')
+        raw = raw.xs('BTC-USD', axis=1, level=1)
+    raw = raw.rename(columns=lambda key: str(key).lower()).copy()
+    if 'timestamp' in raw:
+        dates = pd.to_datetime(raw.pop('timestamp'), utc=True, format='mixed')
+    else:
+        dates = pd.to_datetime(raw.index, utc=True)
+    if 'volume' not in raw:
+        raw['volume'] = 0  # Only prices feed the daily SMA; older saved CSVs lack volume.
+    return validate_candles(raw.set_axis(pd.DatetimeIndex(dates), axis=0), '1d')
+
+
+def read_buy_signal_candles(path: Path) -> pd.DataFrame:
+    return yahoo_candles(pd.read_csv(path))
+
+
+def fetch_buy_signal_candles(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Public BTC-USD daily history for the production ongoing BUY policy."""
+    import yfinance as yf
+    raw = yf.download('BTC-USD', start=start.date().isoformat(), end=end.date().isoformat(),
+                      interval='1d', auto_adjust=False, progress=False, threads=False,
+                      timeout=10, multi_level_index=False)
+    if raw is None or raw.empty:
+        raise ValueError('Yahoo returned no daily BTC-USD BUY signal history.')
+    return yahoo_candles(raw)
 
 
 def fetch_candles(start: pd.Timestamp, end: pd.Timestamp, timeframe='5m') -> pd.DataFrame:
@@ -823,6 +1053,15 @@ def main(argv=None):
                         help='Closed trend-candle timeframe; default daily')
     parser.add_argument('--trend-period', type=int, default=200, help='Closed trend bars for SMA; default 200 (50 supported)')
     parser.add_argument('--trend-csv', type=Path, help='Separate closed trend OHLCV CSV; required for offline daily mode')
+    parser.add_argument('--buy-trend-policy', choices=['production', 'legacy'], default='production',
+                        help='Production: completed Yahoo daily close/SMA200 gates ongoing BUYs; legacy reproduces older studies')
+    parser.add_argument('--allocation-policy', choices=['total_cost_cap', 'legacy_cash'], default='total_cost_cap',
+                        help='Default: tracked BTC purchase cost + outstanding BUY notionals capped by allocation; legacy_cash reproduces older sizing')
+    parser.add_argument('--replacement-buy-policy', choices=['fixed', 'residual', 'budget_aware'], default='fixed',
+                        help='fixed: prior baseline; residual: one final capped BUY then latched CAP_EXHAUSTED; budget_aware: rejected research comparison only')
+    parser.add_argument('--atr-multiple', type=D, default=D('2'), help='Research half-width multiplier; live ATR proposal remains 2')
+    parser.add_argument('--buy-signal-csv', type=Path,
+                        help='Yahoo BTC-USD daily OHLCV including 200-day warm-up; required for offline production policy')
     parser.add_argument('--stop-gap-pct', type=D, default=D('15'), help='Percent below lower bound; default 15')
     parser.add_argument('--stop-mode', choices=['none', 'fixed', 'trailing'], default='fixed',
                         help='Default fixed: 15%% catastrophe stop, no trailing; none/trailing are research comparisons')
@@ -867,7 +1106,9 @@ def main(argv=None):
                         indicator_timeframe=args.indicator_timeframe, cooldown_hours=args.cooldown_hours,
                         trend_filter=not args.no_trend_filter, min_grid_return=args.min_grid_spacing_pct / 100,
                         trend_timeframe=args.trend_timeframe, trend_period=args.trend_period,
-                        stop_gap=args.stop_gap_pct / 100, stop_mode=args.stop_mode)
+                        stop_gap=args.stop_gap_pct / 100, stop_mode=args.stop_mode,
+                        buy_trend_policy=args.buy_trend_policy, allocation_policy=args.allocation_policy,
+                        replacement_buy_policy=args.replacement_buy_policy, atr_multiple=args.atr_multiple)
         frame = read_candles(args.csv, args.execution_timeframe) if args.csv else fetch_candles(warmup, end, args.execution_timeframe)
         frame = validate_candles(frame.loc[(frame.index >= warmup) & (frame.index < end)], args.execution_timeframe)
         if frame.index[0] != warmup or frame.index[-1] != end - step:
@@ -886,9 +1127,25 @@ def main(argv=None):
             if trend_frame.index[0] != trend_start or trend_frame.index[-1] != trend_end - trend_step:
                 raise ValueError('Trend data must cover the complete daily/selected SMA warm-up and closed-bar interval.')
             trend_source = str(args.trend_csv.resolve()) if args.trend_csv else 'Binance production public Spot via CCXT'
+        buy_frame, buy_source = None, None
+        if config.buy_trend_policy == 'production' and config.trend_filter:
+            if args.csv and args.buy_signal_csv is None:
+                raise ValueError('Offline production BUY policy requires --buy-signal-csv; no Yahoo request was made.')
+            buy_start = start.normalize() - TIMEFRAMES['1d'] * 200
+            # Fetch through yesterday for the final execution day, end exclusive.
+            buy_end = (end - step).normalize()
+            buy_frame = (read_buy_signal_candles(args.buy_signal_csv) if args.buy_signal_csv
+                         else fetch_buy_signal_candles(buy_start, buy_end))
+            buy_frame = buy_frame.loc[(buy_frame.index >= buy_start) & (buy_frame.index < buy_end)]
+            buy_frame = validate_candles(buy_frame, '1d')
+            if buy_frame.index[0] != buy_start or buy_frame.index[-1] != buy_end - TIMEFRAMES['1d']:
+                raise ValueError('Yahoo BUY data must cover the complete SMA200 warm-up and closed-day interval.')
+            buy_source = str(args.buy_signal_csv.resolve()) if args.buy_signal_csv else 'Yahoo Finance BTC-USD via yfinance'
+        elif args.buy_signal_csv is not None:
+            raise ValueError('--buy-signal-csv requires the production policy and an enabled trend filter.')
         args.output.mkdir(parents=True, exist_ok=True)
         data_path = args.output / f'btc_usdt_{args.execution_timeframe}.csv'
-        protected = {p.resolve() for p in (args.csv, args.trend_csv) if p is not None}
+        protected = {p.resolve() for p in (args.csv, args.trend_csv, args.buy_signal_csv) if p is not None}
         if data_path.resolve() in protected:
             data_path = args.output / 'data_snapshot.csv'
             if data_path.resolve() in protected:
@@ -902,10 +1159,18 @@ def main(argv=None):
                     raise ValueError('Trend snapshot must not overwrite either input CSV.')
             trend_frame.to_csv(trend_path, index_label='timestamp')
         frame.to_csv(data_path, index_label='timestamp')
+        buy_path = None
+        if buy_frame is not None:
+            buy_path = args.output / 'btc_usd_1d_buy_signal.csv'
+            if buy_path.resolve() in protected:
+                buy_path = args.output / 'buy_signal_snapshot.csv'
+                if buy_path.resolve() in protected:
+                    raise ValueError('BUY signal snapshot must not overwrite an input CSV.')
+            buy_frame.to_csv(buy_path, index_label='timestamp')
         reports = []
         for path in (['ohlc', 'olhc'] if args.path == 'both' else [args.path]):
             simulator = GridBacktest(config, path)
-            report = simulator.run(frame, start, end, trend_frame=trend_frame)
+            report = simulator.run(frame, start, end, trend_frame=trend_frame, buy_signal_frame=buy_frame)
             reports.append(report)
             pd.DataFrame(simulator.fills, columns=['timestamp', 'side', 'kind', 'level', 'price',
                                                   'quantity', 'fee_quote_value', 'realized_pnl']).to_csv(
@@ -920,10 +1185,18 @@ def main(argv=None):
                    'trend_source': trend_source,
                    'trend_file': trend_path.name if trend_path is not None else None,
                    'trend_sha256': hashlib.sha256(trend_path.read_bytes()).hexdigest() if trend_path is not None else None,
+                   'buy_signal_source': buy_source,
+                   'buy_signal_file': buy_path.name if buy_path is not None else None,
+                   'buy_signal_sha256': hashlib.sha256(buy_path.read_bytes()).hexdigest() if buy_path is not None else None,
                    'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                    'geometry_sha256': hashlib.sha256(Path(__file__).with_name('grid_geometry.py').read_bytes()).hexdigest(),
                    'ccxt_version': ccxt.__version__, 'pandas_version': pd.__version__,
                    'assumptions': ['Fixed full-fill OHLC paths, not tick replay or proven profit bounds.',
+                                   'Default total_cost_cap: tracked BTC cost basis plus remaining BUY notionals <= campaign allocation; excludes future fees, price appreciation and outside reserves.',
+                                   'Cap checks run before seed/plans, re-anchors and each new BUY; existing accepted fills are accounted even if quote fees push cost above cap.',
+                                   'Cap-rejected re-anchors defer under the atomic replacement model; cap-rejected new BUYs cause a sizing pause retaining SELLs and the hard stop.',
+                                   'Opt-in budget_aware research policy shrinks replacement BUYs to remaining cost/cash, reserving quote BUY fees, or defers only that lane when BUY/reverse SELL minimums cannot fit; seed/re-anchor plans stay fixed.',
+                                   'legacy_cash allocation is an explicit earlier research model, independent of the selected BUY trend policy.',
                                    'ATR and SMA use independent CLOSED candle clocks; each signal available only at its own candle close.',
                                    'Selected SMA gates initial entry/restart/re-anchor; elapsed cooldown AND trend required after stop (unless explicit ablation).',
                                    'ATR bounds widened to minimum gross per-cycle return after price rounding; not a net profit guarantee.',
@@ -931,7 +1204,10 @@ def main(argv=None):
                                    'No manual pauses, manual re-anchors or external wallet inventory.',
                                    'Constant tick/lot/notional filters over history; no queue/latency/partial-fill model.',
                                    'Default fixed stop: 15% below lower bound, no trailing; manual recovery after liquidation.',
-                                   'Explicit no-stop mode: no forced MARKET SELL, cancel/block BUYs below/equal SMA; SELL limits and inventory retained.',
+                                   'Production BUY policy: completed Yahoo BTC-USD close must exceed its closed daily SMA200; SELLs and fixed stop remain active while BUYs pause.',
+                                   'Legacy policy reproduces earlier entry-only fixed/trailing and price-crossing no-stop comparisons.',
+                                   'Yahoo history assumes complete daily publication at UTC midnight; feed outages are not modeled.',
+                                   'Explicit no-stop mode: no forced MARKET SELL; inventory remains marked.',
                                    'No-stop/trailing modes and automatic restart are explicit research comparisons, not production policy.',
                                    'Price stops run only with positive tracked BTC; dust is not silently discarded.',
                                    '4h breakout continuity inferred from each OHLC path; not observed ticker history.',

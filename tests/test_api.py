@@ -35,6 +35,23 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
         factory.start()
         self.addCleanup(factory.stop)
 
+    async def test_status_exposes_macro_pause_reason_and_success_time_without_fetch(self):
+        from tests.fakes import make_bot
+        with tempfile.TemporaryDirectory() as directory:
+            bot, _ = make_bot(Path(directory) / 'grid_testnet.sqlite')
+            bot.database.set_state(grid_settings.MACRO_BUY_PAUSE_KEY, '1')
+            telemetry = dict(available=False, buy_allowed=False, reason_code='DATA_UNAVAILABLE',
+                             error='Missing yesterday', last_success_at='2026-10-17T23:55:00+00:00')
+            with patch.object(grid_api.app.state, 'grid_bot', bot), \
+                    patch.object(grid_api, 'get_macro_status', return_value=telemetry) as read, \
+                    patch.object(bot, '_macro_trend_provider', side_effect=AssertionError('No fetch')):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=grid_api.app),
+                                             base_url='http://testserver') as client:
+                    payload = (await self.authenticated_status(client)).json()
+                self.assertTrue(payload['macro_buy_paused'])
+                self.assertEqual(payload['macro_buy_filter'], telemetry)
+                read.assert_called_once()
+
     async def test_status_reports_idle_and_halted_account_exposure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = GridDatabase(Path(directory) / "grid_testnet.sqlite")
@@ -348,14 +365,18 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(grid_api, "GridDatabase", return_value=database):
                     offline = await self.authenticated_status(client)
                 self.assertEqual(offline.json(), {
-            "strategy_version": "iteration2", "stop_mode": "fixed",
-            "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.8,
+            "strategy_version": "sma200-compressed-atr-v1", "stop_mode": "fixed",
+            "strategy_baseline_locked": False,
+            "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.4,
             "macro_trend_timeframe": "1d", "macro_trend_period": 200,
             "automatic_post_stop_restart": False,
+            "macro_buy_paused": False, "macro_buy_filter": None,
             "macro_sma": None, "macro_entry_block_reason": None,
                     "trading_environment": "TESTNET",
                     "status": "Offline", "pair": "BTC/USDT",
                     "safety_pause": "Normal", "pause_mode": None,
+                    "allocation_state": None, "allocation_pause_reason": None,
+                    "final_residual_buy_id": None,
                     "trading_state": "IDLE", "engine_status": "IDLE",
                     "engine_fault": None, "pending_grid": None,
                     "can_reset_liquidation": False,
@@ -461,14 +482,18 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "http://localhost:5173",
         )
         self.assertEqual(response.json(), {
-            "strategy_version": "iteration2", "stop_mode": "fixed",
-            "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.8,
+            "strategy_version": "sma200-compressed-atr-v1", "stop_mode": "fixed",
+            "strategy_baseline_locked": False,
+            "catastrophic_stop_gap_pct": 15, "minimum_grid_return_pct": 0.4,
             "macro_trend_timeframe": "1d", "macro_trend_period": 200,
             "automatic_post_stop_restart": False,
+            "macro_buy_paused": False, "macro_buy_filter": None,
             "macro_sma": None, "macro_entry_block_reason": None,
             "trading_environment": "TESTNET",
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "pause_mode": grid_settings.PAUSED_DOWNSIDE,
+            "allocation_state": None, "allocation_pause_reason": None,
+            "final_residual_buy_id": None,
             "trading_state": "ACTIVE", "engine_status": "RUNNING",
             "engine_fault": None, "pending_grid": None,
             "can_reset_liquidation": False,

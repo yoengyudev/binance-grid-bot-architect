@@ -9,6 +9,8 @@ from typing import Any, Optional, Tuple
 from pydantic import BaseModel, Field, FiniteFloat, StrictBool, StrictInt
 from exchange_handler import load_config
 from strategy_policy import catastrophic_stop
+from production_baseline import BASELINE_ID, validate_profile
+from trading_environment import get_trading_settings
 from settings import (
     MAX_LEVELS,
 )
@@ -124,10 +126,12 @@ class GridConfig:
     auto_center_percent: Optional[Decimal] = None
     buy_grid_levels: Optional[int] = None
     sell_grid_levels: Optional[int] = None
+    strategy_baseline: Optional[str] = None
 
     @classmethod
     def load(cls, path: Optional[Path] = None, *, preserve_stop: bool = False) -> "GridConfig":
         raw = load_config(path)
+        locked = validate_profile(raw, required=not get_trading_settings().sandbox)
         grid = raw["grid"]
         investment = _decimal(grid.get("investment_quote"), "investment_quote")
         lower = _decimal(grid.get("lower_price"), "lower_price")
@@ -160,7 +164,9 @@ class GridConfig:
         if width >= 100:
             raise ValueError("grid.auto_center_percent must be below 100.")
         return cls(raw["grid"]["symbol"], investment, lower, upper,
-                   spacing, inventory_percent, stop_loss, poll_seconds, width)
+                   spacing, inventory_percent, stop_loss, poll_seconds, width,
+                   3 if locked else None, 2 if locked else None,
+                   BASELINE_ID if locked else None)
 
     def fingerprint(self) -> str:
         parameters = {
@@ -175,6 +181,8 @@ class GridConfig:
         if self.buy_grid_levels is not None and self.sell_grid_levels is not None:
             parameters["buy_grid_levels"] = self.buy_grid_levels
             parameters["sell_grid_levels"] = self.sell_grid_levels
+        if self.strategy_baseline is not None:
+            parameters['strategy_baseline'] = self.strategy_baseline
         encoded = json.dumps(parameters, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
@@ -191,6 +199,8 @@ class GridConfig:
         if self.buy_grid_levels is not None and self.sell_grid_levels is not None:
             parameters["buy_grid_levels"] = self.buy_grid_levels
             parameters["sell_grid_levels"] = self.sell_grid_levels
+        if self.strategy_baseline is not None:
+            parameters['strategy_baseline'] = self.strategy_baseline
         encoded = json.dumps(parameters, sort_keys=True).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 

@@ -2,11 +2,14 @@
 
 Grid Master is a human-directed BTC/USDT grid-trading system for **Binance Spot**. A Python engine manages orders and persistent risk state; a FastAPI service exposes telemetry and authenticated controls; a React dashboard presents the account, grid, and market data. Telegram is an outbound alert channel only.
 
-**Iteration 2:** Daily SMA200 gates START and automatic re-anchors; rounded grid
-cycles require at least 0.8% gross spacing; new campaigns have a fixed stop 15%
-below the lower bound, with price trailing disabled. Liquidations require human
-review and manual START. See [the production policy](ITERATION2.md) for retained
-legacy floors, explicit tightening overrides and Testnet macro-data sourcing.
+**Selected production baseline:** `sma200-compressed-atr-v1` retains SMA200,
+uses a shortest adjacent gap of 0.5× closed 1h ATR with a 0.4% gross floor,
+3 BUY / 2 SELL lanes and 50% seed inventory. The strict allocation cap,
+one final residual BUY / persistent CAP_EXHAUSTED, fixed 15%-below-lower stop
+and manual recovery remain enforced. All RSI entry variants are rejected.
+See [the Mainnet checklist and exact configuration layout](MAINNET_DEPLOYMENT.md).
+Existing Testnet ledgers retain their saved bounds and tighter stop floors;
+historical simulator defaults remain unchanged for reproducibility.
 
 The [runtime Yahoo SMA200 BUY kill switch](MACRO_TREND.md) also suspends and
 cancels bot BUY limits when the latest completed `BTC-USD` daily close is not
@@ -233,7 +236,7 @@ Omit `--summary-only` to print every row in timestamp order. The bot did **not**
 
 ## Current limits and operational risks
 
-- The application is **Testnet-only** by configuration and exchange construction. A Mainnet rollout requires a separate review of exchange filters, liquidity, permissions, stop execution, and recovery under outages.
+- Mainnet routing is explicit and requires the locked profile, `--ready`, a reviewed grid and authenticated START. [The deployment checklist](MAINNET_DEPLOYMENT.md) records the required prospective Testnet and live host checks; retrospective results alone do not establish Mainnet readiness.
 - The Testnet WebSocket price in the header and the backend's polled Testnet ticker can differ briefly because they are separate feeds. The backend does not receive every tick, so stop and breakout decisions can lag fast markets.
 - Post-Only limits may be rejected at the spread; a lane can remain temporarily empty until a later safe cycle. Exchange precision and balances can change between validation and submission.
 - The order-book ratio is a top-50 snapshot, susceptible to rapidly changing or canceled displayed liquidity. It is not a predictor of future fills.

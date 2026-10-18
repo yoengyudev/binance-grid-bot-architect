@@ -1,12 +1,110 @@
 # Grid strategy backtest
 
-`backtest_grid.py` is standalone research code requiring only `pandas` and
-`ccxt` and the adjacent pure-math `grid_geometry.py` module shared with the engine.
+## Accepted residual BUY rule
+
+The live engine now allows one final residual BUY when a requested BUY LIMIT
+cannot fit the remaining total allocation. Use `--replacement-buy-policy residual`
+to model it. `fixed` remains the default historical comparison; it globally
+pauses and cancels BUYs on cap rejection. The earlier `budget_aware` experiment
+is **rejected for Live/Mainnet** and retained solely to reproduce its research.
+The live engine has no switch or configuration path for that rejected policy.
+
+The residual policy rounds the final base quantity down within remaining
+cost-cap room and validates both the BUY and conservative reverse SELL against
+exchange/bot minimums. It cannot spend an arbitrary final fraction smaller than
+a quantity increment. In the reproduced example, 82.8181102459 USDT of room at
+41,284.67 buys 0.00200 BTC (82.56934 USDT), rather than rounding up past the cap.
+
+After that final intent, enter persistent `CAP_EXHAUSTED`. If no valid residual
+can fit, enter it without placing an order. Keep previously accepted orders,
+including the final BUY, eligible to fill. Reconcile partial fills, place SELL
+protection and evaluate the stop while preventing all new BUYs and automatic
+re-anchors. SELL proceeds, macro recovery, process restart and STOP/START cannot
+release the latch. Only a successfully validated manual replacement/new campaign
+can release it. The initial reservation of a normally funded ladder does not
+itself trigger the latch; the trigger is the first underfunded new BUY request.
+
+The live latch commits atomically with its final order intent before HTTP. An
+uncertain response retains the original client ID and latch. Even a definitive
+Post-Only/balance rejection of that final attempt remains fail-closed pending
+manual review; it cannot open an alternate BUY or silently retry a larger order.
+Macro/stop/manual controls can still cancel accepted orders for their own reasons.
+The underlying allocation validator, cap tolerance, fee exclusions and legacy
+campaign cap flag are unchanged. `CAP_EXHAUSTED` is a separate durable allocation
+state, so liquidation and manual safety modes retain their normal priority.
+
+`walk_forward.py` and [WALK_FORWARD.md](WALK_FORWARD.md) provide the protected
+rolling validation pipeline. `atr_multiple`/`--atr-multiple` affects initial ATR
+proposals in research only; live ATR proposal settings remain unchanged.
+
+## Rejected budget-aware BUY sizing experiment
+
+`--replacement-buy-policy budget_aware` requires
+`--allocation-policy total_cost_cap` and is an archived research comparison.
+It must not be used for live execution or walk-forward parameter selection.
+
+During grid maintenance, the variant never increases a requested BUY quantity.
+It floors the quantity to the lesser of the requested amount, remaining cost-cap
+room, and free quote cash. Quote-denominated BUY fees are conservatively reserved
+for existing resting BUYs and the proposed BUY during sizing; the underlying
+cost-cap definition still excludes future fees. Both the reduced BUY and its
+post-commission, rounded reverse SELL must satisfy order minimums. If they cannot,
+only that lane waits for a later eligible maintenance cycle; peer orders are not
+canceled and the global sizing pause is not entered for this budget shortage.
+The existing macro, bounds, Post-Only and hard-stop rules still apply. Unknown or
+invalid sizing still fails through the existing validation paths.
+
+Seed budgets and initial/re-anchor planning keep their existing fixed allocation
+rules; this experiment does not dynamically shrink re-anchor plans, recycle
+retained dust, raise the budget, sell inventory to fit, or restart after a stop.
+Lane priority stays unchanged: upper-lane rebuys precede lower BUY lanes, so a
+small remaining budget can leave later lanes unfunded. A RUNNING state can still
+include macro BUY pauses and waiting lanes; it is not proof of continuous trading.
+
+Results record `replacement_buy_policy`, `budget_buy_resizes`,
+`budget_buy_deferrals` (distinct waiting episodes), and
+`budget_deferred_lanes_at_end`. Events identify resized, deferred and resumed
+lanes. Macro pauses, grid installations and terminal stops clear the set of
+currently waiting lanes. Add the research flag to a documented offline command,
+and choose a fresh `--output` directory to preserve the baseline.
+
+The paired historical experiment and independent accounting audit are preserved
+in `../artifacts/budget-aware-sizing-20261019/`. It uses previously inspected data
+and is not blind out-of-sample validation, WFO, or a production release.
+
+## Total allocation policy
+
+New runs default to `--allocation-policy total_cost_cap`, matching the live
+engine's policy for new campaigns. Before planning a campaign or re-anchor,
+and before placing each new BUY, tracked BTC purchase cost plus outstanding
+BUY notionals must fit within the campaign allocation (absolute tolerance
+0.000001 USDT). An initial proposal also reserves its seed quote budget.
+The cap excludes future fees, market-price appreciation and separately recorded
+dust/outside-wallet reserves. It is not a portfolio drawdown or market-value cap.
+Existing accepted orders still fill and are accounted; incurred quote fees can
+push cost above the cap and block subsequent BUYs.
+
+An over-cap re-anchor is deferred under the simulator's atomic replacement
+assumption, preserving the old grid and stop. An over-cap new BUY causes
+`SIZING_PAUSED`, cancelling BUYs while retaining existing SELL orders and
+hard-stop monitoring. No emergency sale or reduced order is invented to fit.
+Results report the allocation policy, cap-related pauses/deferrals, and ending
+position cost and BUY commitments. Partial-fill/cancel latency is not modeled.
+
+Use `--allocation-policy legacy_cash` to reproduce earlier cash-only sizing;
+this switch is independent of `--buy-trend-policy legacy`. Old studies may need
+both switches. The currently grandfathered Testnet campaign is not automatically
+converted by this research change. Offline simulations still begin with fresh
+cash; they are not replays of its carried inventory.
+
+`backtest_grid.py` is standalone research code using `pandas`, `ccxt`, and
+`yfinance` for public Yahoo downloads, plus the adjacent pure-math
+`grid_geometry.py` module shared with the engine. Offline replay does not import yfinance.
 It never imports the application, loads `.env`, accesses the live
 ledger, uses API credentials, or submits/cancels exchange orders.
 
 ```powershell
-python -m pip install "pandas>=2.2,<4" "ccxt>=4.5,<5"
+python -m pip install "pandas>=2.2,<4" "ccxt>=4.5,<5" "yfinance>=0.2.54,<2"
 python backtest_grid.py --months 12 --capital 500 --levels 8
 python backtest_grid.py --months 12 --capital 500 --levels 8 --stop-mode fixed --stop-gap-pct 15 --restart-after-stop --cooldown-hours 8
 ```
@@ -15,10 +113,14 @@ The default end is the most recent fully closed execution-candle boundary in UTC
 Binance **production Spot** history, not periodically reset Testnet history.
 Fills use **5-minute candles by default** (`--execution-timeframe 1m` is supported).
 ATR uses closed **1-hour candles** (`--indicator-timeframe 4h` is supported).
-The default trend filter is a separate **daily SMA200**. Select a daily SMA50
+The deployment trend filter is a separate Binance **daily SMA200**. Select a daily SMA50
 explicitly with `--trend-period 50`. ATR OHLCV is aggregated from execution data;
 daily trend OHLCV is fetched separately, including 200 preceding complete days.
-The two signals have independent UTC close/availability timestamps and are
+The default `--buy-trend-policy production` additionally reads **Yahoo BTC-USD**
+daily history. BUYs require its last completed daily close to be strictly above
+its own SMA200. This ongoing gate applies in all stop modes. A negative signal
+cancels BUYs and blocks replacements while preserving SELLs, inventory, and
+any enabled price stop. The signals have independent UTC availability timestamps and are
 forward-filled to execution opens; a forming candle supplies neither signal.
 At intrabar events, the most recent execution-open signal is retained until the
 next execution open. Partial macro buckets do not supply signals.
@@ -32,7 +134,7 @@ For reproducibility, specify `--start 2025-10-16T00:00:00Z --end 2026-10-16T00:0
 `--end` is exclusive. To replay the saved dataset without network calls:
 
 ```powershell
-python backtest_grid.py --csv backtest_results/btc_usdt_5m.csv --trend-csv backtest_results/btc_usdt_1d_trend.csv --start 2025-10-16T00:00:00Z --end 2026-10-16T00:00:00Z --stop-mode none --output replay_results
+python backtest_grid.py --csv backtest_results/btc_usdt_5m.csv --trend-csv backtest_results/btc_usdt_1d_trend.csv --buy-signal-csv backtest_results/btc_usd_1d_buy_signal.csv --start 2025-10-16T00:00:00Z --end 2026-10-16T00:00:00Z --output replay_results
 ```
 
 Use the actual start/end in `summary.json` for a downloaded default window.
@@ -45,6 +147,24 @@ Start/end must align to the execution timeframe; `--end` cannot include unfinish
 or future execution candles. `--execution-timeframe 1h` exists only for explicit
 legacy comparisons, not the default fine-resolution simulation.
 
+Production-policy offline replay also requires `--buy-signal-csv` with 200
+preceding Yahoo daily closes and coverage through yesterday for every test day.
+It accepts normalized OHLCV or older Yahoo `Open,High,Low,Close` CSVs with a
+`timestamp` column; missing volume defaults to zero because SMA uses only closes.
+Missing input never causes a silent Yahoo network call. `summary.json` records
+the selected policy and all three snapshot hashes. Input snapshots are preserved.
+
+Use **`--buy-trend-policy legacy`** explicitly to reproduce earlier research:
+fixed/trailing modes use entry-only Binance gating; no-stop mode cancels BUYs
+on intrabar modeled-price crossings of the selected Binance SMA. Legacy mode
+does not use Yahoo and needs no BUY-signal CSV. Library `Config` also defaults
+to production; `GridBacktest.run()` receives Yahoo candles as `buy_signal_frame`.
+
+In production policy, a macro-off interval invalidates the four-hour breakout
+timer. Halted campaigns do not count as actively BUY-paused or accumulate
+blocked-entry bars unless research restarts are enabled. `--no-trend-filter`
+explicitly disables both gates for an ablation.
+
 ## Iteration 2 defaults and research comparisons
 
 The default is **Daily SMA200 + at least 0.8% gross grid spacing + fixed 15%
@@ -54,12 +174,12 @@ The script itself never changes the live engine or deploys software.
 
 - **Explicit no-stop research comparison:** `--stop-mode none` disables all price-stop
   liquidation and stop ratcheting. The stop is `None`, including on re-anchor.
-  At or below the last closed Daily SMA200, cancel resting BUY limits and block
-  new BUY placements. Retain BTC quantity/cost and existing SELL limits; SELL
-  fills continue. Resume eligible BUY lanes only when modeled price is strictly
-  above the SMA, still respecting grid bounds, funding and Post-Only constraints.
+  The selected ongoing BUY policy still applies. Retain BTC quantity/cost and
+  existing SELL limits; SELL fills continue. Resume BUY lanes only when that
+  policy approves, respecting bounds, funding and Post-Only constraints.
   A new daily signal can pause BUYs even without a price change. Threshold crossings
-  are processed inside each declared OHLC path, not just at execution-bar closes.
+  are processed inside each OHLC path in legacy mode; production policy uses
+  completed-day Yahoo signals.
   Opening gaps can fill previously resting BUYs before cancellation takes effect.
   Pausing does not move the grid or guarantee that SELL prices will be reached.
 - **Daily SMA200 gate:** initial activation, automatic restart and breakout
@@ -73,9 +193,9 @@ The script itself never changes the live engine or deploys software.
   Set `--cooldown-hours 4` or `12` to study alternative predeclared policies.
 - In fixed/trailing modes, a blocked breakout re-anchor preserves existing orders and risk monitoring;
   only the explicit legacy trailing mode ratchets a floor with price.
-  The trend filter does not liquidate an existing run just because price dips
-  below the SMA, nor does it gate each normal replacement fill. These comparison
-  modes retain the earlier entry-only SMA policy for reproducibility.
+  The production BUY gate can cancel BUYs while retaining SELLs and risk
+  monitoring. Only explicit legacy fixed/trailing modes retain the earlier
+  entry-only SMA policy for reproducibility.
 - Restarts still require `--restart-after-stop`. Without it a hard stop remains
   halted, matching the production manual-recovery workflow. Automatic restart
   and its cooldown are research-only; a crash requires human review in production.
@@ -91,14 +211,13 @@ to `max(previous_stop, floor_to_tick(new_lower * 0.85))`; it never lowers the
 existing protection. A rejected proposal cannot alter the current stop. A new
 post-liquidation campaign uses its newly calculated lower bound and stop.
 The wider stop allows larger individual losses; fewer stop events is not itself
-evidence of higher expected return. Entry filtering does not liquidate existing
-positions or suppress their normal replacements when price later crosses below
-the SMA. Risk remains until the catastrophic stop or normal grid sales.
+evidence of higher expected return. A negative Yahoo daily signal suspends BUYs;
+inventory risk remains until the catastrophic stop or normal grid sales.
 
 To reproduce the former research policy explicitly:
 
 ```powershell
-python backtest_grid.py --months 12 --restart-after-stop --trend-timeframe 1h --trend-period 50 --stop-mode trailing --stop-gap-pct 2
+python backtest_grid.py --buy-trend-policy legacy --months 12 --restart-after-stop --trend-timeframe 1h --trend-period 50 --stop-mode trailing --stop-gap-pct 2
 ```
 
 `--stop-mode trailing` retains the previous absolute-distance ratchet and
@@ -208,6 +327,11 @@ from OHLC candles alone. Each candle is split into three equal-time monotonic
 segments (100 seconds for 5m, 20 seconds for 1m); event times are interpolated,
 not observed trades. A true production replay requires trades/ticks
 and the recorded configuration/decision timeline.
+
+Yahoo daily signals are assumed available at UTC midnight after candle close.
+Publication lag, stale caches and provider outages are not reconstructed from
+historical OHLC. Live START can initialize and wait for a permitted seed; the
+research model waits for both gates before its initial seed deployment.
 
 Opening gaps fill already marketable resting limits first at their limit prices,
 then apply the stop at the available open, not the old trigger price. This

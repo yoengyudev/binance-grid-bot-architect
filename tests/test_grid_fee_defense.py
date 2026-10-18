@@ -46,7 +46,7 @@ class FeeDefenseTests(unittest.TestCase):
             validate_grid_returns(D(100), [D('99.20')], [D('100.79')])
 
     def test_simulator_atr_widens_and_places_only_defended_pairs(self):
-        config = Config(stop_mode='fixed')
+        config = Config(stop_mode='fixed', trend_filter=False)
         low, high, stop = atr_bounds(D('81260'), D(20), config)
         self.assertLess(stop, low)
         self.assertGreater(high - D('81260'), D(40))

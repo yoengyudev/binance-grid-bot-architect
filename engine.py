@@ -17,9 +17,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import ccxt
 from fastapi import status
 from database import GridDatabase
-from exchange_handler import CircuitOpenError, check_exchange_circuit, config_path, exchange_retry_delay, exchange_write_attempts, load_config, network_backoff
+from exchange_handler import CircuitOpenError, check_exchange_circuit, config_path, exchange_request, exchange_retry_delay, exchange_write_attempts, load_config, network_backoff
 from execution_history import ExecutionHistoryPending, verified_execution_order
 from dashboard_reads import DashboardReads
+from allocation import tracked_position_cost, pending_buy_commitment, require_total_cap
+from budget_policy import CAP_EXHAUSTED, CAP_STATE_KEY, CAP_REASON_KEY, CAP_ORDER_KEY, residual_quantity
 from stop_controller import StopController
 from notifier import TelegramNotifier, markdown_text, schedule_telegram_alert
 from settings import (
@@ -38,6 +40,7 @@ from settings import (
     GHOST_ORDER_ALARM_KEY,
     LAST_EXCHANGE_AUDIT_TIME_KEY,
     LAST_MARKET_PRICE_KEY,
+    LAST_MARKET_PRICE_TIME_KEY,
     LIQUIDATED,
     LIQUIDATING,
     LIQUIDATION_ALARM_KEY,
@@ -93,7 +96,9 @@ from portfolio import (
     _pnl_fee_in_quote,
     _portfolio_wallet,
 )
-from grid_geometry import MIN_GRID_RETURN, defended_bounds, validate_grid_returns
+from grid_geometry import defended_bounds, validate_grid_returns
+from production_baseline import (BASELINE_ID, MIN_GRID_RETURN, compressed_bounds,
+                                 closed_hourly_atr)
 from strategy_policy import STRATEGY_VERSION, catastrophic_stop, closed_daily_sma, DAILY_MS
 from macro_trend import get_macro_trend
 
@@ -164,6 +169,11 @@ class GridBot:
                  *, runner_token: Optional[str] = None, macro_exchange: Any = None,
                  macro_trend_provider: Any = None) -> None:
         self.config = config
+        if config.strategy_baseline is not None and (
+                config.strategy_baseline != BASELINE_ID or config.symbol != 'BTC/USDT'
+                or config.buy_grid_levels != 3 or config.sell_grid_levels != 2
+                or config.initial_inventory_percent != 50):
+            raise ValueError('Locked baseline requires BTC/USDT, 3 BUY / 2 SELL lanes and 50% seed.')
         self.exchange = exchange
         self.macro_exchange = macro_exchange if macro_exchange is not None else exchange
         self.macro_sma: Optional[Decimal] = None
@@ -411,6 +421,25 @@ class GridBot:
                 LOGGER.critical(message, exc_info=True)
                 raise TradingHalt(message) from error
 
+    def _assert_locked_proposal(self, center, width_percent, levels):
+        """Validate reviewed bounds; never silently substitute a different grid."""
+        if self.config.strategy_baseline is None:
+            return
+        if levels != 5:
+            raise ValueError('Locked production baseline requires exactly 5 total levels.')
+        self._load_market_for_engine_control()
+        filters = (self.market.get('info') or {}).get('filters') or []
+        tick = next((Decimal(str(f['tickSize'])) for f in filters
+                     if f.get('filterType') == 'PRICE_FILTER'), Decimal('.01'))
+        with self.exchange_lock:
+            candles = self._call(self.exchange.fetch_ohlcv,self.config.symbol,'1h',None,16)
+        atr,_,_ = closed_hourly_atr(candles,int(time.time()*1000))
+        lower,upper = compressed_bounds(center,atr,tick=tick,round_price=self._price)
+        proposed = self._price(center*(1+width_percent/100))
+        # At most two ticks of transport/float defense may widen a reviewed draft.
+        if not self._price(upper) <= proposed <= self._price(upper)+2*tick:
+            raise ValueError('Locked 0.5x ATR / 0.4% grid differs from this draft. Calculate Grid again using current closed 1h ATR.')
+
     def request_initial_grid(self, center_text: str, width_text: str,
                              stop_distance_text: str, capital_text: str,
                              grid_levels: int) -> Tuple[Decimal, Decimal]:
@@ -419,6 +448,7 @@ class GridBot:
         width_percent = _decimal(width_text, "width_percentage")
         stop_distance = _decimal(stop_distance_text, "stop_loss_percentage")
         capital = _decimal(capital_text, "allocated_capital")
+        self._assert_locked_proposal(center,width_percent,grid_levels)
         if width_percent >= 100 or stop_distance >= 100:
             raise ValueError("Grid width and stop-loss distance must be below 100%.")
         if (isinstance(grid_levels, bool) or not isinstance(grid_levels, int) or
@@ -463,6 +493,7 @@ class GridBot:
             if not center / ratio < current < center * ratio:
                 raise ValueError("Center must be close to the live market price.")
             self._validate_nominal_grid_sizes(candidate, center, buys, sells)
+            self._validate_total_grid_allocation(candidate, center, Decimal(0))
             lowers, uppers = self._validate_reset_grid(candidate, center, Decimal(0))
             baseline = self._free_balance(self.market["base"])
             run = {"anchor": str(center), "baseline_base": str(baseline),
@@ -476,6 +507,7 @@ class GridBot:
             trailing = {"high_water_mark": str(center),
                         "stop_loss_distance": str(center - stop)}
             request = {"phase": "placing", "source": "manual_initial",
+                       "total_allocation_cap": True,
                        "lower": str(lower), "upper": str(upper),
                        "spacing": str(candidate.spacing_percent),
                        "investment_quote": str(capital),
@@ -489,6 +521,8 @@ class GridBot:
                     breakout_width_percent=str(width_percent),
                     trailing_stop=json.dumps(trailing, sort_keys=True),
                 )
+                self.database.set_state('total_allocation_cap', '1')
+                self._clear_cap_exhaustion()
                 if self.ready_mode:
                     self.database.set_state(ENGINE_STATUS_KEY, ENGINE_IDLE,
                                             trigger_event='INITIAL_GRID_SAVED')
@@ -945,6 +979,8 @@ class GridBot:
         return stop_loss
 
     def request_grid_reset(self, lower_text: str, upper_text: str) -> None:
+        if self.config.strategy_baseline is not None:
+            raise ValueError('Locked baseline requires the reviewed ATR recenter workflow.')
         lower = _decimal(lower_text, "lower_price")
         upper = _decimal(upper_text, "upper_price")
         if not self.config.stop_loss_price < lower < upper:
@@ -977,6 +1013,7 @@ class GridBot:
         """Queue a persisted reset with explicit bounds and optional pause trigger."""
         center = _decimal(center_text, "center_price")
         width_percent = _decimal(width_text, "width_percentage")
+        self._assert_locked_proposal(center,width_percent,grid_levels or 5)
         if width_percent >= 100:
             raise ValueError("Width must be below 100%.")
         width = width_percent / 100
@@ -1058,6 +1095,8 @@ class GridBot:
                     candidate, center, candidate_buys, candidate_sells,
                     carry_amount=self._bot_base_exposure(),
                 )
+                self._validate_total_grid_allocation(candidate, center,
+                                                     tracked_position_cost(self.database))
                 price = self._ticker_price()
                 self.advance_trailing_stop(price)
                 if (requested_stop is not None and
@@ -1078,6 +1117,7 @@ class GridBot:
                 request = {
                     "phase": "canceling", "source": "manual_recenter",
                     "center_price": str(center),
+                    "total_allocation_cap": True,
                     "width_percent": str(width_percent),
                     "lower": str(lower), "upper": str(upper),
                     "spacing": str(self.config.spacing_percent),
@@ -1175,6 +1215,7 @@ class GridBot:
         if not stop_loss < lower or not self._within_grid_bounds(price, candidate, strict=True):
             raise ValueError("New hard stop and bounds must contain the live price.")
         new_config = replace(candidate, stop_loss_price=stop_loss)
+        self._validate_total_grid_allocation(new_config, center, Decimal(0))
         lowers, uppers = self._validate_reset_grid(new_config, center, Decimal(0))
         baseline = self._free_balance(self.market["base"])
         run = {"anchor": str(center), "baseline_base": str(baseline),
@@ -1189,6 +1230,7 @@ class GridBot:
         trailing = {"high_water_mark": str(center),
                     "stop_loss_distance": str(center - stop_loss)}
         request = {"phase": "placing", "source": "manual_liquidation_reset",
+                   "total_allocation_cap": True,
                    "center_price": str(center), "stop_loss_price": str(stop_loss),
                    "lower": str(lower), "upper": str(upper),
                    "spacing": str(new_config.spacing_percent),
@@ -1205,6 +1247,8 @@ class GridBot:
                 trailing_stop=json.dumps(trailing, sort_keys=True),
                 clear_liquidation_state=True,
             )
+            self.database.set_state('total_allocation_cap', '1')
+            self._clear_cap_exhaustion()
             self.database.clear_state(LIQUIDATION_ALARM_KEY)
             self.database.clear_state(BREAKOUT_TIMER_KEY)
             if self.ready_mode:
@@ -1234,7 +1278,7 @@ class GridBot:
         tick = next((Decimal(str(f['tickSize'])) for f in filters
                      if f.get('filterType') == 'PRICE_FILTER'), Decimal('0.01'))
         lower, upper = defended_bounds(price, price * width_percent / 100, nb, ns,
-                                       tick=tick, round_price=self._price)
+                                       minimum=MIN_GRID_RETURN,tick=tick, round_price=self._price)
         candidate = replace(self.config, lower_price=lower, upper_price=upper,
                             stop_loss_price=max(self.config.stop_loss_price,
                                                 self._fixed_catastrophic_stop(lower)))
@@ -1274,7 +1318,7 @@ class GridBot:
 
     def _request_breakout_reset(self, price: Decimal) -> None:
         """Persist a macro-approved reset intent before any cancellation begins."""
-        if not self._macro_buys_allowed():
+        if self._cap_exhausted() or not self._macro_buys_allowed():
             return  # Yahoo BUY pause never cancels protective SELLs for a rebuild.
         if not self._macro_entry_allowed(price):
             return  # Preserve existing orders and hard-stop monitoring.
@@ -1303,7 +1347,7 @@ class GridBot:
     def _observe_upper_breakout(self, price: Decimal, *, now: Optional[float] = None,
                                 bot_btc_balance: Optional[Decimal] = None) -> bool:
         """Require four hours of uninterrupted above-bound observations."""
-        if (self.is_paused or self.grid_needs_reset or
+        if (self._cap_exhausted() or self.is_paused or self.grid_needs_reset or
                 self._compare_grid_prices(price, self.config.upper_price) <= 0):
             self.database.clear_state(BREAKOUT_TIMER_KEY)
             return False
@@ -1352,7 +1396,7 @@ class GridBot:
                     self.assert_runner_lease()
                     check_exchange_circuit(self.exchange)
                     try:
-                        return method(*args)
+                        return exchange_request(method, *args)
                     finally:
                         if not readable:
                             self.invalidate_dashboard_reads()
@@ -1514,13 +1558,19 @@ class GridBot:
     def prepare(
         self, *, persist: bool
     ) -> Tuple[Decimal, List[Tuple[int, Decimal, Decimal]], List[Tuple[int, Decimal, Decimal]]]:
+        with self._cycle_lock:
+            return self._prepare_locked(persist=persist)
+
+    def _prepare_locked(self, *, persist: bool):
         self._call(self.exchange.load_markets)
         self.market = self.exchange.market(self.config.symbol)
         if not self.market.get("spot") or self.market.get("active") is False:
             raise TradingHalt("Configured symbol is not an active Spot market.")
         current_price = self._ticker_price()
         if persist:
-            self.database.set_state(LAST_MARKET_PRICE_KEY, str(current_price))
+            with self.database.transaction():
+                self.database.set_state(LAST_MARKET_PRICE_KEY, str(current_price))
+                self.database.set_state(LAST_MARKET_PRICE_TIME_KEY, datetime.now(timezone.utc).isoformat())
 
         saved = self.database.get_state("grid_run")
         if saved:
@@ -1609,6 +1659,13 @@ class GridBot:
 
     def _seed_quote(self) -> Decimal:
         return self.config.investment_quote * self.config.initial_inventory_percent / 100
+
+    def _validate_total_grid_allocation(self, config, center, position_cost):
+        buys, _ = configured_grid_levels(center, config)
+        commitment = self._required_buy_limit_quote(config, buys, config.stop_loss_price)
+        if position_cost == 0:
+            commitment += config.investment_quote * config.initial_inventory_percent / 100
+        require_total_cap(config, position_cost, commitment)
 
     def _lower_quote_per_level(self) -> Decimal:
         lower_budget = self.config.investment_quote - self._seed_quote()
@@ -1940,7 +1997,7 @@ class GridBot:
     def _submit_order(
         self, level: int, side: str, price: Decimal, amount: Decimal,
         *, parent_order_id: Optional[str] = None, order_type: str = "LIMIT",
-        quote_cost: Optional[Decimal] = None,
+        quote_cost: Optional[Decimal] = None, final_residual: bool = False,
     ) -> Optional[str]:
         if self.database.in_transaction:
             raise RuntimeError("Order intents must commit before exchange submission.")
@@ -1949,18 +2006,34 @@ class GridBot:
             self.assert_runner_lease()
             if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
                 raise TradingHalt('Risk exit verification is pending; new grid orders are blocked.')
+            if side == 'BUY' and self._cap_exhausted():
+                return None
             if side == 'BUY' and not self._macro_buys_allowed():
                 self._set_macro_buy_pause(True)
                 return None  # No durable intent or exchange write, including seed MARKET BUY.
+            if side == 'BUY' and self.database.get_state('total_allocation_cap') == '1':
+                if order_type == 'MARKET' and quote_cost is None:
+                    raise TradingHalt('A capped MARKET BUY requires an explicit quote budget.')
+                proposed = quote_cost if quote_cost is not None else price * amount
+                require_total_cap(self.config, tracked_position_cost(self.database),
+                                  pending_buy_commitment(self.database) + proposed)
             check_exchange_circuit(self.exchange)
             liquidation = order_type == "MARKET" and side == "SELL" and level == -1
             if self.stop_controller.stop_requested.is_set() and not liquidation:
                 raise TradingHalt("Stop was requested before order submission.")
-            self.database.insert_order(
-                client_id, level, side, price, amount,
-                client_order_id=client_id, parent_order_id=parent_order_id,
-                order_type=order_type,
-            )
+            if final_residual and (side != 'BUY' or order_type != 'LIMIT' or
+                                   self.database.get_state('total_allocation_cap') != '1'):
+                raise TradingHalt('A final residual must be a capped BUY LIMIT.')
+            # The latch and intent commit together BEFORE HTTP. An uncertain
+            # response or restart must never reopen BUYs after this final attempt.
+            with self.database.transaction():
+                self.database.insert_order(
+                    client_id, level, side, price, amount,
+                    client_order_id=client_id, parent_order_id=parent_order_id,
+                    order_type=order_type,
+                )
+                if final_residual:
+                    self._exhaust_cap(client_id, 'Final residual BUY reserved; new BUYs require a reviewed new grid.')
             previous_write_attempts = exchange_write_attempts(self.exchange)
             try:
                 self.assert_runner_lease()
@@ -1969,7 +2042,7 @@ class GridBot:
                     params["timeInForce"] = "PO"
                 if quote_cost is not None:
                     params["quoteOrderQty"] = str(quote_cost)
-                response = self.exchange.create_order(
+                response = exchange_request(self.exchange.create_order,
                     self.config.symbol, order_type.lower(), side.lower(), float(amount),
                     float(price) if order_type == "LIMIT" else None,
                     params,
@@ -2194,6 +2267,8 @@ class GridBot:
         return amounts[level] if amounts is not None else None
 
     def _place_buy(self, level: int, parent_order_id: Optional[str]) -> None:
+        if self._cap_exhausted():
+            return
         if level > 0:
             price = self._price(self.levels[level - 1])
             amount = self._amount(self._lower_quote_per_level() / price)
@@ -2210,6 +2285,20 @@ class GridBot:
         if price <= self.config.stop_loss_price:
             return  # Never create a BUY at or beneath the liquidation floor.
         self._check_order_size(price, amount)
+        final_residual = False
+        if self.database.get_state('total_allocation_cap') == '1':
+            room = (self.config.investment_quote - tracked_position_cost(self.database)
+                    - pending_buy_commitment(self.database))
+            if price * amount > room:
+                amount = residual_quantity(amount, price, room, self._amount)
+                try:
+                    self._check_order_size(price, amount)
+                    reverse = self._amount(amount * (1 - SELL_AMOUNT_BUFFER))
+                    self._check_order_size(self._paired_sell_price({'level': level}), reverse)
+                except GridSizingError:
+                    self._exhaust_cap(None, 'Remaining allocation cannot fund a valid final BUY and reverse SELL.')
+                    return
+                final_residual = True
         available_quote = self._free_balance(self.market["quote"])
         if available_quote < price * amount:
             LOGGER.info(
@@ -2218,7 +2307,27 @@ class GridBot:
             )
             return
         if not self.stop_controller.stop_requested.is_set():
-            self._submit_order(level, "BUY", price, amount, parent_order_id=parent_order_id)
+            self._submit_order(level, "BUY", price, amount, parent_order_id=parent_order_id,
+                               final_residual=final_residual)
+
+    def _cap_exhausted(self) -> bool:
+        state = self.database.get_state(CAP_STATE_KEY)
+        if state not in (None, CAP_EXHAUSTED):
+            raise TradingHalt('Unknown saved allocation BUY state; manual review required.')
+        return state == CAP_EXHAUSTED
+
+    def _exhaust_cap(self, order_id: Optional[str], reason: str) -> None:
+        with self.database.transaction():
+            self.database.set_state(CAP_STATE_KEY, CAP_EXHAUSTED, trigger_event='ALLOCATION_EXHAUSTED')
+            self.database.set_state(CAP_REASON_KEY, reason)
+            if order_id:
+                self.database.set_state(CAP_ORDER_KEY, order_id)
+            self.database.clear_state(BREAKOUT_TIMER_KEY)
+        self.invalidate_dashboard_reads()
+
+    def _clear_cap_exhaustion(self) -> None:
+        for key in (CAP_STATE_KEY, CAP_REASON_KEY, CAP_ORDER_KEY):
+            self.database.clear_state(key)
 
     def _place_sell(self, row: Dict[str, Any]) -> None:
         buy = self._fetch_order(row)
@@ -2517,6 +2626,10 @@ class GridBot:
             self.grid_needs_reset = False
             return False
         request = json.loads(request_text)
+        if self._cap_exhausted() and request.get('phase') == 'canceling' and request.get('source') not in (
+                'manual_recenter', 'manual_initial', 'manual_liquidation_reset'):
+            self.run_cycle()
+            return False
         if self.stop_controller.stop_requested.is_set():
             raise TradingHalt("Stop requested during grid reset.")
         if not self._macro_buys_allowed():
@@ -2670,6 +2783,10 @@ class GridBot:
             if not self._within_grid_bounds(price, new_config, strict=True):
                 raise TradingHalt("Price left the requested bounds during reset.")
             try:
+                capped = (request.get('total_allocation_cap') is True or
+                          self.database.get_state('total_allocation_cap') == '1')
+                if capped:
+                    self._validate_total_grid_allocation(new_config, anchor, carry_cost)
                 lowers, uppers = self._validate_reset_grid(new_config, anchor, carry_amount)
                 if resuming:
                     self._validate_recovery_sell_prices(uppers, carry_amount, carry_cost)
@@ -2726,6 +2843,10 @@ class GridBot:
                     trailing_stop=(json.dumps(trailing, sort_keys=True)
                                    if trailing is not None else None),
                 )
+                if capped:
+                    self.database.set_state('total_allocation_cap', '1')
+                if request.get('source') == 'manual_recenter':
+                    self._clear_cap_exhaustion()
                 if release_sizing_pause:
                     self.database.clear_state(SAFETY_MODE_KEY)
                     self.database.clear_state(SIZING_PAUSE_REASON_KEY)
@@ -2756,7 +2877,7 @@ class GridBot:
             return False  # Also covers fresh grids saved directly in placing phase.
         for _ in range(3):
             self.run_cycle()
-            if self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING:
+            if self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING or self._cap_exhausted():
                 self.database.clear_state("grid_reset")
                 self.pending_grid_bounds = None
                 self.grid_needs_reset = False
@@ -3600,6 +3721,9 @@ class GridBot:
                         LIQUIDATION_HALTED):
                 raise TradingHalt(f"Cannot start while safety mode is {mode}.")
             pending_text = self.database.get_state("grid_reset")
+            if self._cap_exhausted() and (not pending_text or
+                    json.loads(pending_text).get('source') != 'manual_recenter'):
+                raise TradingHalt('CAP_EXHAUSTED requires a reviewed manual grid re-anchor; START cannot release it.')
             if self.grid_needs_reset and not pending_text:
                 raise TradingHalt("A pending grid is missing from SQLite; manual review required.")
             if pending_grid_token and not pending_text:
@@ -3612,6 +3736,24 @@ class GridBot:
                         "Review the saved pending grid before START. Refresh the dashboard "
                         "and confirm its exact settings."
                     )
+            capped_pending = json.loads(pending_text) if pending_text else {}
+            reviewed_anchor = self.anchor
+            if reviewed_anchor is None:
+                reviewed_anchor = Decimal(json.loads(self.database.get_state('grid_run'))['anchor'])
+            if capped_pending.get('total_allocation_cap') is True:
+                candidate = replace(self.config,
+                    investment_quote=Decimal(capped_pending.get('investment_quote', str(self.config.investment_quote))),
+                    lower_price=Decimal(capped_pending['lower']), upper_price=Decimal(capped_pending['upper']),
+                    buy_grid_levels=capped_pending.get('buy_levels', self.config.buy_grid_levels),
+                    sell_grid_levels=capped_pending.get('sell_levels', self.config.sell_grid_levels))
+                center = Decimal(capped_pending.get('center_price', str(reviewed_anchor)))
+                self._validate_total_grid_allocation(candidate, center, tracked_position_cost(self.database))
+            elif self.database.get_state('total_allocation_cap') == '1':
+                cost = tracked_position_cost(self.database)
+                if state['resumable']:
+                    require_total_cap(self.config, cost, pending_buy_commitment(self.database))
+                else:
+                    self._validate_total_grid_allocation(self.config, reviewed_anchor, cost)
             unhedged = state["unhedged_btc"]
             if unhedged:
                 if not auto_cover_inventory:
@@ -3796,7 +3938,9 @@ class GridBot:
             self._liquidate_locked(self.config.stop_loss_price)
             return []
         current_price = self._ticker_price()
-        self.database.set_state(LAST_MARKET_PRICE_KEY, str(current_price))
+        with self.database.transaction():
+            self.database.set_state(LAST_MARKET_PRICE_KEY, str(current_price))
+            self.database.set_state(LAST_MARKET_PRICE_TIME_KEY, datetime.now(timezone.utc).isoformat())
         if mode in (LIQUIDATED, LIQUIDATION_HALTED):
             return []
         events: List[Tuple[str, Tuple[str, ...]]] = []
@@ -3890,7 +4034,7 @@ class GridBot:
         if seed_row is None:
             if cover_text:
                 raise TradingHalt("Inventory cover has no saved seed lot; manual review required.")
-            if (macro_buys_allowed and not self.is_paused and self._within_grid_bounds(current_price)
+            if (macro_buys_allowed and not self._cap_exhausted() and not self.is_paused and self._within_grid_bounds(current_price)
                     and current_price > self.config.stop_loss_price):
                 self._check_grid_buy_capital(
                     self.config, self.levels, self.config.stop_loss_price,
@@ -3905,7 +4049,7 @@ class GridBot:
 
         latest = self.database.fetch_latest_orders_by_level()
         in_bounds = (
-            macro_buys_allowed and not self.is_paused and not cover_text and
+            macro_buys_allowed and not self._cap_exhausted() and not self.is_paused and not cover_text and
             self._within_grid_bounds(current_price)
         )
         if in_bounds and all(

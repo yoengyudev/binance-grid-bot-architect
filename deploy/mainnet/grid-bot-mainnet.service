@@ -1,0 +1,25 @@
+[Unit]
+Description=Locked SMA200 compressed ATR Binance Spot bot (Mainnet)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=gridbot
+Group=gridbot
+WorkingDirectory=/opt/grid-bot/current/binance-grid-bot-architect
+EnvironmentFile=/etc/grid-bot/mainnet.env
+ExecStart=/opt/grid-bot/current/binance-grid-bot-architect/.venv/bin/python /opt/grid-bot/current/binance-grid-bot-architect/main.py --ready
+Restart=on-failure
+RestartSec=60s
+RestartPreventExitStatus=2 130
+TimeoutStopSec=60s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

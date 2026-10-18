@@ -12,7 +12,7 @@ from tests.test_daily_macro_backtest import daily_history
 
 class NoStopBacktestTests(unittest.TestCase):
     def bot(self):
-        bot = GridBacktest(Config(stop_mode='none'))
+        bot = GridBacktest(Config(stop_mode='none', buy_trend_policy='legacy'))
         bot.macro_sma = D(99)
         bot.start_grid(START, D(100), D(1))
         return bot
@@ -111,7 +111,7 @@ class NoStopBacktestTests(unittest.TestCase):
 
     def test_unsold_losses_reduce_ending_equity_even_with_zero_realized_loss(self):
         frame = fine_candles([[101, 101, 70, 70, 1]])
-        bot = GridBacktest(Config(stop_mode='none'))
+        bot = GridBacktest(Config(stop_mode='none', buy_trend_policy='legacy'))
         result = bot.run(frame, START, START + pd.Timedelta(minutes=5), trend_frame=daily_history())
         self.assertEqual(result['total_realized_pnl'], 0)
         self.assertLess(result['unrealized_pnl'], 0)
@@ -123,7 +123,7 @@ class NoStopBacktestTests(unittest.TestCase):
         self.assertTrue(all(mark['hard_stop'] is None for mark in bot.curve))
 
     def test_stop_comparison_modes_keep_previous_entry_only_sma_behavior(self):
-        bot = GridBacktest(Config(stop_mode='fixed'))
+        bot = GridBacktest(Config(stop_mode='fixed', buy_trend_policy='legacy'))
         bot.macro_sma = D(99)
         bot.start_grid(START, D(100), D(1))
         buys = {key: o for key, o in bot.orders.items() if o.side == 'BUY'}

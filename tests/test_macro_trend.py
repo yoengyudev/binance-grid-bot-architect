@@ -44,11 +44,23 @@ class YahooDataTests(unittest.TestCase):
         result = fetch_macro_trend(now=NOW, download=download)
         args, kwargs = download.call_args
         self.assertEqual(args, ('BTC-USD',))
-        self.assertEqual(pd.Timestamp(kwargs['end']) - pd.Timestamp(kwargs['start']), pd.Timedelta(days=250))
-        self.assertEqual(kwargs['end'], '2026-10-17')
+        self.assertEqual(NOW.normalize() - pd.Timestamp(kwargs['start'], tz='UTC'), pd.Timedelta(days=250))
+        self.assertEqual(pd.Timestamp(kwargs['end']), NOW)
         self.assertEqual((kwargs['interval'], kwargs['timeout'], kwargs['threads']), ('1d', 10, False))
         self.assertFalse(kwargs['auto_adjust'])
         self.assertEqual(result.candle_day, '2026-10-16')
+
+    def test_live_ended_fetch_bypasses_cached_incomplete_historical_response(self):
+        cached = history(101).iloc[:-1]
+        requests = []
+        def download(*args, **kwargs):
+            end = pd.Timestamp(kwargs['end'])
+            requests.append(end)
+            # Model yfinance's historical-cache selection, not its private API.
+            return cached if end + pd.Timedelta(minutes=30) <= NOW else history(101)
+        result = fetch_macro_trend(now=NOW, download=download)
+        self.assertTrue(result.uptrend)
+        self.assertEqual(requests, [NOW])
 
     def test_single_ticker_multiindex_and_flat_columns_agree(self):
         flat = history(101)
@@ -89,6 +101,70 @@ class MonitorTests(unittest.TestCase):
         self.fetch.assert_not_called()
         self.jobs.pop()()
         self.assertTrue(monitor.get_macro_trend())
+
+    def test_status_is_read_only_and_reports_missing_then_fresh_then_stale(self):
+        monitor = self.monitor()
+        self.assertEqual(monitor.status()['reason_code'], 'DATA_UNAVAILABLE')
+        self.assertEqual(self.jobs, [])
+        monitor.get_macro_trend(); self.jobs.pop()()
+        status = monitor.status()
+        self.assertTrue(status['available'])
+        self.assertTrue(status['buy_allowed'])
+        self.assertEqual(status['last_success_at'], self.utc.isoformat())
+        self.now = 901
+        self.assertEqual(monitor.status()['reason_code'], 'DATA_STALE')
+        self.assertEqual(self.jobs, [])  # Telemetry cannot start a download.
+
+    def test_failed_refresh_retains_last_success_time_and_exposes_error(self):
+        monitor = self.monitor()
+        monitor.get_macro_trend(); self.jobs.pop()()
+        success = monitor.status()['last_success_at']
+        self.now = 300
+        self.utc = (NOW + pd.Timedelta(minutes=5)).to_pydatetime()
+        self.fetch.side_effect = ValueError('Missing daily close')
+        monitor.get_macro_trend(); self.jobs.pop()()
+        status = monitor.status()
+        self.assertFalse(status['available'])
+        self.assertFalse(status['buy_allowed'])
+        self.assertEqual(status['last_success_at'], success)
+        self.assertEqual(status['last_attempt_at'], self.utc.isoformat())
+        self.assertIn('Missing daily close', status['error'])
+
+    def test_late_daily_publication_retries_fresh_request_and_recovers(self):
+        monitor = self.monitor()
+        published = False
+        requests = []
+        def download(*args, **kwargs):
+            requests.append(kwargs['end'])
+            return history(101) if published else history(101).iloc[:-1]
+        monitor.fetch = lambda: fetch_macro_trend(now=self.utc, download=download)
+        monitor.get_macro_trend(); self.jobs.pop()()
+        self.assertFalse(monitor.get_macro_trend())
+        self.assertEqual(self.jobs, [])
+        self.assertIsNone(monitor.status()['last_success_at'])
+        self.now = 30
+        self.utc = (NOW + pd.Timedelta(seconds=30)).to_pydatetime()
+        published = True
+        monitor.get_macro_trend(); self.jobs.pop()()
+        self.assertTrue(monitor.get_macro_trend())
+        self.assertNotEqual(requests[0], requests[1])
+        self.assertIsNone(monitor.status()['error'])
+
+    def test_fresh_downtrend_is_distinct_from_unavailable_data(self):
+        monitor = self.monitor()
+        self.fetch.return_value = MacroTrendSnapshot(99, 100, '2026-10-16')
+        monitor.get_macro_trend(); self.jobs.pop()()
+        self.assertEqual(monitor.status()['reason_code'], 'BELOW_OR_EQUAL_SMA200')
+        self.assertTrue(monitor.status()['available'])
+        self.assertFalse(monitor.status()['buy_allowed'])
+
+    def test_rollover_status_rejects_previous_signal_without_fetching(self):
+        monitor = self.monitor()
+        monitor.get_macro_trend(); self.jobs.pop()()
+        self.utc = datetime(2026, 10, 18, tzinfo=timezone.utc)
+        self.assertFalse(monitor.status()['available'])
+        self.assertEqual(monitor.status()['reason_code'], 'DATA_STALE')
+        self.assertEqual(self.jobs, [])
 
     def test_soft_refresh_uses_fresh_cache_but_hard_expiry_blocks(self):
         monitor = self.monitor()

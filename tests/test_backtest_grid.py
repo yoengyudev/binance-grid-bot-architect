@@ -21,7 +21,7 @@ START = pd.Timestamp('2025-01-02T00:00:00Z')
 def LegacyConfig(**kwargs):
     # Preserve the former 1h SMA50 / trailing-buffer policy in regression fixtures.
     return Config(trend_timeframe='1h', trend_period=50, stop_gap=D('0.02'),
-                  stop_mode='trailing', **kwargs)
+                  stop_mode='trailing', buy_trend_policy='legacy', allocation_policy='legacy_cash', **kwargs)
 
 
 def candles(bars):

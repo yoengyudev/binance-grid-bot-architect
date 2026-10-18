@@ -105,3 +105,23 @@ manual-pause restoration, strict stop comparison and lease fencing.
 This does not guarantee an exit during an exchange outage. No sale is submitted
 until inventory and cancellation can be verified; existing exchange orders can
 still execute during uncertainty. No live deployment was performed in this follow-up.
+
+## Follow-up: raw transport errors
+
+`exchange_request()` now normalizes raw socket/connection/DNS/time-out errors
+and errno-less transport `OSError`s into `ccxt.NetworkError` at exchange API
+boundaries. Engine reads, grid submissions, liquidation calls and stop-controller
+calls use this adapter. It preserves the original exception as its cause and
+does not retry a request itself. Existing bounded read retries, interruptible
+outer exponential backoff, circuit penalties and exact-client-ID recovery apply.
+
+The whole cycle does not broadly retry `OSError`: local disk/file/device errno
+values, database errors, authentication/order failures and lease loss retain
+their existing handling. A timed-out write is still resolved by its original ID;
+it is never blindly posted again. The original witnessed hard-stop trigger and
+reserved wallet BTC remain protected during repeated read failures and recovery.
+
+`tests/test_transport_errors.py` adds ten offline tests covering normalization,
+cause preservation, fatal-error classification, asynchronous pending-stop and
+ticker recovery, increasing delays, STOP interruption, ambiguous create/market
+SELL/cancel responses, and reserved BTC. No live fault injection was performed.

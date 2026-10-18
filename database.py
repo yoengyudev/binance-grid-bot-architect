@@ -117,6 +117,25 @@ class GridDatabase:
             finally:
                 self._transactions.connection = None
 
+    @contextmanager
+    def read_snapshot(self) -> Iterator["GridDatabase"]:
+        """Reuse one read-only SQLite view; never reserve the writer lock."""
+        if self.in_transaction:
+            raise RuntimeError('A dashboard read snapshot cannot nest in a write transaction.')
+        with closing(sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True,
+                                     timeout=1)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute('PRAGMA query_only = ON')
+            connection.execute('BEGIN')
+            connection.execute('SELECT COUNT(*) FROM sqlite_master').fetchone()
+            self._transactions.connection = connection
+            self._transactions.serial = 0
+            try:
+                yield self
+            finally:
+                self._transactions.connection = None
+                connection.rollback()
+
     def initialize(self) -> None:
         """Create tables and indexes without changing any existing rows."""
         with self._connection() as connection:

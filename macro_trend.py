@@ -28,11 +28,17 @@ class MacroTrendSnapshot:
 
 
 def fetch_macro_trend(*, now=None, download=None) -> MacroTrendSnapshot:
-    """Blocking fetch for the background worker, using 250 completed UTC days."""
-    today = pd.Timestamp(now if now is not None else datetime.now(timezone.utc)).tz_convert('UTC').normalize()
+    """Fetch a live-ended window; validate only completed UTC daily closes.
+
+    A midnight end can make yfinance cache an incomplete historical response
+    indefinitely. Ending at retrieval time uses its live request path. Today's
+    forming candle is discarded by the completed-day reindex below.
+    """
+    retrieved = pd.Timestamp(now if now is not None else datetime.now(timezone.utc)).tz_convert('UTC')
+    today = retrieved.normalize()
     start = today - pd.Timedelta(days=250)
     frame = (download or yf.download)(
-        'BTC-USD', start=start.date().isoformat(), end=today.date().isoformat(),
+        'BTC-USD', start=start.date().isoformat(), end=retrieved.to_pydatetime(),
         interval='1d', auto_adjust=False, progress=False, threads=False,
         timeout=10, multi_level_index=False,
     )
@@ -72,9 +78,13 @@ class MacroTrendMonitor:
         self._updated = None
         self._next_refresh = 0.0
         self._refreshing = False
+        self._last_attempt_at = None
+        self._last_success_at = None
         self.error = 'Yahoo SMA200 has not been fetched yet.'
 
     def _refresh(self):
+        with self._lock:
+            self._last_attempt_at = self.utcnow().isoformat()
         try:
             result = self.fetch()
             if not isinstance(result, MacroTrendSnapshot):
@@ -89,9 +99,32 @@ class MacroTrendMonitor:
         else:
             with self._lock:
                 self._snapshot, self._updated = result, self.clock()
+                self._last_success_at = self.utcnow().isoformat()
                 self.error = None
                 self._next_refresh = self._updated + REFRESH_SECONDS
                 self._refreshing = False
+
+    def status(self) -> dict:
+        """Read-only telemetry: never fetch or start a worker from API polling."""
+        now = self.clock()
+        yesterday = (pd.Timestamp(self.utcnow()).tz_convert('UTC').normalize()
+                     - pd.Timedelta(days=1)).date().isoformat()
+        with self._lock:
+            snapshot, updated = self._snapshot, self._updated
+            age = max(0., now - updated) if updated is not None else None
+            fresh = (snapshot is not None and updated is not None and
+                     0 <= now - updated < MAX_AGE_SECONDS and snapshot.candle_day == yesterday)
+            available = bool(fresh)
+            allowed = bool(fresh and snapshot.uptrend)
+            reason = ('ABOVE_SMA200' if allowed else 'BELOW_OR_EQUAL_SMA200' if fresh
+                      else 'DATA_UNAVAILABLE' if snapshot is None else 'DATA_STALE')
+            return dict(source='Yahoo BTC-USD', available=available, buy_allowed=allowed,
+                        reason_code=reason, error=self.error, refreshing=self._refreshing,
+                        last_attempt_at=self._last_attempt_at,
+                        last_success_at=self._last_success_at, age_seconds=age,
+                        candle_day=snapshot.candle_day if snapshot is not None else None,
+                        close=snapshot.close if snapshot is not None else None,
+                        sma200=snapshot.sma200 if snapshot is not None else None)
 
     def get_macro_trend(self) -> bool:
         now = self.clock()
@@ -125,3 +158,7 @@ _monitor = MacroTrendMonitor()
 def get_macro_trend() -> bool:
     """True only for a fresh Yahoo closing price > SMA200; never waits on HTTP."""
     return _monitor.get_macro_trend()
+
+
+def get_macro_status() -> dict:
+    return _monitor.status()

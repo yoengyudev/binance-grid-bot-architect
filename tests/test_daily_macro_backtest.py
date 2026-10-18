@@ -55,7 +55,7 @@ class DailyMacroBacktestTests(unittest.TestCase):
 
     def test_daily_gate_blocks_equal_price_and_allows_only_strictly_above(self):
         frame = fine_candles([[100, 100, 100, 100, 1], [101, 101, 101, 101, 1]])
-        bot = GridBacktest(Config())
+        bot = GridBacktest(Config(buy_trend_policy='legacy'))
         result = bot.run(frame, START, START + pd.Timedelta(minutes=10), trend_frame=daily_history())
         starts = [e for e in bot.events if e['event'] == 'GRID_STARTED']
         self.assertEqual(len(starts), 1)
@@ -64,7 +64,7 @@ class DailyMacroBacktestTests(unittest.TestCase):
         self.assertEqual(result['entry_trend_blocked_bars'], 1)
 
     def test_fixed_stop_does_not_ratchet_and_still_triggers_strictly_below(self):
-        bot = GridBacktest(Config(stop_mode='fixed'))
+        bot = GridBacktest(Config(stop_mode='fixed', buy_trend_policy='legacy'))
         bot.start_grid(START, D(100), D(1))
         original = bot.stop
         bot._point(D(150), START)
@@ -78,7 +78,7 @@ class DailyMacroBacktestTests(unittest.TestCase):
         self.assertEqual(bot.orders, {})
 
     def test_fixed_stop_repositions_only_after_a_successful_reanchor(self):
-        bot = GridBacktest(Config(stop_mode='fixed'))
+        bot = GridBacktest(Config(stop_mode='fixed', buy_trend_policy='legacy'))
         bot.start_grid(START, D(100), D(1))
         old_stop = bot.stop
         bot.macro_sma = D(90)
@@ -92,7 +92,7 @@ class DailyMacroBacktestTests(unittest.TestCase):
         self.assertEqual(bot.stop, new_stop)
 
     def test_legacy_trailing_is_explicit_and_still_works(self):
-        bot = GridBacktest(Config(stop_mode='trailing', stop_gap=D('.02')))
+        bot = GridBacktest(Config(stop_mode='trailing', stop_gap=D('.02'), buy_trend_policy='legacy'))
         bot.start_grid(START, D(100), D(1))
         initial = bot.stop
         bot._point(D(105), START)
@@ -101,11 +101,11 @@ class DailyMacroBacktestTests(unittest.TestCase):
     def test_missing_daily_warmup_or_stale_tail_is_rejected(self):
         frame = fine_candles([[101, 101, 101, 101, 1]])
         with self.assertRaisesRegex(ValueError, 'Trend data must cover'):
-            GridBacktest(Config()).run(frame, START, START + pd.Timedelta(minutes=5),
+            GridBacktest(Config(buy_trend_policy='legacy')).run(frame, START, START + pd.Timedelta(minutes=5),
                                       trend_frame=daily_history().iloc[1:])
         longer = fine_candles([[101, 101, 101, 101, 1]] * 865)
         with self.assertRaisesRegex(ValueError, 'Trend data must cover'):
-            GridBacktest(Config()).run(longer, START, START + pd.Timedelta(minutes=5 * 865),
+            GridBacktest(Config(buy_trend_policy='legacy')).run(longer, START, START + pd.Timedelta(minutes=5 * 865),
                                       trend_frame=daily_history(extra_days=1))
 
     def test_offline_daily_replay_preserves_both_inputs_and_never_fetches(self):
@@ -116,7 +116,7 @@ class DailyMacroBacktestTests(unittest.TestCase):
             fine_candles([[101, 101, 101, 101, 1]] * 2).to_csv(execution, index_label='timestamp')
             daily_history().to_csv(trend, index_label='timestamp')
             originals = execution.read_bytes(), trend.read_bytes()
-            args = ['--csv', str(execution), '--trend-csv', str(trend), '--start', START.isoformat(),
+            args = ['--buy-trend-policy', 'legacy', '--csv', str(execution), '--trend-csv', str(trend), '--start', START.isoformat(),
                     '--end', (START + pd.Timedelta(minutes=10)).isoformat(), '--output', str(root)]
             with patch('backtest_grid.fetch_candles', side_effect=AssertionError('Network forbidden')), redirect_stdout(io.StringIO()):
                 self.assertEqual(main(args), 0)

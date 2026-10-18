@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, List, Optional
 import pandas as pd
 import pandas_ta
+from production_baseline import closed_hourly_atr
 from exchange_handler import CircuitOpenError, check_exchange_circuit
 from settings import (
     ATR_REFRESH_SECONDS,
@@ -47,9 +48,14 @@ def _calculate_atr_snapshot(candles: List[List[float]]) -> Optional[Dict[str, fl
 def _fetch_atr_snapshot(bot: "GridBot") -> Optional[Dict[str, float]]:
     with bot.exchange_lock:
         candles = bot.exchange.fetch_ohlcv(
-            bot.config.symbol, timeframe="1h", limit=15
+            bot.config.symbol, timeframe="1h", limit=16
         )
-    return _calculate_atr_snapshot(candles)
+    try:
+        atr,close,available_at = closed_hourly_atr(candles,int(time.time()*1000))
+    except (ValueError,TypeError,ArithmeticError):
+        return None
+    return {'atr_value':float(atr),'atr_percentage':float(atr/close*100),
+            'available_at_ms':available_at}
 
 
 def _calculate_order_book_snapshot(book: Dict[str, Any]) -> Optional[Dict[str, float]]:
