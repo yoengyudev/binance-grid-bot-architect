@@ -64,14 +64,14 @@ async def _runner_heartbeat(bot: GridBot) -> None:
 
 
 async def _run_services(bot: GridBot, notifier: Optional[TelegramNotifier],
-                        *, ready: bool = False) -> None:
+                        *, ready: bool = False, reviewed_resume: bool = False) -> None:
     """Own the SQLite runner fence throughout API and trading service lifetime."""
     bot.acquire_runner_lease()
     bind_notification_loop()
     schedule_telegram_alert("*Process START / RESTART*\nTrading service initialized")
     heartbeat = asyncio.create_task(_runner_heartbeat(bot), name="runner-lease")
     try:
-        await _run_services_owned(bot, notifier, ready=ready)
+        await _run_services_owned(bot, notifier, ready=ready, reviewed_resume=reviewed_resume)
         if bot._runner_lease_lost:
             raise RunnerLeaseLost("Trading runner lease was lost.")
     except Exception as error:
@@ -85,10 +85,34 @@ async def _run_services(bot: GridBot, notifier: Optional[TelegramNotifier],
         await close_notifications()
 
 
+async def _reconcile_reviewed_testnet_resume(bot: GridBot) -> None:
+    """Explicit maintenance handover only; never reopen an IDLE/halted campaign."""
+    if not TRADING_SETTINGS.sandbox:
+        raise TradingHalt('Reviewed order-preserving resume is TESTNET-only.')
+    bot.assert_runner_lease()
+    database = bot.database
+    if (database.get_state(ENGINE_STATUS_KEY) != ENGINE_RUNNING or
+            not database.get_state('grid_run') or any(database.get_state(key) for key in (
+                ENGINE_FAULT_KEY, ENGINE_STOP_CLEANUP_KEY, SAFETY_MODE_KEY,
+                LIQUIDATION_KEY, 'halt_reason', 'grid_reset'))):
+        raise TradingHalt('Reviewed resume requires an existing RUNNING grid without fault, pause or reset state.')
+    result = await asyncio.to_thread(bot._reconcile_state)
+    owned = await asyncio.to_thread(bot._bot_btc_balance, refresh=False)
+    unallocated = max(owned - result['covered_btc'], Decimal(0))
+    if result['unhedged_btc'] > unallocated:
+        raise TradingHalt('Unexplained wallet BTC prevents reviewed resume; no inventory was adopted.')
+    database.record_transition(ENGINE_RUNNING, ENGINE_RUNNING, 'REVIEWED_TESTNET_MAINTENANCE_RESUME')
+
+
 async def _run_services_owned(bot: GridBot, notifier: Optional[TelegramNotifier],
-                              *, ready: bool = False) -> None:
+                              *, ready: bool = False, reviewed_resume: bool = False) -> None:
     """Run the local API and trading loop with outbound alerts only."""
-    await _reconcile_service_boot(bot, ready=ready)
+    if reviewed_resume:
+        if not ready:
+            raise TradingHalt('Reviewed resume requires the dashboard ready service.')
+        await _reconcile_reviewed_testnet_resume(bot)
+    else:
+        await _reconcile_service_boot(bot, ready=ready)
     if notifier is None:
         notifier = TelegramNotifier()
     app.state.grid_bot = bot
@@ -281,7 +305,11 @@ def main() -> int:
                       help="Start the bot idle with market data, without trading")
     mode.add_argument("--ready", action="store_true",
                       help="Serve the dashboard; trading starts only from the web UI")
+    parser.add_argument('--resume-reviewed', action='store_true',
+                        help='TESTNET-only approved maintenance: retain a currently RUNNING grid and its orders')
     arguments = parser.parse_args()
+    if arguments.resume_reviewed and not arguments.ready:
+        parser.error('--resume-reviewed requires --ready')
     try:
         if not TRADING_SETTINGS.sandbox and not (arguments.ready or arguments.monitor_only):
             raise TradingHalt('MAINNET requires --ready and a reviewed dashboard START; direct execution is disabled.')
@@ -303,7 +331,7 @@ def main() -> int:
                       if existing_run else GridConfig.load())
             bot = GridBot(config, exchange, database, macro_exchange=create_macro_exchange())
             bot.ready_mode = True
-            asyncio.run(_run_services(bot, None, ready=True))
+            asyncio.run(_run_services(bot, None, ready=True, reviewed_resume=arguments.resume_reviewed))
             return 0
         if arguments.standby:
             _credentials()

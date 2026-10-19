@@ -1,6 +1,6 @@
 {
   "baseline": "sma200-compressed-atr-v1",
-  "release_tag": "v1.0.2-production",
+  "release_tag": "v1.0.3-production",
   "environment": "TESTNET",
   "frontend_source_commit": "0c552879ed3eed086eb4ea6945a2165aaae2b576",
   "backend_source_sha256_lf": {
@@ -8,7 +8,7 @@
     ".gitignore": "321c5050d424e70c6822c7b67b1eed5b5d8a4eaece8b3957d140967b44b0094c",
     "allocation.py": "1cba92588e021c2b30e3f07b15f170a8c0cad7e714d84ca95933178e06530ee0",
     "api.py": "45e7360d8e59e62ec7473ef48134d9cdd37dffdaf375c26a6e8b1298c8d9f7ab",
-    "BACKTEST.md": "195c72c3b11c5c00bde07d78c642d58436342ae48ba6a1b6f0982a0a1291de44",
+    "BACKTEST.md": "f8fbf23fb61bd618a53875c8d26e68a95a032d284d52968f282716a765f5c267",
     "backtest_grid.py": "d4c5af84e3e8609b41088aff02bd3e056c4fb874c807e5721250b0fd99027b3d",
     "backtest_hybrid_grid.py": "b6004f2638496f40b7de111dc55f706fe98411cbc7b1cb35b883c11fa0757bef",
     "budget_policy.py": "19c01cd9719f268e60113f1d4c6f080d0b9d8db9ce37795084131c5772da3895",
@@ -23,13 +23,13 @@
     "diagnose_stop_event.py": "05e77310ee346015de6628dd582024da0426fe3556a52531d4f98fd0f4a54a78",
     "docker_runner.py": "6b03004907aa659cd6110712b7c2d597b7bc5777a7993be59d9c8c0c84d2187b",
     "Dockerfile": "547e23c67bd756cc334458c49532d0725b336b025f0e366eba3712687f42c6ce",
-    "engine.py": "6bb1b744c84a9d36ef287b3150a2c522a0a8f9de5875158483ed503127515ed9",
+    "engine.py": "3dc8acc07dd52c19f6fc239cbac4b1e945b818c955b39169b35b70b86a0853df",
     "exchange_handler.py": "00871a4dec4b46c22e67d57d61f37fdd4af9e5ab03a28e4434714eb2104458f1",
     "execution_history.py": "63958163addacc784c777a0af1b292652fe64546e918c060ffd430bc34f162fa",
     "grid_geometry.py": "eca83185fd6a4103a7ffa2712818589d98493559487cfa73bcf824490adf59a4",
     "hard_reset.py": "78da04e28156f817d53f9d24c4a1af9a2828d27587b52b90422583cb7568da91",
     "macro_trend.py": "b2230f6990f9626a733d24c4150196f0c63b54062c386221304b25aabc26ce3a",
-    "main.py": "97f8a552867c967dc00632db4504499bbdfa9b3dda86952329ab8d092740aef4",
+    "main.py": "91f87a69b97f0335c90b3c8c24365aae2cfa774c9ec039240d2d4107320e8702",
     "MAINNET_DEPLOYMENT.md": "c2ee07cf5de4abf178ebfcf23e66a0776c79ad2f6db56cb1e72f8077f945f7cf",
     "mainnet_preflight.py": "579a822452cc734f6de5a84f634d30ea5d34e45de2b9e814b3bb3fc8e92181de",
     "market_data.py": "232001d7911cca751fae713c72b88fbe1f3e9a66b4cea45eb0fe6c384bc7dafe",
@@ -37,7 +37,7 @@
     "notifier.py": "73d93d36381bf37c5ff430738df56bbb79a9ada6fa40194448c97e90866e2931",
     "portfolio.py": "d1866189e2b2082ee781c8cd82038f606a74d03ddda5bb5d9588d30f3f541081",
     "production_baseline.py": "3175a453ff296dbb63ee35b3f3e115dd64370f89aca7ab73460a33837e73e125",
-    "README.md": "64c94eb3dbb8bced9f473ecea4262b590e26e7fdc6cedb0995b50d30e739ebb0",
+    "README.md": "134862f3b6b90add2fc3ff0bfc56db5a8c02db89ce4e9330f6011fe79a11fa4a",
     "requirements.txt": "a690687d3236f698519ca46ef2f034df1987da72b46525a1345a095a905b0865",
     "settings.py": "b0676c0415a3f59921c7d372214eb46039d562e1eb22d9bc3661790a6184e0cc",
     "stop_controller.py": "2526871366b4f52e4fad4a1672a74faa26432f27c808b527deca495552556dd7",
@@ -46,7 +46,7 @@
     "telemetry.py": "eb5ebdf4214ba857b28cd5a870affa46d44420ffc6c5498918e8292e3006908f",
     "test_stop_loss.py": "c5f3d6fde1a07d032d511d4893bafed42e05c76a855ff05d25c1c3a64b8008e9",
     "tests/__init__.py": "ee123d467bb5fb8ad292e5aa24dd41957692d18aff3eebee03d6060c00658e98",
-    "tests/fakes.py": "0c18a33e79a700f21b58b89da6cb0cb165f100acd8539a873264853f52f0047e",
+    "tests/fakes.py": "bee5179fb47a710390db7f24518ffdde1ad7e9cecae49d2c8f0349479a93bc57",
     "tests/test_allocation_backtest.py": "8c438a5f55a01bbfaf396edbca874c0226e252018b84a11eb5c7b6a03a24dd6c",
     "tests/test_api.py": "1fb4318beb82e971ee11e2b6646ffc9ef0e6368b15c57c9bc5d65f84a973c572",
     "tests/test_async_notifier.py": "15c2486ce9c27456c816d39606ac5f8ea216e77f0b4dea444646434b59394fb0",
@@ -69,7 +69,7 @@
     "tests/test_iteration2_policy.py": "6cc7cfc9501960d24583970b8ccb714ca5485e75cbe06573fe825835af54f2b7",
     "tests/test_liquidation_recovery.py": "0701356329201126938f48bc4efd3ff800f54d241cb9212004165bd272b1b41b",
     "tests/test_macro_trend.py": "ff45a821c51819e324463bdd1648763db4804ebedc22599944877097c8128cda",
-    "tests/test_main.py": "f463a229a22de006f42c1341b97cac4b092810f4bffb1f4ba8b9d24d8f5540ff",
+    "tests/test_main.py": "1466e5ab8d181e62937e8ebf5e0d87731cacc8a27d82fb63655f57525193ace1",
     "tests/test_manual_liquidation.py": "5ff4abd1c052a1ddc78a46678767b7376ada259683aee6e6744e94ed7e4cd840",
     "tests/test_no_stop_backtest.py": "f29e713eb18672d4a80d303aadc9dcc44c0f3573d46da00e081d465bef9bbcbe",
     "tests/test_notifier.py": "56c16c903e066c4778caa06a340ff30e4e848b131edf36af1b27c0da9ff79c5e",
@@ -91,7 +91,8 @@
     "trading_environment.py": "1e7ba7b54fe2706e3c49020a504fb6af2d90d35548a9e8fcac1c9ae376ce0fc8",
     "WALK_FORWARD.md": "cfa949ae16f9855f2338c161262b28c47548580e32bb3c748cf0d41bbfa30e8f",
     "walk_forward.py": "63bf51e515b9b99204c36399a9c69f017f3cf759775d356c4f421d04441f03e2",
-    "MACRO_TREND.md": "933112a673007b9cddf6b29e89d9f5ab13db1058001958f449d23f1f2ee7f002"
+    "MACRO_TREND.md": "a47b75332d8c18857062e31923fbc6102ba862802df433707eacb1b8568a67b9",
+    "tests/test_marketable_sell_exits.py": "f398e0b8b76549aaa60da6158d49f3fb1e950fb68e928e995d24369e0346b8b0"
   },
   "dashboard_sha256": {
     "apple-touch-icon.png": "923ac7edb54e0d2650998baa8c2d7909f4793f54ace1d2430a0434ae794e6640",
@@ -103,7 +104,7 @@
     "index.html": "3e029744c6402a578d58bf12338565ea89dee04e00a6ac674c687d6b925165b4"
   },
   "validation": {
-    "backend_tests_passed": 594,
+    "backend_tests_passed": 609,
     "frontend_checks_passed": [
       "tests",
       "lint",
@@ -139,6 +140,7 @@
     "Source and dashboard assets are fetched from this Git tag.",
     "Fresh DB is isolated by full path; required basename remains grid_testnet.sqlite.",
     "Execution repair: a reviewed same-grid resume restores SELLs for carried BTC while Yahoo blocks all new BUYs. Policy constants, cap, floor and frontend assets unchanged.",
-    "Data repair: missing recent Yahoo daily closes require all 24 valid same-feed UTC hourly bars; strict SMA200, strategy parameters and exchange environment unchanged."
+    "Data repair: missing recent Yahoo daily closes require all 24 valid same-feed UTC hourly bars; strict SMA200, strategy parameters and exchange environment unchanged.",
+    "Execution repair: BUY PO / SELL GTC; exact-ID recovery and fee accounting retained. TESTNET-only explicitly reviewed RUNNING handover retains existing order IDs and parent lots. Canonical startup remains --ready; historical backtest SELL placement model is unchanged and does not validate new exit execution."
   ]
 }

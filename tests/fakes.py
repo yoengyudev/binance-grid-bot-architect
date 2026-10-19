@@ -79,6 +79,7 @@ class FakeSpotExchange:
         if self.fail_create:
             raise RuntimeError("Simulated uncertain response")
         if (self.reject_post_only_once and order_type == "limit" and
+                params.get("timeInForce") == "PO" and
                 (self.reject_post_only_side is None or side == self.reject_post_only_side)):
             self.reject_post_only_once = False
             raise ccxt.OrderImmediatelyFillable(

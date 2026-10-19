@@ -1,11 +1,11 @@
 # Prospective Testnet release
 
-`v1.0.2-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
+`v1.0.3-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
 and 0.5x closed-hour ATR compression. No strategy parameter is changed here.
 
 Runtime layout:
 
-- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.2-production`
+- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.3-production`
 - Environment: `/home/ubuntu/prospective-testnet/.env` (private, outside Git)
 - Ledger: `/home/ubuntu/prospective-testnet/state/grid_testnet.sqlite`
 - Configuration: `/home/ubuntu/prospective-testnet/state/config.json`
@@ -59,3 +59,11 @@ Patch release 1.0.2 recovers missing recent Yahoo daily closes only from all 24
 validated same-feed UTC hourly bars. It preserves the strict completed-day
 SMA200 rule and fails closed when recovery is incomplete. Existing valid daily
 closes are unchanged. See MACRO_TREND.md for provenance and validation.
+
+Patch 1.0.3 keeps BUY entries post-only and permits GTC limit SELL exits to
+execute at their saved target or better after a rebound. For an explicitly
+reviewed TESTNET maintenance handover only, `main.py --ready --resume-reviewed`
+retains orders/parent lots after reconciliation. It refuses Mainnet, IDLE/HALTED,
+fault/cleanup/pause/reset/liquidation states and unexplained wallet BTC. The
+canonical unit remains plain `--ready`; the operator removes the one-time
+runtime override after verification. This does not enable post-stop restarts.

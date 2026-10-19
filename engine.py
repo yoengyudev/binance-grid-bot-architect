@@ -2039,7 +2039,10 @@ class GridBot:
                 self.assert_runner_lease()
                 params = {"newClientOrderId": client_id}
                 if order_type == "LIMIT":
-                    params["timeInForce"] = "PO"
+                    # Entries must add liquidity; exits must also work after a
+                    # rebound has already crossed their saved minimum price.
+                    # GTC preserves that price floor without a maker-only veto.
+                    params["timeInForce"] = "PO" if side == "BUY" else "GTC"
                 if quote_cost is not None:
                     params["quoteOrderQty"] = str(quote_cost)
                 response = exchange_request(self.exchange.create_order,
@@ -2058,7 +2061,7 @@ class GridBot:
                 self.database.discard_unsubmitted_order(client_id)
                 raise
             except ccxt.OrderImmediatelyFillable as error:
-                if (order_type != "LIMIT" or
+                if (order_type != "LIMIT" or side != "BUY" or
                         "Order would immediately match and take." not in str(error)):
                     raise UncertainOrderError(
                         f"Order {client_id} may have been accepted; inspect it before restarting."

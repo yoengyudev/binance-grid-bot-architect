@@ -94,7 +94,7 @@ Small carried BTC can also limit the number of SELL lanes: each exchange-rounded
 1. **Ready service:** `main.py --ready` serves the API and market intelligence with `engine_status=IDLE`, even if a saved grid exists. Before it rests in IDLE, startup verifies Testnet BTC/USDT orders against SQLite and cancels all bot-owned open orders. The cleanup obligation and alarm remain in SQLite until exchange cancellation is verified; START is blocked while cleanup is unresolved. An in-progress hard-stop liquidation remains a separate safety exception. The authenticated top-bar Master Switch is the only normal path from IDLE to RUNNING.
 2. **Human approval:** The operator supplies center price, ceiling, hard stop, allocated USDT, and an **exact total** of BUY plus SELL levels. The API validates the live Testnet price, exchange precision, order size, and available capital before accepting the request. In ready mode this saves a pending grid; it places no orders until the operator presses **START**.
 3. **Initial inventory:** The configured `initial_inventory_percent` (50% in the current configuration) funds a seed market BUY. Its BTC is divided among upper SELL limits. The remaining quote allocation funds lower BUY limits.
-4. **Geometric grid:** The engine calculates exact geometric price levels between the center and each bound. For an odd level count, the BUY side gets one extra level. Each limit order is sent **Post-Only** (`timeInForce: PO`) with a bot-specific client order ID. An order that would immediately take liquidity is logged and deferred to a later cycle.
+4. **Geometric grid:** The engine calculates exact geometric price levels between the center and each bound. For an odd level count, the BUY side gets one extra level. BUY limits are **Post-Only** (`timeInForce: PO`); SELL exits use **GTC limit orders** at the saved target price. A SELL may execute immediately at its target or better when a rebound has already crossed that price, and can incur taker fees. Both sides retain durable bot-specific client order IDs and exact-ID recovery. A maker-only BUY rejected at the spread is deferred to a later cycle.
 5. **Fill rotation:** A filled BUY creates a corresponding SELL sized from its executed BTC minus BTC-denominated commissions, rounded through CCXT's exchange precision, and checked against free bot-owned BTC. If execution details or free BTC have not caught up, placement waits for another cycle. A definitive insufficient-balance SELL rejection also leaves the lane available for retry. A filled SELL records realized trade profit and re-arms a BUY at the corresponding grid lane when conditions allow. The grid rotates through price levels; a completed sell does not permanently reduce its configured lane count.
 
 This is spread-capture grid trading, **not risk-free arbitrage**. Fees, gaps, inventory exposure, and adverse trends can exceed the spread earned by completed cycles. The order ledger and status card count currently active/open orders; that number can temporarily differ from the configured number of price levels during fills, pauses, Post-Only rejections, and reconciliation.
@@ -169,7 +169,7 @@ After liquidation, trading remains locked until an authenticated new-grid reset.
 
 ## Upward breakout and “Infinity Grid” behavior
 
-When price stays **strictly above the upper bound** across uninterrupted observations for four hours, the bot queues an upward grid shift. The timer is stored in SQLite and reset if price returns inside the bound, the grid changes, a pause begins, or polling has a material gap. Before the shift, it rechecks the breakout and the active trailing floor. It then cancels and reconciles bot orders, carries bot-owned BTC and its cost basis into the new grid, re-centers the bounds around the current Testnet price using the configured width, and places replacement Post-Only orders. Old lower BUYs are removed as part of that full re-anchor. If price fades during the transition, the engine can withdraw the shift or rebuild the old bounds under its safety checks.
+When price stays **strictly above the upper bound** across uninterrupted observations for four hours, the bot queues an upward grid shift. The timer is stored in SQLite and reset if price returns inside the bound, the grid changes, a pause begins, or polling has a material gap. Before the shift, it rechecks the breakout and the active trailing floor. It then cancels and reconciles bot orders, carries bot-owned BTC and its cost basis into the new grid, re-centers the bounds around the current Testnet price using the configured width, and places replacement post-only BUYs and GTC limit SELLs. Old lower BUYs are removed as part of that full re-anchor. If price fades during the transition, the engine can withdraw the shift or rebuild the old bounds under its safety checks.
 
 **Important boundary:** This is an automatic *upward re-anchoring* mechanism; the current code does **not** increase `investment_quote` using realized profits. Trade profit is recorded in SQLite, while the grid's USDT allocation remains the configured amount until an operator changes it. “Auto-compounding realized profits” is a proposed feature, not an implemented one.
 
@@ -238,7 +238,19 @@ Omit `--summary-only` to print every row in timestamp order. The bot did **not**
 
 - Mainnet routing is explicit and requires the locked profile, `--ready`, a reviewed grid and authenticated START. [The deployment checklist](MAINNET_DEPLOYMENT.md) records the required prospective Testnet and live host checks; retrospective results alone do not establish Mainnet readiness.
 - The Testnet WebSocket price in the header and the backend's polled Testnet ticker can differ briefly because they are separate feeds. The backend does not receive every tick, so stop and breakout decisions can lag fast markets.
-- Post-Only limits may be rejected at the spread; a lane can remain temporarily empty until a later safe cycle. Exchange precision and balances can change between validation and submission.
+- Post-only BUY limits may be rejected at the spread; their lane can remain temporarily empty until a later safe cycle. SELL exits keep a minimum price but permit immediate execution and taker fees; partial remainders remain working until reconciled. Exchange precision and balances can change between validation and submission.
 - The order-book ratio is a top-50 snapshot, susceptible to rapidly changing or canceled displayed liquidity. It is not a predictor of future fills.
 - Portfolio PnL is an estimate from bot-recorded lots and the last observed price. It is not exchange-wide equity, a tax ledger, or a guarantee of realized profit.
 - Outbound Telegram alerts improve visibility but do not control the bot or replace process and exchange monitoring. The system has no automatic realized-profit compounding.
+
+### Reviewed Testnet maintenance handover
+
+`main.py --ready --resume-reviewed` is an explicit Testnet-only maintenance
+mode for a saved RUNNING campaign. It retains working order IDs and parent lots
+after startup reconciliation instead of performing the usual ready-mode order
+cleanup. It rejects stopped/halted grids, pending resets, cleanup/fault/risk
+states and unexplained free wallet BTC. It retains the runner fence and the
+normal dashboard controls. Deployment must prevent two active owners and allow
+the previous lease to expire; it must never edit or bypass the lease. Use the
+ordinary `--ready` service for subsequent starts. No Mainnet or post-liquidation
+automatic resume is enabled.

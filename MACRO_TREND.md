@@ -59,7 +59,7 @@ the cached Yahoo trend before normal grid maintenance. When False:
    owned bot inventory while BUYs remain blocked.
 
 When True again, eligible BUY lanes can resume subject to bounds, balance,
-Post-Only precision and the retained fixed floor. Manual pauses and reset locks
+BUY post-only constraints, exchange precision and the retained fixed floor. SELL exits use GTC limits and can execute immediately even while macro BUYs are paused. Manual pauses and reset locks
 remain independent; macro recovery cannot release them. A process restart starts
 with an unknown/False cache, while saved cancellation markers prevent expected
 canceled BUYs from being mistaken for unexpected order failures.

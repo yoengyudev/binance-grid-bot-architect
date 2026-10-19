@@ -846,7 +846,8 @@ class GridBotTests(unittest.TestCase):
             )
             for order in exchange.orders.values():
                 if order["type"] == "limit":
-                    self.assertEqual(order["params"]["timeInForce"], "PO")
+                    self.assertEqual(order["params"]["timeInForce"],
+                                     "PO" if order["side"] == "buy" else "GTC")
             self.assertEqual(bot.database.fetch_latest_orders_by_level()[-1]["side"], "SELL")
             exchange.fill(first_buy["client_order_id"])
 
@@ -2041,7 +2042,7 @@ class GridBotTests(unittest.TestCase):
             self.assertTrue(restarted.grid_needs_reset)
             exchange.price = Decimal("145")  # Use execution-time price as the center.
             exchange.reject_post_only_once = True
-            exchange.reject_post_only_side = "sell"
+            exchange.reject_post_only_side = "buy"
             self.assertFalse(restarted.reset_grid())
             self.assertIsNone(restarted.database.get_state(grid_settings.BREAKOUT_NOTICE_KEY))
             self.assertTrue(restarted.reset_grid())
@@ -2065,7 +2066,7 @@ class GridBotTests(unittest.TestCase):
                 ), existing_btc,
             )
             self.assertTrue(all(
-                order["params"]["timeInForce"] == "PO"
+                order["params"]["timeInForce"] == ("PO" if order["side"] == "buy" else "GTC")
                 for order in exchange.fetch_open_orders("BTC/USDT")
             ))
             exchange.price = Decimal("200")
@@ -2145,7 +2146,7 @@ class GridBotTests(unittest.TestCase):
                     exchange.fetch_open_orders("BTC/USDT") if row["side"] == "sell"
                 ), held_before,
             )
-            self.assertTrue(all(row["params"]["timeInForce"] == "PO"
+            self.assertTrue(all(row["params"]["timeInForce"] == ("PO" if row["side"] == "buy" else "GTC")
                                 for row in exchange.fetch_open_orders("BTC/USDT")))
             self.assertEqual(sum(row["type"] == "market" and row["side"] == "sell"
                                  for row in exchange.orders.values()), 0)
@@ -2391,7 +2392,7 @@ class GridBotTests(unittest.TestCase):
             self.assertIsNone(rows[0]["exchange_order_id"])
 
     def test_post_only_rejection_skips_one_order_and_retries_next_cycle(self) -> None:
-        for side, skipped_level in (("sell", -1), ("buy", 1)):
+        for side, skipped_level in (("buy", 1),):
             with self.subTest(side=side), tempfile.TemporaryDirectory() as directory:
                 bot, exchange = self.make_bot(Path(directory) / "grid_testnet.sqlite")
                 bot.run_cycle()  # The seed market buy is deliberately not post-only.

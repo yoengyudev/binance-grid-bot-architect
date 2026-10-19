@@ -312,6 +312,13 @@ can still cause losses. More spacing cannot establish an edge by itself.
 
 ## Execution assumptions and limits
 
+The live engine now uses post-only BUY entries and GTC limit SELL exits. A newly
+submitted live SELL can execute at its target or better when the current bid
+already crosses that target. The historical simulator below retains its earlier
+post-only-style SELL-placement restriction for reproducibility. Its existing
+metrics therefore do not validate this revised exit execution policy; update
+the replay model and rerun it before making new profitability claims.
+
 Both predetermined routes are run independently by default: open-high-low-close
 (`ohlc`) and open-low-high-close (`olhc`). No favorable route is selected after
 seeing a candle. Each monotonic segment processes prices in crossing order;
