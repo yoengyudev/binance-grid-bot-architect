@@ -16,8 +16,19 @@ False until usable data is available. Calls thereafter use the cached result.
   A forming daily candle is excluded. This is a daily regime filter, not a
   comparison of the live Binance ticker with yesterday's SMA.
 - Require 200 consecutive valid days through yesterday. Empty data, missing
-  recent days, duplicates, nonfinite/nonpositive closes and stale daily tails
-  cannot produce an uptrend. Single-ticker MultiIndex output is supported.
+  unrecoverable days, duplicates, nonfinite/nonpositive closes and stale daily
+  tails cannot produce an uptrend. Single-ticker MultiIndex output is supported.
+- If a daily close is absent or blank within the last seven completed UTC days,
+  make one additional bounded Yahoo `BTC-USD` hourly request in the background.
+  Recover that day's close only when all 24 distinct UTC hourly bars are present
+  and have finite, positive closes. Use the 23:00 bar's completed close, never
+  the hourly mean, today's forming candle, interpolation, or a previous close.
+  Preserve already-valid daily values. Older gaps or incomplete hourly data
+  keep BUYs paused. No Binance prices are substituted into the Yahoo series.
+  A complete daily response makes no hourly request and behaves as before.
+- Status includes `reconstructed_days` so operators can identify recovered
+  candles. A successful recovery still requires `close > sma200`; it does not
+  force the regime filter to approve BUYs. No new dependency is needed.
 - Refresh lazily every five minutes while the engine calls the accessor. Keep
   an existing valid result during a background refresh for at most 15 minutes.
   A refresh failure invalidates it immediately and retries after 30 seconds.
@@ -44,6 +55,8 @@ the cached Yahoo trend before normal grid maintenance. When False:
    change between cycle planning and submission.
 5. Defer automatic/manual grid rebuild execution without canceling SELLs for
    that rebuild. Retain the durable pending reset and continue normal risk checks.
+   The reviewed same-grid `engine_resume` recovery may restore SELLs for already
+   owned bot inventory while BUYs remain blocked.
 
 When True again, eligible BUY lanes can resume subject to bounds, balance,
 Post-Only precision and the retained fixed floor. Manual pauses and reset locks
@@ -72,3 +85,11 @@ Tests use deterministic history and injected trend providers, never Yahoo or
 Binance credentials. `tests/test_macro_trend.py` covers data validation, cache
 expiry/retries, slow downloads, order ownership, cancellation races, partial
 fills, SELL accounting, restart recovery and hard-stop priority.
+
+The missing-daily-close recovery was also checked read-only on EC2 on
+2026-10-19. Yahoo's daily endpoint returned a null October 18 close; all 24
+hourly closes were available. Recovery produced a completed close of
+82,006.8515625 USD and SMA200 of 72,495.332265625 USD. This check ran the candidate
+fetcher separately and did not replace the running release, place orders, or
+restart the service. Any deployment requires a new release identity and a
+recorded restart of prospective observation.

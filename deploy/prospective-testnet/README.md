@@ -1,11 +1,11 @@
 # Prospective Testnet release
 
-`v1.0.1-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
+`v1.0.2-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
 and 0.5x closed-hour ATR compression. No strategy parameter is changed here.
 
 Runtime layout:
 
-- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.1-production`
+- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.2-production`
 - Environment: `/home/ubuntu/prospective-testnet/.env` (private, outside Git)
 - Ledger: `/home/ubuntu/prospective-testnet/state/grid_testnet.sqlite`
 - Configuration: `/home/ubuntu/prospective-testnet/state/config.json`
@@ -54,3 +54,8 @@ market seed is permitted. New deployments and other reanchors retain their
 existing macro gates. Fixed stop, allocation cap, reserved wallet BTC boundary,
 grid geometry and strategy constants are unchanged. The original 1.0.0 tag is
 retained. Record the maintenance interruption and begin a new observation window.
+
+Patch release 1.0.2 recovers missing recent Yahoo daily closes only from all 24
+validated same-feed UTC hourly bars. It preserves the strict completed-day
+SMA200 rule and fails closed when recovery is incomplete. Existing valid daily
+closes are unchanged. See MACRO_TREND.md for provenance and validation.

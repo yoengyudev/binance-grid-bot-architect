@@ -32,7 +32,96 @@ def history(last=100):
     return frame
 
 
+def hourly_history(day=None, last=101):
+    day = day if day is not None else NOW.normalize() - pd.Timedelta(days=1)
+    frame = pd.DataFrame({'Close': [100.] * 24},
+                         index=pd.date_range(day, periods=24, freq='h'))
+    frame.iloc[-1, 0] = last
+    return frame
+
+
 class YahooDataTests(unittest.TestCase):
+    def test_complete_daily_feed_never_requests_hourly_recovery(self):
+        download = Mock(return_value=history(101))
+        result = fetch_macro_trend(now=NOW, download=download)
+        download.assert_called_once()
+        self.assertEqual(result.reconstructed_days, ())
+
+    def test_missing_last_daily_close_uses_last_of_24_verified_hourly_closes(self):
+        download = Mock(side_effect=[history().iloc[:-1], hourly_history()])
+        result = fetch_macro_trend(now=NOW, download=download)
+        self.assertEqual(result.close, 101)
+        self.assertAlmostEqual(result.sma200, (19900 + 101) / 200)
+        self.assertTrue(result.uptrend)
+        self.assertEqual(result.candle_day, '2026-10-16')
+        self.assertEqual(result.reconstructed_days, ('2026-10-16',))
+        kwargs = download.call_args_list[1].kwargs
+        self.assertEqual(kwargs['interval'], '1h')
+        self.assertEqual(kwargs['start'], '2026-10-16')
+        self.assertEqual(pd.Timestamp(kwargs['end']), NOW)
+        self.assertEqual(kwargs['timeout'], 10)
+        self.assertFalse(kwargs['threads'])
+        self.assertFalse(kwargs['auto_adjust'])
+
+    def test_recovered_close_below_or_equal_sma_still_blocks_buys(self):
+        for close in (99, 100):
+            with self.subTest(close=close):
+                download = Mock(side_effect=[history().iloc[:-1], hourly_history(last=close)])
+                self.assertFalse(fetch_macro_trend(now=NOW, download=download).uptrend)
+
+    def test_blank_daily_row_recovers_without_overwriting_existing_daily_values(self):
+        daily = history(103)
+        missing_day = daily.index[-2]
+        daily.loc[missing_day, 'Close'] = float('nan')
+        hourly = pd.concat([hourly_history(missing_day, last=102), hourly_history(last=999999)])
+        result = fetch_macro_trend(now=NOW, download=Mock(side_effect=[daily, hourly]))
+        self.assertEqual(result.close, 103)
+        self.assertAlmostEqual(result.sma200, (19800+102+103)/200)
+        self.assertEqual(result.reconstructed_days, (str(missing_day.date()),))
+
+    def test_multiple_missing_recent_days_require_complete_hourly_data_for_each(self):
+        days = history().index[-2:]
+        hourly = pd.concat([hourly_history(day, last=101) for day in days])
+        result = fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-2], hourly]))
+        self.assertEqual(result.reconstructed_days, tuple(str(day.date()) for day in days))
+        self.assertAlmostEqual(result.sma200, (19800+202)/200)
+        with self.assertRaises(ValueError):
+            fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-2], hourly.iloc[:-1]]))
+
+    def test_old_missing_daily_close_is_not_reconstructed(self):
+        daily = history().drop(history().index[-8])
+        download = Mock(return_value=daily)
+        with self.assertRaisesRegex(ValueError, 'recovery window'):
+            fetch_macro_trend(now=NOW, download=download)
+        download.assert_called_once()
+
+    def test_partial_duplicate_misaligned_and_invalid_hourly_bars_fail_closed(self):
+        hourly = hourly_history()
+        shifted = hourly.copy()
+        shifted.index = shifted.index + pd.Timedelta(minutes=1)
+        for frame in (hourly.iloc[:-1], hourly.drop(hourly.index[12]),
+                      pd.concat([hourly, hourly.tail(1)]), shifted,
+                      hourly.assign(Close=float('nan')), hourly.assign(Close=float('inf')),
+                      hourly.assign(Close=0), hourly.assign(Close=-1), None, pd.DataFrame()):
+            with self.subTest(frame=type(frame)), self.assertRaises(ValueError):
+                fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], frame]))
+
+    def test_forming_day_and_final_live_quote_cannot_repair_yesterday(self):
+        current = hourly_history(NOW.normalize())
+        current.loc[NOW, 'Close'] = 999999
+        with self.assertRaises(ValueError):
+            fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], current]))
+
+    def test_hourly_failure_is_unavailable_and_does_not_fabricate_a_close(self):
+        with self.assertRaises(TimeoutError):
+            fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], TimeoutError()]))
+
+    def test_multiindex_hourly_recovery_matches_flat_output(self):
+        hourly = hourly_history()
+        hourly.columns = pd.MultiIndex.from_tuples([('Close', 'BTC-USD')])
+        result = fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], hourly]))
+        self.assertEqual(result.close, 101)
+
     def test_up_down_and_equality_use_strictly_greater_than_sma(self):
         for close, expected in ((101, True), (99, False), (100, False)):
             with self.subTest(close=close):
@@ -86,6 +175,13 @@ class YahooDataTests(unittest.TestCase):
 
 
 class MonitorTests(unittest.TestCase):
+    def test_reconstruction_provenance_is_exposed_in_read_only_status(self):
+        monitor = self.monitor()
+        self.fetch.return_value = MacroTrendSnapshot(101, 100, '2026-10-16', ('2026-10-16',))
+        monitor.get_macro_trend(); self.jobs.pop()()
+        self.assertEqual(monitor.status()['reconstructed_days'], ['2026-10-16'])
+        self.assertEqual(self.jobs, [])
+
     def monitor(self):
         self.now = 0.
         self.utc = NOW.to_pydatetime()
@@ -136,7 +232,8 @@ class MonitorTests(unittest.TestCase):
         published = False
         requests = []
         def download(*args, **kwargs):
-            requests.append(kwargs['end'])
+            if kwargs['interval'] == '1d':
+                requests.append(kwargs['end'])
             return history(101) if published else history(101).iloc[:-1]
         monitor.fetch = lambda: fetch_macro_trend(now=self.utc, download=download)
         monitor.get_macro_trend(); self.jobs.pop()()
