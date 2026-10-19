@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal as D
 
 RUN = Path('/home/ubuntu/prospective-testnet')
-RELEASE = RUN/'releases/v1.0.0-production'
+RELEASE = RUN/'releases/v1.0.1-production'
 sys.path.insert(0, str(RELEASE))
 from dotenv import dotenv_values
 
@@ -31,7 +31,7 @@ os.environ.update({k:v for k,v in env.items() if v is not None})
 assert not (RELEASE/'.env').exists(), 'Release must not carry another .env.'
 assert not subprocess.check_output(['git','-C',str(RELEASE),'status','--porcelain','--untracked-files=no'],text=True).strip()
 commit = subprocess.check_output(['git','-C',str(RELEASE),'rev-parse','HEAD'],text=True).strip()
-assert commit == subprocess.check_output(['git','-C',str(RELEASE),'rev-parse','refs/tags/v1.0.0-production^{commit}'],text=True).strip()
+assert commit == subprocess.check_output(['git','-C',str(RELEASE),'rev-parse','refs/tags/v1.0.1-production^{commit}'],text=True).strip()
 assert commit == (RUN/'evidence/release-commit.txt').read_text().strip()
 
 from database import GridDatabase, resolve_database_path

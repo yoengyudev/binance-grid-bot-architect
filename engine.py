@@ -2632,7 +2632,11 @@ class GridBot:
             return False
         if self.stop_controller.stop_requested.is_set():
             raise TradingHalt("Stop requested during grid reset.")
-        if not self._macro_buys_allowed():
+        # An explicitly reviewed same-grid resume must restore exits for owned
+        # inventory even when Yahoo blocks BUYs. Other rebuilds remain gated.
+        sell_only_resume = request.get('source') == 'engine_resume' and (
+            request.get('phase') == 'placing' or self._bot_btc_balance(refresh=False) > 0)
+        if not self._macro_buys_allowed() and not sell_only_resume:
             self.run_cycle()  # Reconcile/cancel BUYs, retain SELLs, and evaluate the hard stop.
             return False
         if request["phase"] == "canceling":
@@ -2700,7 +2704,8 @@ class GridBot:
             price = self._ticker_price()
             if self._evaluate_automatic_stop(price, bot_btc_balance=carry_amount):
                 return False
-            if not self._macro_buys_allowed():
+            if not self._macro_buys_allowed() and not (
+                    request.get('source') == 'engine_resume' and carry_amount > 0):
                 request['cancellation_verified'] = True
                 self.database.set_state('grid_reset', json.dumps(request, sort_keys=True))
                 return False
@@ -2889,8 +2894,9 @@ class GridBot:
                 level for level, raw in enumerate(self.levels, start=1)
                 if self._price(raw) > self.config.stop_loss_price
             }
-            expected = safe_buys | set(
-                range(-1, -len(self.upper_levels) - 1, -1)) | {0}
+            expected = set(range(-1, -len(self.upper_levels) - 1, -1)) | {0}
+            if request.get('source') != 'engine_resume' or self._macro_buys_allowed():
+                expected |= safe_buys
             if expected <= latest.keys():
                 notification_key = (
                     BREAKOUT_NOTICE_KEY if request.get("source") == "breakout"

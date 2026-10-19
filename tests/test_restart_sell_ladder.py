@@ -78,11 +78,16 @@ class RestartSellLadderTests(unittest.TestCase):
         self.exchange.price = D('81599.63')
         recovered.start_engine(auto_cover_inventory=True)
         recovered._macro_trend_provider = lambda: False
-        self.assertFalse(recovered.reset_grid())
-        self.assertEqual(self.exchange.fetch_open_orders('BTC/USDT'), [])
-        recovered._macro_trend_provider = lambda: True
         self.assertTrue(recovered.reset_grid())
+        live = self.exchange.fetch_open_orders('BTC/USDT')
+        self.assertTrue(live)
+        self.assertTrue(all(order['side'] == 'sell' for order in live))
         self.assertEqual(self.sells(recovered), self.original_sells)
+        recovered._macro_trend_provider = lambda: True
+        recovered.run_cycle()
+        self.assertEqual(self.sells(recovered), self.original_sells)
+        self.assertTrue(any(order['side'] == 'buy' for order in
+                            self.exchange.fetch_open_orders('BTC/USDT')))
 
     def test_carried_sell_fill_is_accounted_once_then_rebuys_at_saved_level(self):
         self.bot.stop_engine()

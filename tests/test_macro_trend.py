@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 from threading import Event
 import unittest
+import json
 from unittest.mock import Mock, patch
 
 import ccxt
@@ -323,23 +324,25 @@ class MacroBuyPauseTests(unittest.TestCase):
         self.assertTrue(self.bot.grid_needs_reset)
         self.assertEqual({r['order_id'] for r in self.bot.database.fetch_active_grids() if r['side']=='SELL'},sells)
 
-    def test_stopped_grid_restart_waits_for_cold_macro_cache_then_rebuilds(self):
+    def test_stopped_grid_restart_restores_sells_while_macro_buys_stay_blocked(self):
         self.bot.stop_engine()
         held = self.bot._bot_btc_balance()
-        submissions = len(self.exchange.orders)
+        buy_ids = {key for key,row in self.exchange.orders.items() if row['side']=='buy'}
         self.bot.start_engine(auto_cover_inventory=True)
         self.assertTrue(self.bot.grid_needs_reset)
         # These are deliberate STOP cancellations, not failed working lanes.
         self.assertTrue(any(r['side'] == 'SELL' and r['status'] == 'CANCELED'
                             for r in self.bot.database.fetch_all_orders()))
-        for _ in range(2):
-            self.assertFalse(self.bot.reset_grid())
-        self.assertEqual(len(self.exchange.orders), submissions)
+        self.assertTrue(self.bot.reset_grid())
+        self.assertFalse(self.bot.grid_needs_reset)
+        active = self.bot.database.fetch_active_grids()
+        self.assertTrue(active)
+        self.assertTrue(all(r['side']=='SELL' for r in active))
+        self.assertEqual({key for key,row in self.exchange.orders.items() if row['side']=='buy'},buy_ids)
         self.assertEqual(self.bot._bot_btc_balance(), held)
         self.assertEqual(self.bot.database.get_state(ENGINE_STATUS_KEY), ENGINE_RUNNING)
         self.trend.return_value = True
-        self.assertTrue(self.bot.reset_grid())
-        self.assertFalse(self.bot.grid_needs_reset)
+        self.bot.run_cycle()
         self.assertTrue(any(r['side'] == 'SELL' for r in self.bot.database.fetch_active_grids()))
         self.assertTrue(any(r['side'] == 'BUY' for r in self.bot.database.fetch_active_grids()))
         self.assertEqual(self.exchange.market_sell_calls, 0)
@@ -354,14 +357,33 @@ class MacroBuyPauseTests(unittest.TestCase):
 
     def test_macro_refresh_finishing_mid_cycle_cannot_replay_stopped_lanes(self):
         self.bot.stop_engine()
+        old_ids=set(self.exchange.orders)
         self.bot.start_engine(auto_cover_inventory=True)
-        self.trend.side_effect = [False, True]
-        self.assertFalse(self.bot.reset_grid())
-        self.assertTrue(self.bot.grid_needs_reset)
-        self.assertEqual(self.exchange.fetch_open_orders('BTC/USDT'), [])
-        self.trend.side_effect = None
-        self.trend.return_value = True
+        calls=iter([False]+[True]*100)
+        self.trend.side_effect=lambda:next(calls)
         self.assertTrue(self.bot.reset_grid())
+        live=self.exchange.fetch_open_orders('BTC/USDT')
+        self.assertTrue(live)
+        self.assertTrue(all(row['id'] not in old_ids for row in live))
+
+    def test_cold_process_resume_preserves_reserved_btc_and_never_seeds(self):
+        saved=json.loads(self.bot.database.get_state('grid_run'))
+        saved['baseline_base']='1'
+        self.bot.database.set_state('grid_run',json.dumps(saved))
+        self.bot.baseline_base=D(1)
+        self.exchange.base_free+=D(1)
+        held=self.bot._bot_btc_balance()
+        self.bot.stop_engine()
+        buys={key for key,row in self.exchange.orders.items() if row['side']=='buy'}
+        recovered=GridBot(self.bot.config,self.exchange,GridDatabase(self.path),
+                          macro_trend_provider=lambda:False)
+        recovered.ready_mode=True
+        recovered.start_engine(auto_cover_inventory=True)
+        self.assertTrue(recovered.reset_grid())
+        self.assertEqual(D(json.loads(recovered.database.get_state('grid_run'))['baseline_base']),D(1))
+        self.assertEqual(recovered._bot_btc_balance(),held)
+        self.assertEqual({key for key,row in self.exchange.orders.items() if row['side']=='buy'},buys)
+        self.assertTrue(all(r['side']=='SELL' for r in recovered.database.fetch_active_grids()))
 
     def test_deferred_reanchor_protects_new_buy_fill_and_accounts_sell_fill(self):
         self.bot._macro_trend_provider = lambda: True

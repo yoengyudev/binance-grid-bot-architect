@@ -1,11 +1,11 @@
 # Prospective Testnet release
 
-`v1.0.0-production` freezes `sma200-compressed-atr-v1`, including Residual Fill
+`v1.0.1-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
 and 0.5x closed-hour ATR compression. No strategy parameter is changed here.
 
 Runtime layout:
 
-- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.0-production`
+- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.1-production`
 - Environment: `/home/ubuntu/prospective-testnet/.env` (private, outside Git)
 - Ledger: `/home/ubuntu/prospective-testnet/state/grid_testnet.sqlite`
 - Configuration: `/home/ubuntu/prospective-testnet/state/config.json`
@@ -45,3 +45,12 @@ Keep code/settings fixed during prospective observation. Record the actual
 ACTIVE time as burn-in start. Historical studies and the previous interrupted
 observation are not prospective evidence for this release. No Mainnet deployment
 or automatic post-stop restart is enabled by these files.
+
+Patch release 1.0.1 repairs an execution recovery issue found during authorized
+Telegram maintenance. A reviewed same-grid resume previously waited for Yahoo
+even before rebuilding SELL protection for already-owned BTC. That resume now
+restores only protective SELLs while the Yahoo BUY gate is closed; no new BUY or
+market seed is permitted. New deployments and other reanchors retain their
+existing macro gates. Fixed stop, allocation cap, reserved wallet BTC boundary,
+grid geometry and strategy constants are unchanged. The original 1.0.0 tag is
+retained. Record the maintenance interruption and begin a new observation window.
