@@ -189,21 +189,28 @@ def save_fill_snapshot(
         if verified_fees is not None:
             base_fee, quote_fee = verified_fees
             fee_source = "trades"
+            fees = order.get("fees") or ([order["fee"]] if order.get("fee") else [])
         elif (previous.get("fee_source") == "trades" and
               Decimal(previous["filled_base"]) == filled):
             base_fee = Decimal(previous["base_fee"])
             quote_fee = Decimal(previous["quote_fee"])
             fee_source = "trades"
+            fees = previous.get("fees", [])
         else:
             base_fee = _fees_in_asset(order, base)
             quote_fee = _fees_in_asset(order, quote)
             fee_source = "order"
+            fees = []
         snapshot = json.dumps({
             "filled_base": str(filled),
             "filled_quote": str(quote_cost),
             "base_fee": str(base_fee),
             "quote_fee": str(quote_fee),
             "fee_source": fee_source,
+            # Keep explicit zero and third-asset commissions distinguishable
+            # from missing fee data when the raw order endpoint omits fees.
+            "fees": [{'currency': fee.get('currency'), 'cost': str(fee.get('cost'))}
+                     for fee in fees],
         }, sort_keys=True)
         if previous_text != snapshot:
             database.set_state(key, snapshot)

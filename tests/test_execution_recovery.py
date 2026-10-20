@@ -38,6 +38,57 @@ class HistoryExchange(FakeSpotExchange):
 
 
 class ExecutionRecoveryTests(unittest.TestCase):
+    def test_verified_zero_buy_commission_is_not_estimated_again(self):
+        bot, exchange = self.live(history=True)
+        buy = bot.database.fetch_latest_orders_by_level()[1]
+        exchange.fill(buy['client_order_id'])
+        bot.run_cycle()
+        sell = bot.database.fetch_latest_orders_by_level()[1]
+        exchange.fill(sell['client_order_id'])
+        bot.run_cycle()
+        recorded = bot.database.get_trade_by_sell_order_id(sell['order_id'])
+        quantity = D(sell['amount'])
+        expected = quantity * (D(sell['price']) - D(buy['price']))
+        self.assertEqual(D(recorded['profit']), expected)
+        self.assertEqual(recorded['fee_basis'], 'exchange')
+        before = bot.database.realized_pnl_summary()['total']
+        bot._record_filled_sell(bot.database.get_order(sell['order_id']))
+        self.assertEqual(bot.database.realized_pnl_summary()['total'], before)
+        snapshot = json.loads(bot.database.get_state(FILL_SNAPSHOT_PREFIX + buy['order_id']))
+        self.assertEqual(snapshot['fees'], [{'currency': 'USDT', 'cost': '0'}])
+
+    def test_legacy_verified_zero_snapshot_is_upgraded_from_private_trades(self):
+        bot, exchange = self.live(history=True)
+        buy = bot.database.fetch_latest_orders_by_level()[1]
+        exchange.fill(buy['client_order_id'])
+        bot.run_cycle()
+        key = FILL_SNAPSHOT_PREFIX + buy['order_id']
+        old = json.loads(bot.database.get_state(key))
+        old.pop('fees', None)
+        bot.database.set_state(key, json.dumps(old))
+        sell = bot.database.fetch_latest_orders_by_level()[1]
+        exchange.fill(sell['client_order_id'])
+        bot.run_cycle()
+        self.assertEqual(bot.database.get_trade_by_sell_order_id(sell['order_id'])['fee_basis'], 'exchange')
+        self.assertEqual(json.loads(bot.database.get_state(key))['fees'][0]['cost'], '0')
+
+    def test_third_asset_buy_commission_remains_estimated_not_free(self):
+        bot, exchange = self.live(history=True)
+        original = exchange.fetch_order_trades
+        def third_asset(*args, **kwargs):
+            trades = original(*args, **kwargs)
+            for trade in trades:
+                trade['info'].update(commission='0.01', commissionAsset='BNB')
+            return trades
+        buy = bot.database.fetch_latest_orders_by_level()[1]
+        exchange.fill(buy['client_order_id'])
+        with patch.object(exchange, 'fetch_order_trades', side_effect=third_asset):
+            bot.run_cycle()
+        sell = bot.database.fetch_latest_orders_by_level()[1]
+        exchange.fill(sell['client_order_id'])
+        bot.run_cycle()
+        self.assertEqual(bot.database.get_trade_by_sell_order_id(sell['order_id'])['fee_basis'], 'mixed')
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

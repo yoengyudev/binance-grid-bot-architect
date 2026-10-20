@@ -1,11 +1,11 @@
 # Prospective Testnet release
 
-`v1.0.3-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
+`v1.0.4-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
 and 0.5x closed-hour ATR compression. No strategy parameter is changed here.
 
 Runtime layout:
 
-- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.3-production`
+- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.4-production`
 - Environment: `/home/ubuntu/prospective-testnet/.env` (private, outside Git)
 - Ledger: `/home/ubuntu/prospective-testnet/state/grid_testnet.sqlite`
 - Configuration: `/home/ubuntu/prospective-testnet/state/config.json`
@@ -67,3 +67,8 @@ retains orders/parent lots after reconciliation. It refuses Mainnet, IDLE/HALTED
 fault/cleanup/pause/reset/liquidation states and unexplained wallet BTC. The
 canonical unit remains plain `--ready`; the operator removes the one-time
 runtime override after verification. This does not enable post-stop restarts.
+
+Patch 1.0.4 adds durable between-poll stop-trade catch-up, preserves verified
+zero commissions, and rejects stale dashboard market events. See
+EXECUTION_SAFETY.md for behavior, limitations and validation. This remains
+Testnet; fixed strategy settings and manual post-stop review are retained.

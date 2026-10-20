@@ -23,6 +23,7 @@ from dashboard_reads import DashboardReads
 from allocation import tracked_position_cost, pending_buy_commitment, require_total_cap
 from budget_policy import CAP_EXHAUSTED, CAP_STATE_KEY, CAP_REASON_KEY, CAP_ORDER_KEY, residual_quantity
 from stop_controller import StopController
+from stop_history import StopTradeHistory
 from notifier import TelegramNotifier, markdown_text, schedule_telegram_alert
 from settings import (
     BREAKOUT_COOLDOWN_SECONDS,
@@ -198,6 +199,12 @@ class GridBot:
             exchange_guard=self.assert_runner_lease,
         )
         self.market: Dict[str, Any] = {}
+        self._stop_history = None
+        if getattr(exchange, 'id', None) == 'binance':
+            self._stop_history = StopTradeHistory(
+                database, lambda params: self._call(exchange.public_get_aggtrades, params),
+                config.symbol.replace('/', ''),
+            )
         self.anchor: Optional[Decimal] = None
         self.levels: List[Decimal] = []
         self.upper_levels: List[Decimal] = []
@@ -1388,7 +1395,8 @@ class GridBot:
         if self.database.in_transaction:
             raise RuntimeError("Exchange I/O must occur outside SQLite transactions.")
         # Retry only reads. A timed-out mutation may already have executed.
-        readable = getattr(method, "__name__", "").startswith(("fetch_", "load_"))
+        readable = (getattr(method, "__name__", "").startswith(("fetch_", "load_")) or
+                    method == getattr(self.exchange, "public_get_aggtrades", None))
         for attempt in range(3 if readable else 1):
             self.assert_runner_lease()
             try:
@@ -1566,6 +1574,8 @@ class GridBot:
         self.market = self.exchange.market(self.config.symbol)
         if not self.market.get("spot") or self.market.get("active") is False:
             raise TradingHalt("Configured symbol is not an active Spot market.")
+        if persist and self._stop_history is not None:
+            self._stop_history.initialize(floor=self.config.stop_loss_price)
         current_price = self._ticker_price()
         if persist:
             with self.database.transaction():
@@ -2395,11 +2405,27 @@ class GridBot:
         if parent is None or parent["side"] != "BUY":
             raise TradingHalt("Filled sell has no tracked parent buy.")
         buy = self._fetch_order(parent, persist=False)
+        carry = json.loads(self.database.get_state("carry_inventory") or '{}')
+        synthetic = carry.get('order_id') == parent_id and not parent.get('client_order_id')
+        snapshot = json.loads(self.database.get_state(FILL_SNAPSHOT_PREFIX + parent_id) or '{}')
+        buy_verified = False
+        if not synthetic and getattr(self.exchange, 'has', {}).get('fetchOrderTrades'):
+            if (snapshot.get('fee_source') == 'trades' and snapshot.get('fees') and
+                    Decimal(snapshot['filled_base']) == _order_decimal(buy.get('filled'))):
+                buy = dict(buy, fee=None, fees=snapshot['fees'])
+            else:
+                # Upgrade old snapshots once: zero is valid, missing is unknown.
+                buy = verified_execution_order(self._call, self.exchange, self.config.symbol, buy)
+            buy_verified = True
         sell = sell_order if sell_order is not None else self._fetch_order(row, persist=False)
         if sell_order is None:
             sell = verified_execution_order(self._call, self.exchange, self.config.symbol, sell)
         with self.database.transaction():
             self._persist_order_response(parent, buy)
+            if buy_verified:
+                self._save_fill_snapshot(parent_id, buy, verified_fees=(
+                    _fees_in_asset(buy, self.market['base']),
+                    _fees_in_asset(buy, self.market['quote'])))
             self._persist_order_response(row, sell, "FILLED")
             if getattr(self.exchange, "has", {}).get("fetchOrderTrades"):
                 self._save_fill_snapshot(row["order_id"], sell, verified_fees=(
@@ -2475,6 +2501,14 @@ class GridBot:
                 return True
             if mode in (LIQUIDATED, LIQUIDATION_HALTED):
                 return False
+            crossed = None
+            if self._stop_history is not None and price >= self.config.stop_loss_price:
+                crossed = self._stop_history.scan(self.config.stop_loss_price)
+                if crossed is not None:
+                    price = min(price, crossed)
+                    # Fills can race the public-history request. Refresh again
+                    # after witnessing a crossing, including locked/partial BTC.
+                    bot_btc_balance = None
             if bot_btc_balance is None:
                 try:
                     bot_btc_balance = self._bot_btc_balance()
@@ -2483,6 +2517,11 @@ class GridBot:
                         self._queue_stop_verification(price, error)
                     raise
             if bot_btc_balance <= 0:
+                if crossed is not None:
+                    self._stop_history.acknowledge_flat()
+                    # No new entry in this cycle. Drain any later history on
+                    # the next pass before allowing a fresh acquisition.
+                    return True
                 return False
             self.advance_trailing_stop(price, bot_btc_balance=bot_btc_balance)
             if price < self.config.stop_loss_price:
@@ -3785,6 +3824,10 @@ class GridBot:
             if current <= self.config.stop_loss_price:
                 raise TradingHalt("Market price is at or below the hard stop.")
             request = None
+            if self._stop_history is not None:
+                # Explicit human START begins a reviewed observation interval;
+                # process restarts while RUNNING retain the durable cursor.
+                self._stop_history.initialize(reset=True, floor=self.config.stop_loss_price)
             if not state["resumable"] and not self.grid_needs_reset:
                 carry_amount, carry_cost = self._carry_inventory()
                 _, uppers = self._validate_reset_grid(self.config, self.anchor, carry_amount)
