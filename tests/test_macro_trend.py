@@ -6,7 +6,8 @@ import tempfile
 from threading import Event
 import unittest
 import json
-from unittest.mock import Mock, patch
+import asyncio
+from unittest.mock import Mock, patch, AsyncMock
 
 import ccxt
 import pandas as pd
@@ -17,7 +18,8 @@ from engine import GridBot
 from macro_trend import MacroTrendMonitor, MacroTrendSnapshot, fetch_macro_trend
 from models import TradingHalt
 from settings import (MACRO_BUY_PAUSE_KEY, SAFETY_MODE_KEY, PAUSED_MANUAL,
-                      PAUSED_RESET, LIQUIDATED, ENGINE_RUNNING, ENGINE_STATUS_KEY)
+                      PAUSED_RESET, LIQUIDATED, ENGINE_RUNNING, ENGINE_STATUS_KEY,
+                      MACRO_BUY_REASON_KEY, MACRO_BUY_NOTICE_KEY, ENGINE_HALTED)
 from tests.fakes import make_bot
 
 NOW = pd.Timestamp('2026-10-17T01:00:00Z')
@@ -36,6 +38,13 @@ def hourly_history(day=None, last=101):
     day = day if day is not None else NOW.normalize() - pd.Timedelta(days=1)
     frame = pd.DataFrame({'Close': [100.] * 24},
                          index=pd.date_range(day, periods=24, freq='h'))
+    frame.iloc[-1, 0] = last
+    return frame
+
+
+def quarter_hour_history(day=None, last=101):
+    day = day if day is not None else NOW.normalize() - pd.Timedelta(days=1)
+    frame = pd.DataFrame({'Close': [100.] * 96}, index=pd.date_range(day, periods=96, freq='15min'))
     frame.iloc[-1, 0] = last
     return frame
 
@@ -113,8 +122,46 @@ class YahooDataTests(unittest.TestCase):
             fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], current]))
 
     def test_hourly_failure_is_unavailable_and_does_not_fabricate_a_close(self):
-        with self.assertRaises(TimeoutError):
-            fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], TimeoutError()]))
+        with self.assertRaisesRegex(ValueError, 'complete UTC day'):
+            fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], TimeoutError(), TimeoutError()]))
+
+    def test_incomplete_hourly_day_recovers_from_complete_quarter_hours(self):
+        download = Mock(side_effect=[history().iloc[:-1], hourly_history().iloc[:-1], quarter_hour_history(last=102)])
+        result = fetch_macro_trend(now=NOW, download=download)
+        self.assertEqual(result.close, 102)
+        self.assertAlmostEqual(result.sma200, (19900+102)/200)
+        self.assertEqual(result.recovery_intervals, (('2026-10-16', '15m'),))
+        self.assertEqual(download.call_args.kwargs['interval'], '15m')
+        self.assertFalse(download.call_args.kwargs['ignore_tz'])
+        self.assertEqual(pd.Timestamp(download.call_args.kwargs['end']), NOW)
+
+    def test_hourly_timeout_can_recover_from_independent_quarter_hour_response(self):
+        result = fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], TimeoutError(), quarter_hour_history()]))
+        self.assertTrue(result.uptrend)
+
+    def test_quarter_hour_recovery_never_relaxes_completeness_or_uses_forming_day(self):
+        good = quarter_hour_history()
+        shifted = good.copy(); shifted.index += pd.Timedelta(minutes=1)
+        for invalid in (good.iloc[:-1], good.drop(good.index[40]), pd.concat([good, good.tail(1)]),
+                        shifted, good.assign(Close=0), good.assign(Close=float('inf')),
+                        good.assign(Close=float('nan')), quarter_hour_history(NOW.normalize())):
+            with self.subTest(frame=len(invalid)), self.assertRaisesRegex(ValueError, 'complete UTC day'):
+                fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], hourly_history().iloc[:-1], invalid]))
+
+    def test_recovery_uses_one_complete_resolution_per_day_and_preserves_daily_authority(self):
+        daily = history(103).iloc[:-1]
+        day = daily.index[-1]
+        daily.loc[day, 'Close'] = float('nan')
+        hourly = pd.concat([hourly_history(day, last=102), hourly_history().iloc[:-1]])
+        quarters = pd.concat([quarter_hour_history(day, last=999), quarter_hour_history(last=104)])
+        result = fetch_macro_trend(now=NOW, download=Mock(side_effect=[daily, hourly, quarters]))
+        self.assertEqual(result.close, 104)
+        self.assertAlmostEqual(result.sma200, (19800+102+104)/200)
+        self.assertEqual(dict(result.recovery_intervals), {str(day.date()):'1h', '2026-10-16':'15m'})
+
+    def test_partial_hourly_and_partial_quarter_days_are_not_combined(self):
+        with self.assertRaisesRegex(ValueError, 'complete UTC day'):
+            fetch_macro_trend(now=NOW, download=Mock(side_effect=[history().iloc[:-1], hourly_history().iloc[:-1], quarter_hour_history().iloc[4:]]))
 
     def test_multiindex_hourly_recovery_matches_flat_output(self):
         hourly = hourly_history()
@@ -175,6 +222,33 @@ class YahooDataTests(unittest.TestCase):
 
 
 class MonitorTests(unittest.TestCase):
+    def test_worker_crossing_midnight_does_not_publish_yesterdays_signal(self):
+        monitor = self.monitor()
+        monitor.get_macro_trend()
+        self.utc = datetime(2026,10,18,tzinfo=timezone.utc)
+        self.jobs.pop()()
+        self.assertFalse(monitor.status()['available'])
+        self.assertIsNone(monitor.status()['last_success_at'])
+        self.assertIn('stale signal', monitor.status()['error'])
+        self.now=30
+        self.fetch.return_value=MacroTrendSnapshot(101,100,'2026-10-17')
+        monitor.get_macro_trend(); self.jobs.pop()()
+        self.assertTrue(monitor.get_macro_trend())
+
+    def test_worker_rejects_future_and_nonfinite_snapshots(self):
+        for snapshot in (MacroTrendSnapshot(101,100,'2026-10-17'), MacroTrendSnapshot(float('inf'),100,'2026-10-16'),
+                         MacroTrendSnapshot(101,0,'2026-10-16')):
+            monitor=self.monitor(); self.fetch.return_value=snapshot
+            monitor.get_macro_trend(); self.jobs.pop()()
+            self.assertFalse(monitor.status()['available'])
+
+    def test_failed_worker_launch_waits_before_retrying(self):
+        monitor=self.monitor()
+        monitor._launch=Mock(side_effect=RuntimeError('thread unavailable'))
+        for _ in range(10):self.assertFalse(monitor.get_macro_trend())
+        self.assertEqual(monitor._launch.call_count,1)
+        self.now=30; monitor.get_macro_trend()
+        self.assertEqual(monitor._launch.call_count,2)
     def test_reconstruction_provenance_is_exposed_in_read_only_status(self):
         monitor = self.monitor()
         self.fetch.return_value = MacroTrendSnapshot(101, 100, '2026-10-16', ('2026-10-16',))
@@ -331,6 +405,52 @@ class MacroBuyPauseTests(unittest.TestCase):
         self.bot.database.set_state(ENGINE_STATUS_KEY, ENGINE_RUNNING)
         self.trend = Mock(return_value=False)
         self.bot._macro_trend_provider = self.trend
+
+    def test_macro_notifications_are_deduplicated_and_recovery_notices_are_delivered(self):
+        notifier=Mock();notifier.notify_macro_buy_state=AsyncMock()
+        self.bot.run_cycle()
+        asyncio.run(self.bot._notify_safety_state(notifier))
+        self.bot.run_cycle()
+        asyncio.run(self.bot._notify_safety_state(notifier))
+        notifier.notify_macro_buy_state.assert_awaited_once_with(True,'SIGNAL_BLOCKED')
+        self.trend.return_value=True
+        self.bot.run_cycle()
+        asyncio.run(self.bot._notify_safety_state(notifier))
+        self.assertEqual(notifier.notify_macro_buy_state.await_count,2)
+        notifier.notify_macro_buy_state.assert_awaited_with(False,'ABOVE_SMA200')
+        self.assertIsNone(self.bot.database.get_state(MACRO_BUY_NOTICE_KEY))
+
+    def test_valid_but_bearish_data_gets_a_reason_change_alert_without_reopening_buys(self):
+        provider=Mock(return_value=False)
+        with patch.object(engine,'get_macro_trend',provider), patch.object(engine,'get_macro_status') as status:
+            self.bot._macro_trend_provider=provider
+            status.return_value={'buy_allowed':False,'reason_code':'DATA_UNAVAILABLE'}
+            self.bot.run_cycle()
+            status.return_value={'buy_allowed':False,'reason_code':'BELOW_OR_EQUAL_SMA200'}
+            self.bot.run_cycle()
+        self.assertEqual(self.bot.database.get_state(MACRO_BUY_PAUSE_KEY),'1')
+        notice=json.loads(self.bot.database.get_state(MACRO_BUY_NOTICE_KEY))
+        self.assertEqual(notice,{'paused':True,'reason':'BELOW_OR_EQUAL_SMA200'})
+        self.assertFalse(any(r['side']=='BUY' for r in self.bot.database.fetch_active_grids()))
+
+    def test_macro_recovery_never_clears_completed_stop_or_starts_engine(self):
+        self.bot.run_cycle()
+        self.exchange.price=D(69)
+        self.bot.run_cycle()
+        self.assertEqual(self.bot.database.get_state(SAFETY_MODE_KEY),LIQUIDATED)
+        self.bot._set_macro_buy_pause(False)
+        self.assertEqual(self.bot.database.get_state(SAFETY_MODE_KEY),LIQUIDATED)
+        self.assertEqual(self.bot.database.get_state(ENGINE_STATUS_KEY),ENGINE_HALTED)
+        self.assertEqual(self.exchange.fetch_open_orders('BTC/USDT'),[])
+
+    def test_failed_macro_notice_remains_pending_for_retry(self):
+        self.bot.run_cycle()
+        notifier=Mock();notifier.notify_macro_buy_state=AsyncMock(side_effect=RuntimeError('offline'))
+        asyncio.run(self.bot._notify_safety_state(notifier))
+        self.assertIsNotNone(self.bot.database.get_state(MACRO_BUY_NOTICE_KEY))
+        notifier.notify_macro_buy_state.side_effect=None
+        asyncio.run(self.bot._notify_safety_state(notifier))
+        self.assertIsNone(self.bot.database.get_state(MACRO_BUY_NOTICE_KEY))
 
     def test_downtrend_cancels_only_bot_buys_retains_sells_and_inventory(self):
         manual = self.exchange.create_order('BTC/USDT','limit','buy',.2,50,{'newClientOrderId':'manual'})

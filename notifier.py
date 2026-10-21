@@ -122,3 +122,14 @@ class TelegramNotifier(LegacyTelegramNotifier):
     async def notify_hard_stop(self, liquidated: bool) -> None:
         outcome = "LIQUIDATED — inventory verified flat" if liquidated else "HALTED — review liquidation manually"
         schedule_telegram_alert(f"🚨 *HARD STOP*\n{markdown_text(outcome)}")
+
+    async def notify_macro_buy_state(self, paused: bool, reason: str) -> None:
+        if not paused:
+            message = 'Macro signal approved — BUYs permitted.'
+        elif reason == 'BELOW_OR_EQUAL_SMA200':
+            message = 'Macro data available — BUYs paused because close is at/below SMA200.'
+        elif reason in ('DATA_UNAVAILABLE', 'DATA_STALE'):
+            message = 'BUYs paused — macro data unavailable or stale. Retrying valid data recovery.'
+        else:
+            message = 'BUYs paused — macro signal blocked or unavailable.'
+        schedule_telegram_alert(markdown_text(message + '\nOther safety controls remain unchanged. A halted engine stays halted.'))

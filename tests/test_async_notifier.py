@@ -21,6 +21,18 @@ CONFIG = {'TELEGRAM_BOT_TOKEN': 'secret-token', 'TELEGRAM_CHAT_ID': '-100123'}
 
 
 class AsyncTelegramTests(unittest.IsolatedAsyncioTestCase):
+    async def test_macro_notices_distinguish_data_failure_bearish_signal_and_permission(self):
+        with patch('notifier.schedule_telegram_alert') as schedule:
+            sender=notifier.TelegramNotifier()
+            await sender.notify_macro_buy_state(True,'DATA_UNAVAILABLE')
+            await sender.notify_macro_buy_state(True,'BELOW_OR_EQUAL_SMA200')
+            await sender.notify_macro_buy_state(False,'ABOVE_SMA200')
+        messages=[call.args[0] for call in schedule.call_args_list]
+        self.assertIn('data unavailable',messages[0])
+        self.assertIn('data available',messages[1])
+        self.assertIn('BUYs permitted',messages[2])
+        self.assertTrue(all('A halted engine stays halted' in m for m in messages))
+
     async def asyncTearDown(self):
         await notifier.close_notifications()
 

@@ -23,6 +23,7 @@ class MacroTrendSnapshot:
     sma200: float
     candle_day: str
     reconstructed_days: tuple[str, ...] = ()
+    recovery_intervals: tuple[tuple[str, str], ...] = ()
 
     @property
     def uptrend(self) -> bool:
@@ -45,35 +46,50 @@ def _yahoo_closes(frame) -> pd.Series:
 
 
 def _recover_daily_closes(close, *, today, retrieved, download):
-    """Recover only recent absent daily closes from complete same-feed UTC days.
+    """Use complete same-feed UTC days, trying hourly then 15-minute bars.
 
-    A daily close is the final completed hourly close, not an average. Require
-    exactly all 24 valid hourly bars; never interpolate or reuse another day.
-    Already-valid daily values remain authoritative.
+    Never patch holes by mixing resolutions or using a forming candle. The
+    final completed intraday close supplies the missing daily close. Existing
+    valid daily values remain authoritative; publish repairs atomically.
     """
     missing = close.index[close.isna()]
     if missing.empty:
-        return ()
+        return (), ()
     oldest = today - pd.Timedelta(days=HOURLY_RECOVERY_DAYS)
     if (missing < oldest).any():
         raise ValueError('Yahoo SMA200 has missing daily closes outside the hourly recovery window.')
-    hourly = _yahoo_closes(download(
-        'BTC-USD', start=missing.min().date().isoformat(), end=retrieved.to_pydatetime(),
-        interval='1h', auto_adjust=False, progress=False, threads=False,
-        timeout=10, multi_level_index=False,
-    ))
-    recovered = {}
-    for day in missing:
-        expected = pd.date_range(day, periods=24, freq='h')
-        bars = hourly.loc[(hourly.index >= day) & (hourly.index < day + pd.Timedelta(days=1))]
-        if (len(bars) != 24 or not bars.index.sort_values().equals(expected)
-                or not all(math.isfinite(value) and value > 0 for value in bars)):
-            raise ValueError(f'Yahoo hourly recovery needs 24 valid UTC bars for {day.date()}.')
-        recovered[day] = float(bars.loc[expected[-1]])
+    recovered, resolutions, failures = {}, {}, []
+    for interval, frequency, count in (('1h', 'h', 24), ('15m', '15min', 96)):
+        pending = [day for day in missing if day not in recovered]
+        if not pending:
+            break
+        try:
+            intraday = _yahoo_closes(download(
+                'BTC-USD', start=min(pending).date().isoformat(), end=retrieved.to_pydatetime(),
+                interval=interval, auto_adjust=False, progress=False, threads=False,
+                timeout=10, multi_level_index=False, ignore_tz=False,
+            ))
+            for day in pending:
+                expected = pd.date_range(day, periods=count, freq=frequency)
+                bars = intraday.loc[(intraday.index >= day) & (intraday.index < day + pd.Timedelta(days=1))]
+                if (len(bars) == count and bars.index.sort_values().equals(expected)
+                        and all(math.isfinite(value) and value > 0 for value in bars)):
+                    recovered[day] = float(bars.loc[expected[-1]])
+                    resolutions[day] = interval
+        except Exception as error:
+            # Provider failures never authorize trading. Try the independent
+            # intraday response, then let the monitor retry the whole fetch.
+            failures.append(f'{interval}: {type(error).__name__}')
+    pending = [str(day.date()) for day in missing if day not in recovered]
+    if pending:
+        detail = '; '.join(failures)
+        raise ValueError('Yahoo recovery needs a complete UTC day (24 hourly or 96 15-minute bars) for '
+                         + ', '.join(pending) + (f'; {detail}' if detail else '') + '.')
     # Do not partially repair a snapshot when any missing day is unverified.
     for day, value in recovered.items():
         close.loc[day] = value
-    return tuple(day.date().isoformat() for day in missing)
+    return (tuple(day.date().isoformat() for day in missing),
+            tuple((day.date().isoformat(), resolutions[day]) for day in missing))
 
 
 def fetch_macro_trend(*, now=None, download=None) -> MacroTrendSnapshot:
@@ -82,7 +98,7 @@ def fetch_macro_trend(*, now=None, download=None) -> MacroTrendSnapshot:
     A midnight end can make yfinance cache an incomplete historical response
     indefinitely. Ending at retrieval time uses its live request path. Today's
     forming candle is discarded by the completed-day reindex below. Recent
-    blank daily closes may be recovered from 24 verified Yahoo hourly bars.
+    blank daily closes may be recovered from complete Yahoo intraday days.
     """
     retrieved = pd.Timestamp(now if now is not None else datetime.now(timezone.utc)).tz_convert('UTC')
     today = retrieved.normalize()
@@ -91,18 +107,18 @@ def fetch_macro_trend(*, now=None, download=None) -> MacroTrendSnapshot:
     frame = download(
         'BTC-USD', start=start.date().isoformat(), end=retrieved.to_pydatetime(),
         interval='1d', auto_adjust=False, progress=False, threads=False,
-        timeout=10, multi_level_index=False,
+        timeout=10, multi_level_index=False, ignore_tz=False,
     )
     close = _yahoo_closes(frame)
     if not (close.index == close.index.normalize()).all():
         raise ValueError('Yahoo daily timestamps are not UTC midnight.')
     required = pd.date_range(today - pd.Timedelta(days=200), periods=200, freq='D')
     close = close.reindex(required)  # Missing/stale days remain invalid; never forward-fill.
-    reconstructed = _recover_daily_closes(close, today=today, retrieved=retrieved, download=download)
+    reconstructed, intervals = _recover_daily_closes(close, today=today, retrieved=retrieved, download=download)
     if not all(math.isfinite(value) and value > 0 for value in close):
         raise ValueError('Yahoo SMA200 needs 200 consecutive valid closes through yesterday.')
     sma = float(close.rolling(200, min_periods=200).mean().iloc[-1])
-    return MacroTrendSnapshot(float(close.iloc[-1]), sma, required[-1].date().isoformat(), reconstructed)
+    return MacroTrendSnapshot(float(close.iloc[-1]), sma, required[-1].date().isoformat(), reconstructed, intervals)
 
 
 class MacroTrendMonitor:
@@ -132,6 +148,12 @@ class MacroTrendMonitor:
             result = self.fetch()
             if not isinstance(result, MacroTrendSnapshot):
                 raise ValueError('Invalid Yahoo macro snapshot.')
+            yesterday = (pd.Timestamp(self.utcnow()).tz_convert('UTC').normalize()
+                         - pd.Timedelta(days=1)).date().isoformat()
+            if result.candle_day != yesterday:
+                raise ValueError('UTC day changed or Yahoo returned a stale signal; retry required.')
+            if not all(math.isfinite(v) and v > 0 for v in (result.close, result.sma200)):
+                raise ValueError('Invalid Yahoo macro prices.')
         except Exception as error:
             with self._lock:
                 self._snapshot, self._updated = None, None
@@ -167,6 +189,7 @@ class MacroTrendMonitor:
                         last_success_at=self._last_success_at, age_seconds=age,
                         candle_day=snapshot.candle_day if snapshot is not None else None,
                         reconstructed_days=list(snapshot.reconstructed_days) if snapshot is not None else [],
+                        recovery_intervals=dict(snapshot.recovery_intervals) if snapshot is not None else {},
                         close=snapshot.close if snapshot is not None else None,
                         sma200=snapshot.sma200 if snapshot is not None else None)
 

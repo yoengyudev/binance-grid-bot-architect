@@ -51,6 +51,8 @@ from settings import (
     MAX_LEVELS,
     MIN_GRID_ORDER_NOTIONAL,
     MACRO_BUY_PAUSE_KEY,
+    MACRO_BUY_REASON_KEY,
+    MACRO_BUY_NOTICE_KEY,
     ORDER_CLIENT_PREFIX,
     ORDER_CLIENT_PREFIX_KEY,
     ORDER_CLEANUP_ALARM_KEY,
@@ -101,7 +103,7 @@ from grid_geometry import defended_bounds, validate_grid_returns
 from production_baseline import (BASELINE_ID, MIN_GRID_RETURN, compressed_bounds,
                                  closed_hourly_atr)
 from strategy_policy import STRATEGY_VERSION, catastrophic_stop, closed_daily_sma, DAILY_MS
-from macro_trend import get_macro_trend
+from macro_trend import get_macro_trend, get_macro_status
 
 LOGGER = logging.getLogger(__name__)
 
@@ -3891,16 +3893,26 @@ class GridBot:
 
     def _set_macro_buy_pause(self, paused: bool) -> None:
         prior = self.database.get_state(MACRO_BUY_PAUSE_KEY) == '1'
-        if prior == paused:
+        reason = 'SIGNAL_BLOCKED' if paused else 'ABOVE_SMA200'
+        if paused and self._macro_trend_provider is get_macro_trend:
+            status = get_macro_status()
+            reason = status['reason_code'] if not status['buy_allowed'] else 'DATA_UNAVAILABLE'
+        prior_reason = self.database.get_state(MACRO_BUY_REASON_KEY)
+        if prior == paused and prior_reason in (None, reason):
+            if prior_reason is None:
+                self.database.set_state(MACRO_BUY_REASON_KEY, reason)
             return
         with self.database.transaction():
             if paused:
                 self.database.set_state(MACRO_BUY_PAUSE_KEY, '1')
             else:
                 self.database.clear_state(MACRO_BUY_PAUSE_KEY)
+            self.database.set_state(MACRO_BUY_REASON_KEY, reason)
+            self.database.set_state(MACRO_BUY_NOTICE_KEY, json.dumps({'paused': paused, 'reason': reason}))
             state = self.database.get_state(ENGINE_STATUS_KEY)
             self.database.record_transition(state, state,
-                'MACRO_BUYS_SUSPENDED' if paused else 'MACRO_BUYS_RESUMED',
+                ('MACRO_BUY_REASON_CHANGED' if prior == paused else
+                 'MACRO_BUYS_SUSPENDED' if paused else 'MACRO_BUYS_RESUMED'),
                 'Yahoo BTC-USD close <= Daily SMA200, or signal unavailable/stale.' if paused else None)
         if paused:
             LOGGER.warning('Price below/equal SMA 200 or macro data unavailable. '
@@ -4170,6 +4182,19 @@ class GridBot:
         return events
 
     async def _notify_safety_state(self, notifier: TelegramNotifier) -> None:
+        macro_notice = self.database.get_state(MACRO_BUY_NOTICE_KEY)
+        if macro_notice:
+            try:
+                notice = json.loads(macro_notice)
+                await notifier.notify_macro_buy_state(notice['paused'], notice['reason'])
+            except Exception as error:
+                LOGGER.warning('Macro BUY-state Telegram update failed: %s', type(error).__name__)
+            else:
+                # A worker/control action can replace a pending notice while
+                # the notifier is awaited; never acknowledge a newer event.
+                with self.database.transaction():
+                    if self.database.get_state(MACRO_BUY_NOTICE_KEY) == macro_notice:
+                        self.database.clear_state(MACRO_BUY_NOTICE_KEY)
         if self.database.get_state(SIZING_PAUSE_NOTICE_KEY):
             try:
                 await notifier.notify_sizing_pause(

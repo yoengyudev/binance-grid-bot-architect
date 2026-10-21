@@ -1,5 +1,5 @@
 [Unit]
-Description=Prospective Testnet burn-in v1.0.4-production
+Description=Prospective Testnet burn-in v1.0.5-production
 Wants=network-online.target
 After=network-online.target
 Conflicts=binance-grid-bot.service
@@ -9,10 +9,10 @@ StartLimitIntervalSec=0
 Type=simple
 User=ubuntu
 Group=ubuntu
-WorkingDirectory=/home/ubuntu/prospective-testnet/releases/v1.0.4-production
+WorkingDirectory=/home/ubuntu/prospective-testnet/releases/v1.0.5-production
 EnvironmentFile=/home/ubuntu/prospective-testnet/.env
 ExecStartPre=/usr/bin/test -f /home/ubuntu/prospective-testnet/state/grid_testnet.sqlite
-ExecStart=/home/ubuntu/prospective-testnet/releases/v1.0.4-production/.venv/bin/python /home/ubuntu/prospective-testnet/releases/v1.0.4-production/main.py --ready
+ExecStart=/home/ubuntu/prospective-testnet/releases/v1.0.5-production/.venv/bin/python /home/ubuntu/prospective-testnet/releases/v1.0.5-production/main.py --ready
 Restart=on-failure
 RestartSec=60s
 RestartPreventExitStatus=2 130

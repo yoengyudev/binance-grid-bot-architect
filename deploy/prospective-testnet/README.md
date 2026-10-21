@@ -1,11 +1,11 @@
 # Prospective Testnet release
 
-`v1.0.4-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
+`v1.0.5-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
 and 0.5x closed-hour ATR compression. No strategy parameter is changed here.
 
 Runtime layout:
 
-- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.4-production`
+- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.5-production`
 - Environment: `/home/ubuntu/prospective-testnet/.env` (private, outside Git)
 - Ledger: `/home/ubuntu/prospective-testnet/state/grid_testnet.sqlite`
 - Configuration: `/home/ubuntu/prospective-testnet/state/config.json`
@@ -72,3 +72,9 @@ Patch 1.0.4 adds durable between-poll stop-trade catch-up, preserves verified
 zero commissions, and rejects stale dashboard market events. See
 EXECUTION_SAFETY.md for behavior, limitations and validation. This remains
 Testnet; fixed strategy settings and manual post-stop review are retained.
+
+Patch 1.0.5 adds complete same-feed 15-minute recovery when hourly Yahoo
+recovery is incomplete, validates refresh results across UTC rollover, and
+adds deduplicated macro BUY-state alerts. It retains the strict daily
+SMA200 gate and manual post-stop review. During this deployment the
+existing completed liquidation remains HALTED; no grid is restarted.

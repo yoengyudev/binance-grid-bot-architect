@@ -23,16 +23,24 @@ False until usable data is available. Calls thereafter use the cached result.
   Recover that day's close only when all 24 distinct UTC hourly bars are present
   and have finite, positive closes. Use the 23:00 bar's completed close, never
   the hourly mean, today's forming candle, interpolation, or a previous close.
-  Preserve already-valid daily values. Older gaps or incomplete hourly data
-  keep BUYs paused. No Binance prices are substituted into the Yahoo series.
+  If the hourly response fails or a missing day is incomplete, try one bounded
+  same-feed 15-minute request. Require all 96 distinct UTC quarter-hour bars
+  with positive, finite closes, then use the completed 23:45 close. Never mix
+  partial resolutions to manufacture a complete day. Preserve days already
+  verified from hourly bars, and publish no repairs unless every missing day
+  is verified. Older gaps or days incomplete in both resolutions keep BUYs
+  paused. No Binance prices are substituted into the Yahoo series.
   A complete daily response makes no hourly request and behaves as before.
-- Status includes `reconstructed_days` so operators can identify recovered
+- Status includes `reconstructed_days` and a `recovery_intervals` mapping so operators can identify recovered
   candles. A successful recovery still requires `close > sma200`; it does not
   force the regime filter to approve BUYs. No new dependency is needed.
 - Refresh lazily every five minutes while the engine calls the accessor. Keep
   an existing valid result during a background refresh for at most 15 minutes.
   A refresh failure invalidates it immediately and retries after 30 seconds.
   UTC day rollover invalidates the previous day's signal immediately.
+  A worker completing after midnight must match the new required signal day;
+  stale/future/nonfinite snapshots are rejected before publication. Failure to
+  launch a worker also observes the 30-second retry interval.
 - At most one download runs at a time. A slow response cannot accumulate jobs
   or hold the cycle lock, exchange lock, API event loop, or SQLite transaction.
   The accessor never waits for HTTP; it only takes a short snapshot lock and
@@ -74,6 +82,15 @@ Macro pause does not liquidate BTC. The fixed 15% catastrophic stop and manual
 panic liquidation still cancel SELLs and exit inventory when their own protocols
 require it. Completed liquidation still requires human review and manual START.
 
+Macro BUY-state changes queue a best-effort Telegram notification through the
+existing background notifier. The pending event survives a process restart;
+unchanged polls do not queue duplicate notices. Reasons distinguish unavailable
+or stale data from a valid bearish SMA200 signal. Data becoming valid but still
+bearish produces a reason-change notice and leaves BUYs paused. A positive
+signal means BUY permission only: it never clears a manual pause, reset lock or
+completed hard-stop halt. Delivery uses the existing best-effort queue; it is
+not a guaranteed-delivery outbox.
+
 The earlier Binance production Spot SMA200 gate for START/re-anchors is retained.
 Yahoo `BTC-USD` and Binance `BTC/USDT` are separate sources/instruments and can
 disagree; both applicable gates must permit new deployment/buying. Testnet
@@ -93,3 +110,17 @@ hourly closes were available. Recovery produced a completed close of
 fetcher separately and did not replace the running release, place orders, or
 restart the service. Any deployment requires a new release identity and a
 recorded restart of prospective observation.
+
+On 2026-10-21 the incident logs showed a missing daily close and rejected hourly
+recovery through 08:15 Cambodia. Original provider responses from that interval
+were not retained, so publication lag versus a transient feed gap cannot be
+distinguished retrospectively. By 23:01 Cambodia the provider returned complete
+daily/hourly data again. The new candidate was subsequently checked in a separate
+EC2 process with the missing daily row and final hourly row deliberately removed.
+It recovered from 96 valid quarter-hour bars, without reading trading credentials
+or importing the engine. The recovered close was 82,938.2578125 USD versus the
+then-published daily close of 82,941 USD; intraday reconstruction can differ
+slightly from the canonical daily series. Published valid daily rows remain
+authoritative on the next refresh. This probe exercised fallback behavior; it
+did not reproduce or prove the precise historical provider failure and did not
+deploy the candidate or restart/resume trading.
