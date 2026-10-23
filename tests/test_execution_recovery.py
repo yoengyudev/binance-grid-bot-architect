@@ -38,6 +38,44 @@ class HistoryExchange(FakeSpotExchange):
 
 
 class ExecutionRecoveryTests(unittest.TestCase):
+    def test_liquidation_verifies_zero_commission_and_appears_once_in_recent_fills(self):
+        bot, exchange = self.live(history=True)
+        exchange.price = D('69')
+        bot.run_cycle()
+        liquidation = json.loads(bot.database.get_state('hard_stop_liquidation'))
+        self.assertEqual(liquidation['phase'], 'complete')
+        row = bot.database.get_trade_by_sell_order_id(liquidation['client_order_id'])
+        expected = D(liquidation['proceeds_quote']) - D(liquidation['cost_basis_quote'])
+        self.assertAlmostEqual(D(row['profit']), expected, places=20)
+        self.assertEqual(row['fee_basis'], 'mixed')
+        snapshot = json.loads(bot.database.get_state(FILL_SNAPSHOT_PREFIX + liquidation['client_order_id']))
+        self.assertEqual(snapshot['fee_source'], 'trades')
+        self.assertEqual(snapshot['fees'], [{'currency': 'USDT', 'cost': '0'}])
+        recent = bot.database.fetch_recent_filled_orders()
+        self.assertEqual(sum(r['order_id'] == row['sell_order_id'] for r in recent), 1)
+        self.assertEqual(next(r for r in recent if r['order_id'] == row['sell_order_id'])['side'], 'SELL')
+        before = len(bot.database.fetch_trade_history())
+        bot.run_cycle()
+        self.assertEqual(len(bot.database.fetch_trade_history()), before)
+        self.assertEqual(exchange.market_sell_calls, 1)
+
+    def test_liquidation_history_lag_retries_confirmation_without_another_sale(self):
+        bot, exchange = self.live(history=True)
+        original = exchange.fetch_order_trades
+        state = {'lagged': False}
+        def lag_once(order_id, *args, **kwargs):
+            order = next(o for o in exchange.orders.values() if o['id'] == order_id)
+            if order['type'] == 'market' and order['side'] == 'sell' and not state['lagged']:
+                state['lagged'] = True
+                return []
+            return original(order_id, *args, **kwargs)
+        exchange.price = D('69')
+        with patch.object(exchange, 'fetch_order_trades', side_effect=lag_once), patch.object(engine.time, 'sleep'):
+            bot.run_cycle()
+        self.assertTrue(state['lagged'])
+        self.assertEqual(exchange.market_sell_calls, 1)
+        self.assertEqual(json.loads(bot.database.get_state('hard_stop_liquidation'))['phase'], 'complete')
+
     def test_verified_zero_buy_commission_is_not_estimated_again(self):
         bot, exchange = self.live(history=True)
         buy = bot.database.fetch_latest_orders_by_level()[1]

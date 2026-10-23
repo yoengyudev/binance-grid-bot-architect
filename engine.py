@@ -3287,6 +3287,12 @@ class GridBot:
                 if order.get("filled") is None:
                     raise TradingHalt("Hard-stop SELL has no confirmed filled quantity.")
                 sold = _order_decimal(order.get("filled"))
+                # fetch_order commonly omits commissions, including explicit
+                # zero fees on Testnet. Verify executions before accounting;
+                # retries stay in confirming and cannot submit another sale.
+                if sold > 0:
+                    order = verified_execution_order(
+                        self._call, self.exchange, self.config.symbol, order)
                 total_sold = Decimal(state.get("sold_base", "0")) + sold
                 if total_sold > Decimal(state["held_base"]):
                     raise TradingHalt("Hard-stop SELL exceeded bot-tracked BTC.")
@@ -3307,6 +3313,13 @@ class GridBot:
                              confirmed_proceeds_quote=str(total_proceeds))
                 with self.database.transaction():
                     if sold > 0 and proceeds > 0:
+                        self._save_fill_snapshot(
+                            state["client_order_id"], order,
+                            verified_fees=(
+                                _fees_in_asset(order, self.market["base"]),
+                                _fees_in_asset(order, self.market["quote"]))
+                            if getattr(self.exchange, "has", {}).get("fetchOrderTrades") else None,
+                        )
                         self.database.record_trade(
                             basis / sold, proceeds / sold, profit,
                             sell_order_id=state["client_order_id"],

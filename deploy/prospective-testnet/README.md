@@ -1,11 +1,11 @@
 # Prospective Testnet release
 
-`v1.0.5-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
+`v1.0.6-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
 and 0.5x closed-hour ATR compression. No strategy parameter is changed here.
 
 Runtime layout:
 
-- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.5-production`
+- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.6-production`
 - Environment: `/home/ubuntu/prospective-testnet/.env` (private, outside Git)
 - Ledger: `/home/ubuntu/prospective-testnet/state/grid_testnet.sqlite`
 - Configuration: `/home/ubuntu/prospective-testnet/state/config.json`
@@ -78,3 +78,10 @@ recovery is incomplete, validates refresh results across UTC rollover, and
 adds deduplicated macro BUY-state alerts. It retains the strict daily
 SMA200 gate and manual post-stop review. During this deployment the
 existing completed liquidation remains HALTED; no grid is restarted.
+
+Patch 1.0.6 verifies liquidation commissions through private executions,
+includes consolidated MARKET exits in Recent Fills, and exits 75 for
+retryable runner-lease contention. Configuration/review errors remain
+exit 2. Keep the completed liquidation HALTED during deployment.
+Back up SQLite before an explicitly audited, journaled fee correction;
+never change purchase basis, timestamps, strategy rules or wallet BTC.

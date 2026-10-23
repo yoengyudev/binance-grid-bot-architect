@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 
 RUN=Path('/home/ubuntu/prospective-testnet')
-RELEASE=RUN/'releases/v1.0.5-production'
+RELEASE=RUN/'releases/v1.0.6-production'
 sys.path.insert(0,str(RELEASE))
 from dotenv import dotenv_values
 env=dotenv_values(RUN/'.env')

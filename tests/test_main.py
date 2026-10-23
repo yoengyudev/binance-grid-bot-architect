@@ -210,6 +210,7 @@ class GridBotTests(unittest.TestCase):
 
     def test_process_exit_codes_separate_retry_from_safety_halt(self) -> None:
         for error, expected in (
+            (grid_models.RunnerLeaseLost("Another runner still owns its lease"), 75),
             (ccxt.NetworkError("Temporary network failure"), 1),
             (ccxt.AuthenticationError("Invalid API credentials"), 2),
             (TradingHalt("Order state requires review"), 2),

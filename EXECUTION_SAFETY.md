@@ -55,6 +55,30 @@ The unique SELL-order accounting constraint is retained. This change does not
 rewrite already recorded historical realized P&L. Any historic correction needs
 an independent, backed-up reconciliation of the old records.
 
+## Liquidation accounting and visibility (1.0.6)
+
+MARKET liquidation confirmation now verifies private per-order executions before
+recording proceeds and commission. Explicit zero fees remain zero; incomplete
+history retries the confirming phase without submitting another sale. The saved
+fill snapshot and realized trade commit atomically. Recent Fills includes these
+consolidated exits even though they are not ordinary grid-lane orders, excluding
+duplicates already present in current or archived grid orders.
+
+`repair_liquidation_fees.py --order-id CLIENT_ID` previews a historical correction;
+`--apply` requires an attended, completed HALTED Testnet liquidation and ownership
+of the runner lease. Back up the ledger first, stop the service, and wait for its
+lease to expire. The tool allows only Testnet GETs, verifies matching MARKET SELL
+quantity/proceeds and explicit pair-asset fees, and excludes ordinary grid trades.
+It preserves purchase basis, execution prices and original timestamps. Each fee
+correction and snapshot has an atomic audit record; repeat application is a no-op.
+It does not change the actual exchange loss or execute any order.
+
+Runner lease contention/loss exits with temporary-failure status 75. The systemd
+unit's existing Restart=on-failure and 60-second RestartSec can retry after an
+expired lease, while configuration/safety-review errors remain status 2 and do
+not loop. A competing process cannot clear, steal or bypass a still-valid lease.
+The canonical --ready service still requires manual post-stop grid review/START.
+
 ## Frontend freshness
 
 Ticker and kline callbacks reject old/missing exchange event timestamps and
@@ -66,9 +90,9 @@ at click time, so recent message receipt cannot extend an old quote's lifetime.
 
 ## Deployment status
 
-These are local changes. This repair has not restarted EC2, modified its running
-orders or database, rewritten its P&L, or sent Telegram notifications. A Testnet
-release must include the new `stop_history.py` and frontend helper modules, then
-validate startup, a synthetic crossing/rebound, and recovery before Mainnet is
-considered. Start a new observation baseline after deploying these protection
+Release identity and per-deployment verification belong in the attended Testnet
+evidence directory. Validate startup, synthetic crossing/rebound and recovery
+before considering Mainnet. Begin a new observation baseline after protection
 changes; earlier Testnet results relied on different stop-detection behavior.
+The 1.0.6 maintenance deployment preserves the completed HALTED campaign and
+changes only explicitly audited historical liquidation fee estimates.

@@ -393,6 +393,12 @@ def main() -> int:
             return 0
         finally:
             database.release_runner_lease(runner_token, runner_epoch)
+    except RunnerLeaseLost as error:
+        # A previous process can leave a valid TTL after an abrupt shutdown.
+        # Keep fencing intact and let systemd retry after RestartSec; exit 2
+        # is deliberately reserved for configuration/review failures.
+        print(f"Bot waiting for runner lease: {error}", file=sys.stderr)
+        return 75  # EX_TEMPFAIL, retried by Restart=on-failure.
     except ccxt.NetworkError as error:
         print(f"Bot stopped: {error}", file=sys.stderr)
         return 1

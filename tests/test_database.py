@@ -231,9 +231,11 @@ class GridDatabaseTests(unittest.TestCase):
             database.insert_order("new-fill", -1, "SELL", "90000", "0.01",
                                   client_order_id="gridbot-new-fill")
             database.mark_order_filled("new-fill")
+            database.record_trade('80000', '90000', '100', sell_order_id='new-fill', sold_base='0.01')
+            database.record_trade('80000', '70000', '-100', sell_order_id='stop-exit', sold_base='0.01')
             self.assertEqual(
                 {row["order_id"] for row in database.fetch_recent_filled_orders()},
-                {"old-fill", "new-fill"},
+                {"old-fill", "new-fill", "stop-exit"},
             )
             self.assertEqual(len(database.fetch_recent_filled_orders(1)), 1)
             with self.assertRaises(ValueError):

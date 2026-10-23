@@ -217,6 +217,11 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             database.set_state(grid_settings.FILL_SNAPSHOT_PREFIX + "sell-filled",
                                '{"filled_base":"0.009","filled_quote":"792",'
                                '"base_fee":"0","quote_fee":"0"}')
+            database.record_trade('80000', '68000', '-120', sell_order_id='hard-stop-sale',
+                                  sold_base='0.01', fee_basis='mixed')
+            database.set_state(grid_settings.FILL_SNAPSHOT_PREFIX + 'hard-stop-sale',
+                               '{"filled_base":"0.01","filled_quote":"680",'
+                               '"base_fee":"0","quote_fee":"0"}')
             grid_api.app.state.grid_bot = SimpleNamespace(database=database)
             try:
                 with patch.dict(os.environ, {
@@ -238,7 +243,12 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.headers["cache-control"], "no-store")
                 self.assertEqual(response.json()["open_limits"][0]["id"], "buy-open")
-                filled = response.json()["filled_trades"][0]
+                fills = {row['id']: row for row in response.json()['filled_trades']}
+                self.assertEqual(fills['hard-stop-sale']['side'], 'SELL')
+                self.assertEqual(fills['hard-stop-sale']['order_type'], 'MARKET')
+                self.assertEqual(fills['hard-stop-sale']['price_source'], 'execution')
+                self.assertEqual(fills['hard-stop-sale']['price'], '68000')
+                filled = fills['sell-filled']
                 self.assertEqual(filled["id"], "sell-filled")
                 self.assertEqual(filled["price"], "88000")
                 self.assertEqual(filled["amount"], "0.009")

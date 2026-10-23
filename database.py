@@ -463,6 +463,23 @@ class GridDatabase:
                            created_at, updated_at
                     FROM archived_grid_orders
                     WHERE status = 'FILLED' AND client_order_id IS NOT NULL
+                    UNION ALL
+                    SELECT history.sell_order_id AS order_id,
+                           'SELL' AS side, 'MARKET' AS order_type,
+                           'FILLED' AS status, history.sell_price AS price,
+                           history.sold_base AS amount,
+                           history.timestamp AS created_at,
+                           history.timestamp AS updated_at
+                    FROM trade_history AS history
+                    WHERE history.sell_order_id IS NOT NULL
+                      AND history.sold_base IS NOT NULL
+                      AND CAST(history.sold_base AS REAL) > 0
+                      AND NOT EXISTS (
+                          SELECT 1 FROM grid_orders AS current
+                          WHERE current.order_id = history.sell_order_id)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM archived_grid_orders AS archived
+                          WHERE archived.order_id = history.sell_order_id)
                 ) AS fills
                 LEFT JOIN bot_state AS snapshots
                   ON snapshots.key = 'fill_snapshot:' || fills.order_id
@@ -883,6 +900,24 @@ class GridDatabase:
                 "SELECT * FROM trade_history WHERE sell_order_id = ?", (order_id,),
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def correct_liquidation_fee(self, order_id: str, expected_profit: str,
+                                profit: NumberValue) -> None:
+        """Compare-and-set an audited fee correction; preserve fill time and basis."""
+        corrected = _decimal_text(profit, positive=False)
+        with self._connection() as connection:
+            self._begin_transaction(connection)
+            changed = connection.execute(
+                "UPDATE trade_history SET profit = ?, fee_basis = 'mixed' "
+                "WHERE sell_order_id = ? AND profit = ? AND fee_basis = 'estimated' "
+                "AND buy_order_id IS NULL",
+                (corrected, order_id, expected_profit),
+            ).rowcount
+            if changed != 1:
+                raise ValueError('Liquidation accounting changed; repeat the audit before applying.')
+            self._journal(connection, None, None, 'LIQUIDATION_FEE_CORRECTED',
+                          json.dumps(dict(order_id=order_id, previous_profit=expected_profit,
+                                          corrected_profit=corrected), sort_keys=True))
 
     def fetch_trade_history(self) -> List[Dict[str, Any]]:
         with self._connection() as connection:
