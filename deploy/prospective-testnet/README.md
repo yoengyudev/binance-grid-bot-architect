@@ -1,11 +1,11 @@
 # Prospective Testnet release
 
-`v1.0.6-production` preserves `sma200-compressed-atr-v1`, including Residual Fill
+`v1.1.0-testnet.1` preserves `sma200-compressed-atr-v1`, including Residual Fill
 and 0.5x closed-hour ATR compression. No strategy parameter is changed here.
 
 Runtime layout:
 
-- Source: `/home/ubuntu/prospective-testnet/releases/v1.0.6-production`
+- Source: `/home/ubuntu/prospective-testnet/releases/v1.1.0-testnet.1`
 - Environment: `/home/ubuntu/prospective-testnet/.env` (private, outside Git)
 - Ledger: `/home/ubuntu/prospective-testnet/state/grid_testnet.sqlite`
 - Configuration: `/home/ubuntu/prospective-testnet/state/config.json`
@@ -85,3 +85,31 @@ retryable runner-lease contention. Configuration/review errors remain
 exit 2. Keep the completed liquidation HALTED during deployment.
 Back up SQLite before an explicitly audited, journaled fee correction;
 never change purchase basis, timestamps, strategy rules or wallet BTC.
+
+
+## Experimental six-feature code release
+
+`v1.1.0-testnet.1` includes six independently opt-in Testnet policies: hourly
+regime, inventory sizing, campaign dollar risk, automatic ATR BUY adaptation,
+confirmed-SELL capital recycling and fee-aware net-edge validation. The base
+profile remains `sma200-compressed-atr-v1`. All feature flags default to false.
+This is not a Mainnet release or evidence of improved profitability.
+
+The current-campaign rollout preserves the private environment, existing
+ledger/configuration, reserved wallet BTC, orders, and strategy settings.
+Install the tagged code and use the documented reviewed Testnet handover;
+do not run fresh initialization against an existing ledger. Check the six
+API feature objects after rollout: all must remain disabled for this handover.
+
+Activating the entire bundle is a separate configuration step requiring an
+isolated ledger, explicit dollar-risk budget and reviewed fee assumptions.
+Never copy old trade history into a supposedly fresh dollar-risk campaign,
+erase previous losses, silently reserve carried bot BTC as manual wallet BTC,
+or force-liquidate an existing position merely to enable the features.
+Their policy documents describe local implementation validation; deployment
+and activation are recorded separately in release evidence.
+
+Validation: 805 local backend tests, including all six features together.
+The dashboard assets and frontend source are unchanged in this release.
+No production dependencies were added. Run Linux offline smoke tests before
+handover, back up SQLite, and retain the previous release for rollback.

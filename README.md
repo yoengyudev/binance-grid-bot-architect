@@ -69,6 +69,12 @@ The backend source is in this directory. The frontend is the sibling `web-dashbo
 | `models.py` | Pydantic request schemas, immutable grid config, exceptions, result structures |
 | `settings.py` | Validated environment settings, shared constants and state keys |
 | `market_data.py` | Hourly strategy ATR and dashboard order-book cache, with injected application state |
+| `market_regime.py` | Opt-in hourly range/trend BUY filter; see [experimental policy](MARKET_REGIME.md) |
+| `inventory_sizing.py` | Opt-in cost-based BUY taper; see [experimental policy](INVENTORY_SIZING.md) |
+| `campaign_risk.py` | Opt-in dollar-risk sizing and campaign exit; see [policy](CAMPAIGN_RISK.md) |
+| `auto_atr.py` | Opt-in hourly ATR BUY-net adaptation; see [policy](AUTO_ATR.md) |
+| `capital_recycling.py` | Opt-in confirmed-SELL cap release; see [policy](CAPITAL_RECYCLING.md) |
+| `fee_validation.py` | Opt-in net-edge and commission validation; see [policy](FEE_VALIDATION.md) |
 | `portfolio.py` | Persisted fill snapshots, wallet cost basis, realized/unrealized fee calculations |
 | `telemetry.py` | Exception formatting and durable fault journaling |
 | `database.py` | Environment-isolated SQLite ledger, transactions, state and transition journal |

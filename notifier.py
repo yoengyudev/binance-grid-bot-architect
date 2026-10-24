@@ -123,6 +123,11 @@ class TelegramNotifier(LegacyTelegramNotifier):
         outcome = "LIQUIDATED — inventory verified flat" if liquidated else "HALTED — review liquidation manually"
         schedule_telegram_alert(f"🚨 *HARD STOP*\n{markdown_text(outcome)}")
 
+    async def notify_campaign_risk(self, liquidated: bool) -> None:
+        outcome = ('LIQUIDATED — inventory verified flat; campaign remains locked' if liquidated
+                   else 'HALTED — review liquidation manually')
+        schedule_telegram_alert(f'*CAMPAIGN DOLLAR RISK LIMIT*\n{markdown_text(outcome)}')
+
     async def notify_macro_buy_state(self, paused: bool, reason: str) -> None:
         if not paused:
             message = 'Macro signal approved — BUYs permitted.'

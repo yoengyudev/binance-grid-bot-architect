@@ -463,6 +463,12 @@ def _bot_status_payload(response: Response, *, account_exposure=None) -> Dict[st
         "macro_sma": (float(bot.macro_sma) if isinstance(bot, GridBot)
                       and bot.macro_sma is not None else None),
         "macro_entry_block_reason": (bot.macro_entry_error if isinstance(bot, GridBot) else None),
+        "regime_filter": bot.regime_status() if isinstance(bot, GridBot) else {'enabled': False},
+        "inventory_sizing": bot.inventory_sizing_status() if isinstance(bot, GridBot) else {'enabled': False},
+        "campaign_risk": bot.campaign_risk_status() if isinstance(bot, GridBot) else {'enabled': False},
+        "auto_atr": bot.auto_atr_status() if isinstance(bot, GridBot) else {'enabled': False},
+        "capital_recycling": bot.capital_recycling_status() if isinstance(bot, GridBot) else {'enabled': False},
+        "fee_validation": bot.fee_validation_status() if isinstance(bot, GridBot) else {'enabled': False},
     }
     if app.state.standby and bot is not None:
         atr = app.state.atr_snapshot

@@ -32,7 +32,8 @@ def _realized_pnl_payload(database: Optional[GridDatabase]) -> Dict[str, Optiona
 
 
 def _portfolio_wallet(database: GridDatabase, *,
-                      include_verifying_inventory: bool = False) -> Dict[str, Optional[float]]:
+                      include_verifying_inventory: bool = False,
+                      decimal_values: bool = False) -> Dict[str, Any]:
     """Value the current run's remaining BTC lots from persisted fill snapshots."""
     try:
         if database.get_state("halt_reason") == MANUAL_ACCOUNT_EXIT_REASON:
@@ -133,9 +134,10 @@ def _portfolio_wallet(database: GridDatabase, *,
         if price is not None and (not price.is_finite() or price <= 0):
             price = None
         return {
-            "btc_held": float(held),
-            "average_cost": float(remaining_cost / held),
-            "unrealized_pnl": float(held * price - remaining_cost) if price else None,
+            "btc_held": held if decimal_values else float(held),
+            "average_cost": remaining_cost / held if decimal_values else float(remaining_cost / held),
+            "unrealized_pnl": ((held * price - remaining_cost) if decimal_values else
+                               float(held * price - remaining_cost)) if price else None,
         }
     except (KeyError, TypeError, ValueError, InvalidOperation, ZeroDivisionError):
         LOGGER.warning("Portfolio exposure is unavailable from saved fill data.")

@@ -30,10 +30,128 @@ from database import GridDatabase
 
 class StatusApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        # Keep empty values inside Python: Windows PowerShell can remove an
+        # environment variable assigned '', allowing dotenv to reload real
+        # notification credentials. Service tests must never deliver alerts.
+        alerts = patch.dict(os.environ, {'TELEGRAM_BOT_TOKEN': '', 'TELEGRAM_CHAT_ID': '',
+                                         'TELEGRAM_OWNER_CHAT_ID': ''})
+        alerts.start()
+        self.addCleanup(alerts.stop)
         # Status now reads the account; keep test monitor sessions off the network.
         factory = patch.object(grid_api, "create_exchange", return_value=Mock())
         factory.start()
         self.addCleanup(factory.stop)
+
+    async def test_status_exposes_regime_without_fetching_or_changing_orders(self):
+        from tests.fakes import make_bot
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = make_bot(Path(directory) / 'grid_testnet.sqlite')
+            monitor = Mock()
+            monitor.status.return_value = dict(enabled=True, available=True,
+                buy_allowed=False, reason_code='DOWNTREND', policy_id='hourly-regime-v1')
+            bot._regime_monitor = monitor
+            with patch.object(grid_api.app.state, 'grid_bot', bot):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=grid_api.app),
+                                             base_url='http://testserver') as client:
+                    payload = (await self.authenticated_status(client)).json()
+            self.assertEqual(payload['regime_filter'], monitor.status.return_value)
+            monitor.buys_allowed.assert_not_called()
+            self.assertEqual(exchange.orders, {})
+
+    async def test_status_exposes_inventory_policy_and_cost_basis(self):
+        from tests.fakes import make_bot
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = make_bot(Path(directory) / 'grid_testnet.sqlite')
+            bot._inventory_sizing_enabled = True
+            bot._submit_order(0, 'BUY', Decimal(100), Decimal(5),
+                              order_type='MARKET', quote_cost=Decimal(500))
+            before = len(exchange.orders)
+            with patch.object(grid_api.app.state, 'grid_bot', bot):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=grid_api.app),
+                                             base_url='http://testserver') as client:
+                    payload = (await self.authenticated_status(client)).json()
+            policy = payload['inventory_sizing']
+            self.assertTrue(policy['available'])
+            self.assertEqual(policy['policy_id'], 'inventory-taper-v1')
+            self.assertEqual(Decimal(policy['position_cost']), Decimal(500))
+            self.assertEqual(Decimal(policy['ceiling']), Decimal(750))
+            self.assertEqual(len(exchange.orders), before)
+
+    async def test_status_exposes_dollar_risk_without_mutating_history_or_orders(self):
+        from tests.test_campaign_risk import make_risk_bot
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = make_risk_bot(Path(directory) / 'grid_testnet.sqlite')
+            bot.run_cycle(); bot.run_cycle()
+            before = (bot.database.fetch_all_orders(), bot.database.fetch_trade_history())
+            with patch.object(grid_api.app.state, 'grid_bot', bot):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=grid_api.app),
+                                             base_url='http://testserver') as client:
+                    payload = (await self.authenticated_status(client)).json()
+            policy = payload['campaign_risk']
+            self.assertTrue(policy['available'])
+            self.assertEqual(Decimal(policy['budget_usdt']), Decimal(20))
+            self.assertEqual(Decimal(policy['exit_trigger_usdt']), Decimal(16))
+            self.assertLessEqual(Decimal(policy['modeled_risk']), Decimal(20))
+            self.assertEqual(before, (bot.database.fetch_all_orders(), bot.database.fetch_trade_history()))
+            self.assertEqual(payload['realized_pnl']['total'], 0)
+
+    async def test_status_exposes_auto_atr_without_refreshing_its_public_client(self):
+        from tests.fakes import make_bot
+        from tests.test_auto_atr import END, monitor_for
+        from auto_atr import ATRSnapshot
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = make_bot(Path(directory) / 'grid_testnet.sqlite')
+            source = dict(snapshot=ATRSnapshot(END, Decimal(2), Decimal(100)), clock=0, hour=END)
+            monitor = monitor_for(source)
+            monitor.refresh()
+            monitor.refresh = Mock(side_effect=AssertionError('Status must not fetch'))
+            bot._auto_atr_monitor = monitor
+            before = bot.database.fetch_all_orders()
+            with patch.object(grid_api.app.state, 'grid_bot', bot):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=grid_api.app),
+                                             base_url='http://testserver') as client:
+                    payload = (await self.authenticated_status(client)).json()
+            self.assertTrue(payload['auto_atr']['available'])
+            self.assertEqual(payload['auto_atr']['policy_id'], 'hourly-atr-buy-net-v1')
+            self.assertEqual(bot.database.fetch_all_orders(), before)
+            monitor.refresh.assert_not_called()
+
+    async def test_status_exposes_recycling_without_releasing_cap_or_changing_orders(self):
+        from tests.test_capital_recycling import make_recycling_bot
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = make_recycling_bot(Path(directory) / 'grid_testnet.sqlite')
+            bot._exhaust_cap(None, 'Waiting')
+            episode = bot.database.get_state('capital_recycling')
+            before = bot.database.fetch_all_orders()
+            with patch.object(grid_api.app.state, 'grid_bot', bot):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=grid_api.app),
+                                             base_url='http://testserver') as client:
+                    payload = (await self.authenticated_status(client)).json()
+            policy = payload['capital_recycling']
+            self.assertTrue(policy['available'])
+            self.assertEqual(policy['policy_id'], 'confirmed-sell-recycling-v1')
+            self.assertFalse(policy['profit_compounding'])
+            self.assertEqual(bot.database.get_state('capital_recycling'), episode)
+            self.assertEqual(bot.database.fetch_all_orders(), before)
+            self.assertEqual(exchange.orders, {})
+
+    async def test_status_exposes_fee_assumptions_and_forecasts_without_booking_profit(self):
+        from tests.test_fee_validation import fee_bot
+        with tempfile.TemporaryDirectory() as directory:
+            bot, exchange = fee_bot(Path(directory) / 'grid_testnet.sqlite')
+            bot.run_cycle(); bot.run_cycle()
+            before = bot.database.fetch_all_orders()
+            with patch.object(grid_api.app.state, 'grid_bot', bot):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=grid_api.app),
+                                             base_url='http://testserver') as client:
+                    payload = (await self.authenticated_status(client)).json()
+            policy = payload['fee_validation']
+            self.assertTrue(policy['buy_allowed'])
+            self.assertEqual(policy['policy']['policy_id'], 'net-edge-validation-v1')
+            self.assertEqual(policy['rate_unit'], 'fraction')
+            self.assertEqual(Decimal(policy['policy']['buy_fee']), Decimal('.001'))
+            self.assertEqual(bot.database.fetch_all_orders(), before)
+            self.assertEqual(payload['realized_pnl']['total'], 0)
 
     async def test_status_exposes_macro_pause_reason_and_success_time_without_fetch(self):
         from tests.fakes import make_bot
@@ -382,6 +500,12 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "automatic_post_stop_restart": False,
             "macro_buy_paused": False, "macro_buy_filter": None,
             "macro_sma": None, "macro_entry_block_reason": None,
+            "regime_filter": {"enabled": False},
+            "inventory_sizing": {"enabled": False},
+            "campaign_risk": {"enabled": False},
+            "auto_atr": {"enabled": False},
+            "capital_recycling": {"enabled": False},
+            "fee_validation": {"enabled": False},
                     "trading_environment": "TESTNET",
                     "status": "Offline", "pair": "BTC/USDT",
                     "safety_pause": "Normal", "pause_mode": None,
@@ -500,6 +624,12 @@ class StatusApiTests(unittest.IsolatedAsyncioTestCase):
             "macro_buy_paused": False, "macro_buy_filter": None,
             "macro_sma": None, "macro_entry_block_reason": None,
             "trading_environment": "TESTNET",
+            "regime_filter": {"enabled": False},
+            "inventory_sizing": {"enabled": False},
+            "campaign_risk": {"enabled": False},
+            "auto_atr": {"enabled": False},
+            "capital_recycling": {"enabled": False},
+            "fee_validation": {"enabled": False},
             "status": "Online", "pair": "BTC/USDT",
             "safety_pause": "Active", "pause_mode": grid_settings.PAUSED_DOWNSIDE,
             "allocation_state": None, "allocation_pause_reason": None,

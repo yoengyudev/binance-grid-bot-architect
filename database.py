@@ -788,6 +788,8 @@ class GridDatabase:
         """Erase trading history atomically while retaining restart configuration."""
         with self._connection() as connection:
             self._begin_transaction(connection)
+            if connection.execute("SELECT 1 FROM bot_state WHERE key = 'campaign_risk_budget'").fetchone():
+                raise ValueError('Dollar-risk campaign history cannot be erased; use a new reviewed isolated ledger.')
             active = connection.execute(
                 "SELECT COUNT(*) FROM grid_orders "
                 "WHERE status IN ('OPEN', 'PARTIALLY_FILLED')"

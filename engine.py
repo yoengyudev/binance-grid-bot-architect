@@ -104,6 +104,15 @@ from production_baseline import (BASELINE_ID, MIN_GRID_RETURN, compressed_bounds
                                  closed_hourly_atr)
 from strategy_policy import STRATEGY_VERSION, catastrophic_stop, closed_daily_sma, DAILY_MS
 from macro_trend import get_macro_trend, get_macro_status
+from market_regime import RegimeMonitor, configured_enabled, public_fetcher
+from inventory_sizing import (POLICY_ID as INVENTORY_POLICY_ID, inventory_budget,
+                              CEILING_FRACTION as INVENTORY_CEILING_FRACTION,
+                              size_buy as inventory_buy_size,
+                              configured_enabled as inventory_sizing_enabled)
+import campaign_risk as risk_policy
+import auto_atr as auto_policy
+import capital_recycling as recycle_policy
+import fee_validation as fee_policy
 
 LOGGER = logging.getLogger(__name__)
 
@@ -170,8 +179,42 @@ def configured_grid_levels(
 class GridBot:
     def __init__(self, config: GridConfig, exchange: Any, database: GridDatabase,
                  *, runner_token: Optional[str] = None, macro_exchange: Any = None,
-                 macro_trend_provider: Any = None) -> None:
+                 macro_trend_provider: Any = None, regime_monitor: Any = None,
+                 atr_monitor: Any = None) -> None:
         self.config = config
+        regime_enabled = configured_enabled() or regime_monitor is not None
+        if regime_enabled and not TRADING_SETTINGS.sandbox:
+            raise ValueError('The experimental regime filter is restricted to Testnet validation.')
+        self._regime_monitor = (regime_monitor if regime_monitor is not None else
+                                RegimeMonitor(public_fetcher(config.symbol)) if regime_enabled else None)
+        auto_enabled = auto_policy.configured_enabled() or atr_monitor is not None
+        if auto_enabled and not TRADING_SETTINGS.sandbox:
+            raise ValueError('Experimental automatic ATR adaptation is restricted to Testnet validation.')
+        if auto_enabled and not regime_enabled:
+            raise ValueError('Automatic ATR adaptation requires the hourly range-market regime gate (#1).')
+        if not auto_enabled and database.get_state(auto_policy.STATE_KEY) is not None:
+            raise TradingHalt('This ledger contains an automatic ATR plan; do not disable it in place.')
+        self._auto_atr_monitor = (atr_monitor if atr_monitor is not None else
+                                 auto_policy.ATRMonitor(auto_policy.public_fetcher(config.symbol))
+                                 if auto_enabled else None)
+        self._inventory_sizing_enabled = inventory_sizing_enabled()
+        if self._inventory_sizing_enabled and not TRADING_SETTINGS.sandbox:
+            raise ValueError('Experimental inventory sizing is restricted to Testnet validation.')
+        if (self._inventory_sizing_enabled and
+                config.initial_inventory_percent > INVENTORY_CEILING_FRACTION * 100):
+            raise ValueError('Initial inventory exceeds the experimental 75% inventory ceiling.')
+        self._risk_budget_usdt = risk_policy.configured_budget()
+        self._recycling_enabled = recycle_policy.configured_enabled()
+        self._fee_policy = fee_policy.configured_policy()
+        if self._fee_policy is not None and not TRADING_SETTINGS.sandbox:
+            raise ValueError('Experimental fee validation is restricted to Testnet validation.')
+        if self._recycling_enabled and not TRADING_SETTINGS.sandbox:
+            raise ValueError('Experimental capital recycling is restricted to Testnet validation.')
+        if self._risk_budget_usdt is not None:
+            if not TRADING_SETTINGS.sandbox:
+                raise ValueError('Experimental dollar risk budgets are restricted to Testnet validation.')
+            if self._risk_budget_usdt >= config.investment_quote:
+                raise ValueError('The dollar risk budget must be smaller than allocated capital.')
         if config.strategy_baseline is not None and (
                 config.strategy_baseline != BASELINE_ID or config.symbol != 'BTC/USDT'
                 or config.buy_grid_levels != 3 or config.sell_grid_levels != 2
@@ -185,6 +228,9 @@ class GridBot:
         self._macro_trend_provider = macro_trend_provider or get_macro_trend
         self._macro_provider_error = None
         self.database = database
+        self._initialize_campaign_risk()
+        self._initialize_recycling()
+        self._initialize_fee_validation()
         order_prefix = self.database.get_or_create_state(
             ORDER_CLIENT_PREFIX_KEY, ORDER_CLIENT_PREFIX + uuid.uuid4().hex[:8]
         )
@@ -1175,6 +1221,7 @@ class GridBot:
 
     def _assert_liquidation_reset_ready(self) -> None:
         """A completed, fault-free exit may be replaced by a reviewed new grid."""
+        self._assert_campaign_risk_open()
         if self.database.get_state(SAFETY_MODE_KEY) != LIQUIDATED:
             raise TradingHalt("Liquidation is unresolved; inspect exchange orders first.")
         if self.database.get_state(ENGINE_STATUS_KEY) == ENGINE_RUNNING:
@@ -1327,8 +1374,8 @@ class GridBot:
 
     def _request_breakout_reset(self, price: Decimal) -> None:
         """Persist a macro-approved reset intent before any cancellation begins."""
-        if self._cap_exhausted() or not self._macro_buys_allowed():
-            return  # Yahoo BUY pause never cancels protective SELLs for a rebuild.
+        if self._cap_exhausted() or not self._entry_buys_allowed():
+            return  # A blocked BUY gate never cancels protective SELLs for a rebuild.
         if not self._macro_entry_allowed(price):
             return  # Preserve existing orders and hard-stop monitoring.
         candidate = self._breakout_candidate(price, self.breakout_width_percent)
@@ -1617,7 +1664,8 @@ class GridBot:
         if self.config.buy_grid_levels is not None:
             self._validate_level_prices(self.anchor, self.levels, self.upper_levels)
         sizing_paused = self.database.get_state(SAFETY_MODE_KEY) == PAUSED_SIZING
-        seed_quote = self._seed_quote()
+        seed_quote = (self._nominal_seed_quote() if saved and self._risk_budget_usdt is not None
+                      else self._seed_quote())
         quote_per_level = self._lower_quote_per_level()
         seed_amount = self._amount(seed_quote / current_price)
         if not sizing_paused:
@@ -1639,6 +1687,10 @@ class GridBot:
             list(range(-1, -len(self.upper_levels) - 1, -1)),
         )
         upper_planned: List[Tuple[int, Decimal, Decimal]] = []
+        if not saved and not sizing_paused and self._risk_budget_usdt is not None:
+            self._validate_risk_seed(self.config, current_price, self.upper_levels)
+        if not saved and not sizing_paused:
+            self._validate_net_fee_geometry(self.anchor, self.levels, self.upper_levels)
         for index, raw_price in enumerate(self.upper_levels, start=1):
             price = self._price(raw_price)
             upper_amount = upper_amounts[-index]
@@ -1670,6 +1722,11 @@ class GridBot:
         return current_price, planned, upper_planned
 
     def _seed_quote(self) -> Decimal:
+        if self._risk_budget_usdt is not None:
+            return self._risk_seed_quote(self.config, self.anchor)
+        return self._nominal_seed_quote()
+
+    def _nominal_seed_quote(self) -> Decimal:
         return self.config.investment_quote * self.config.initial_inventory_percent / 100
 
     def _validate_total_grid_allocation(self, config, center, position_cost):
@@ -1680,7 +1737,7 @@ class GridBot:
         require_total_cap(config, position_cost, commitment)
 
     def _lower_quote_per_level(self) -> Decimal:
-        lower_budget = self.config.investment_quote - self._seed_quote()
+        lower_budget = self.config.investment_quote - self._nominal_seed_quote()
         return lower_budget / Decimal(len(self.levels))
 
     def _required_buy_limit_quote(
@@ -1709,6 +1766,11 @@ class GridBot:
         required = self._required_buy_limit_quote(config, lowers, stop_loss)
         if seed_required:
             required += config.investment_quote * config.initial_inventory_percent / 100
+        if self._inventory_sizing_enabled:
+            # Nominal geometry still passes its normal sizing checks, but this
+            # feature will not spend cash reserved outside its inventory ceiling.
+            budget = self._inventory_budget(allocation=config.investment_quote)
+            required = min(required, budget['room'])
         available = self._free_balance(self.market["quote"])
         if available < required:
             raise InsufficientGridCapital(
@@ -1788,6 +1850,7 @@ class GridBot:
     ) -> None:
         """Check rounded per-side orders before any existing order is canceled."""
         self._validate_fee_spacing(center, buys, sells)
+        self._validate_net_fee_geometry(center, buys, sells)
         seed_quote = config.investment_quote * config.initial_inventory_percent / 100
         if carry_amount <= 0:
             self._check_order_size(center, self._amount(seed_quote / center))
@@ -1800,6 +1863,8 @@ class GridBot:
             sell_target = self._price(raw / (1 - config.spacing_percent / 100))
             self._check_order_size(sell_target, conservative_sell)
         upper_total = carry_amount if carry_amount > 0 else self._amount(seed_quote / center)
+        if self._risk_budget_usdt is not None and carry_amount <= 0:
+            self._validate_risk_seed(config, center, sells)
         upper_amounts = self._split_sell_amounts(
             upper_total * (1 - SELL_AMOUNT_BUFFER),
             list(range(-1, -len(sells) - 1, -1)),
@@ -2000,6 +2065,11 @@ class GridBot:
             self._persist_order_response(row, order, status.upper())
             if (status == "canceled" and row["side"] == "BUY" and
                     (self.database.get_state(f"safety_pause_buy:{row['order_id']}") == "1" or
+                     self.database.get_state(f"regime_pause_buy:{row['order_id']}") == "1" or
+                     self.database.get_state(f"inventory_pause_buy:{row['order_id']}") == "1" or
+                     self.database.get_state(f"risk_pause_buy:{row['order_id']}") == "1" or
+                     self.database.get_state(f"auto_atr_cancel:{row['order_id']}") == "1" or
+                     self.database.get_state(f"fee_pause_buy:{row['order_id']}") == "1" or
                      self.database.get_state(f"macro_pause_buy:{row['order_id']}") == "1" or
                      self.database.get_state(f"partial_fill_buy:{row['order_id']}") == "1")):
                 return None
@@ -2010,6 +2080,7 @@ class GridBot:
         self, level: int, side: str, price: Decimal, amount: Decimal,
         *, parent_order_id: Optional[str] = None, order_type: str = "LIMIT",
         quote_cost: Optional[Decimal] = None, final_residual: bool = False,
+        recycle_episode: Optional[str] = None,
     ) -> Optional[str]:
         if self.database.in_transaction:
             raise RuntimeError("Order intents must commit before exchange submission.")
@@ -2018,17 +2089,60 @@ class GridBot:
             self.assert_runner_lease()
             if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
                 raise TradingHalt('Risk exit verification is pending; new grid orders are blocked.')
-            if side == 'BUY' and self._cap_exhausted():
+            if recycle_episode is not None and (not self._recycling_enabled or side != 'BUY' or
+                    order_type != 'LIMIT' or final_residual or quote_cost is not None):
+                raise TradingHalt('Invalid recycling order reservation.')
+            if side == 'BUY' and self._cap_exhausted() and recycle_episode is None:
                 return None
             if side == 'BUY' and not self._macro_buys_allowed():
                 self._set_macro_buy_pause(True)
                 return None  # No durable intent or exchange write, including seed MARKET BUY.
+            if side == 'BUY' and not self._regime_buys_allowed():
+                return None  # Applies to seed, replacement, reset, and residual BUYs.
+            if side == 'BUY' and not self._auto_atr_buys_allowed():
+                return None
+            if side == 'BUY' and self._risk_budget_usdt is not None:
+                if order_type == 'MARKET' and quote_cost is None:
+                    raise TradingHalt('Risk-budgeted MARKET BUY requires an explicit quote budget.')
+                try:
+                    view = self._campaign_risk_view(mark=price)
+                except TradingHalt:
+                    self._risk_buy_decision(level, 'RISK_UNAVAILABLE')
+                    return None
+                if price <= self.config.stop_loss_price or view['latched']:
+                    self._risk_buy_decision(level, 'RISK_LIMIT')
+                    return None
+                quantity = quote_cost / price if order_type == 'MARKET' else amount
+                if order_type == 'LIMIT' and quote_cost is not None:
+                    raise TradingHalt('Risk-budgeted LIMIT BUY cannot specify a MARKET quote budget.')
+                risk_policy.finite(quantity)
+                proposed_risk = quantity * risk_policy.unit_loss(price, self.config.stop_loss_price)
+                if quantity <= 0 or proposed_risk > view['headroom']:
+                    self._risk_buy_decision(level, 'RISK_LIMIT')
+                    return None
+            if side == 'BUY' and self._inventory_sizing_enabled:
+                if order_type == 'MARKET' and quote_cost is None:
+                    raise TradingHalt('Inventory-capped MARKET BUY requires an explicit quote budget.')
+                proposed = quote_cost if quote_cost is not None else price * amount
+                try:
+                    budget = self._inventory_budget()
+                except TradingHalt:
+                    self._inventory_decision(level, 'EXPOSURE_UNAVAILABLE')
+                    return None
+                if not isinstance(proposed, Decimal) or not proposed.is_finite() or proposed <= 0:
+                    raise TradingHalt('Inventory BUY quote budget must be positive and finite.')
+                if proposed > budget['room']:
+                    self._inventory_decision(level, 'INVENTORY_CEILING')
+                    return None  # No intent, latch mutation, or exchange write.
             if side == 'BUY' and self.database.get_state('total_allocation_cap') == '1':
                 if order_type == 'MARKET' and quote_cost is None:
                     raise TradingHalt('A capped MARKET BUY requires an explicit quote budget.')
                 proposed = quote_cost if quote_cost is not None else price * amount
                 require_total_cap(self.config, tracked_position_cost(self.database),
                                   pending_buy_commitment(self.database) + proposed)
+            if side == 'BUY' and not self._fee_entry_allowed(level, price, amount,
+                    order_type=order_type, quote_cost=quote_cost):
+                return None
             check_exchange_circuit(self.exchange)
             liquidation = order_type == "MARKET" and side == "SELL" and level == -1
             if self.stop_controller.stop_requested.is_set() and not liquidation:
@@ -2039,13 +2153,45 @@ class GridBot:
             # The latch and intent commit together BEFORE HTTP. An uncertain
             # response or restart must never reopen BUYs after this final attempt.
             with self.database.transaction():
+                recycle = None
+                if recycle_episode is not None:
+                    mark = Decimal(self.database.get_state(LAST_MARKET_PRICE_KEY) or '0')
+                    recycle = self._recycling_authorization(mark)
+                    if (recycle is None or recycle['episode']['id'] != recycle_episode or
+                            recycle['candidate'] != dict(level=level, price=price, amount=amount,
+                                                         parent_order_id=parent_order_id)):
+                        return None  # Changed ledger: keep the latch, create no intent.
                 self.database.insert_order(
                     client_id, level, side, price, amount,
                     client_order_id=client_id, parent_order_id=parent_order_id,
                     order_type=order_type,
                 )
+                if side == 'BUY' and order_type == 'LIMIT' and self._auto_atr_monitor is not None:
+                    target = self._paired_sell_price({'level': level})
+                    if target / price - 1 < MIN_GRID_RETURN:
+                        raise TradingHalt('Automatic ATR BUY has no fee-safe frozen exit.')
+                    self.database.set_state(auto_policy.EXIT_PREFIX + client_id, str(target))
+                if side == 'BUY' and self._fee_policy is not None:
+                    if order_type == 'LIMIT':
+                        self.database.set_state('fee_validation_exit:' + client_id,
+                                                str(self._paired_sell_price({'level': level})))
+                    else:
+                        self.database.set_state('fee_validation_seed_exits:' + client_id, json.dumps(
+                            {str(-i): str(self._price(target)) for i,target in enumerate(self.upper_levels, 1)},
+                            sort_keys=True))
                 if final_residual:
                     self._exhaust_cap(client_id, 'Final residual BUY reserved; new BUYs require a reviewed new grid.')
+                if recycle is not None:
+                    state = self._recycling_state()
+                    state['episode'] = None
+                    state['last_release'] = dict(episode_id=recycle_episode,
+                        sell_order_id=recycle['trade']['sell_order_id'], trade_id=recycle['trade']['id'],
+                        buy_order_id=client_id, notional=str(price * amount))
+                    self._clear_cap_exhaustion()
+                    self.database.set_state(recycle_policy.STATE_KEY, json.dumps(state, sort_keys=True))
+                    current = self.database.get_state(ENGINE_STATUS_KEY)
+                    self.database.record_transition(current, current, 'RECYCLING_RELEASE_RESERVED',
+                                                    json.dumps(state['last_release'], sort_keys=True))
             previous_write_attempts = exchange_write_attempts(self.exchange)
             try:
                 self.assert_runner_lease()
@@ -2070,7 +2216,10 @@ class GridBot:
                     ) from error
                 # A concurrent HTTP call may trip the breaker after the intent
                 # was saved. A local rejection guarantees no order was sent.
-                self.database.discard_unsubmitted_order(client_id)
+                with self.database.transaction():
+                    self.database.discard_unsubmitted_order(client_id)
+                    if recycle_episode is not None:
+                        self._exhaust_cap(None, 'Recycled BUY blocked before HTTP; a new SELL is required.')
                 raise
             except ccxt.OrderImmediatelyFillable as error:
                 if (order_type != "LIMIT" or side != "BUY" or
@@ -2078,7 +2227,10 @@ class GridBot:
                     raise UncertainOrderError(
                         f"Order {client_id} may have been accepted; inspect it before restarting."
                     ) from error
-                self.database.discard_rejected_post_only_order(client_id)
+                with self.database.transaction():
+                    self.database.discard_rejected_post_only_order(client_id)
+                    if recycle_episode is not None:
+                        self._exhaust_cap(None, 'Recycled maker BUY rejected; a new confirmed SELL is required.')
                 self._post_only_rejected_in_cycle = True
                 LOGGER.warning(
                     "Spot rejected post-only %s %s at %s (grid level %s); "
@@ -2093,7 +2245,10 @@ class GridBot:
                     ) from error
                 # A definite balance rejection did not create an exchange
                 # order. Keep the lane ready for a fresh balance check next cycle.
-                self.database.discard_rejected_post_only_order(client_id)
+                with self.database.transaction():
+                    self.database.discard_rejected_post_only_order(client_id)
+                    if recycle_episode is not None:
+                        self._exhaust_cap(None, 'Recycled BUY lacks free quote; a new confirmed SELL is required.')
                 self._post_only_rejected_in_cycle = True
                 LOGGER.warning(
                     "Spot rejected %s %s at %s for insufficient free %s "
@@ -2201,7 +2356,10 @@ class GridBot:
         return net_base
 
     def _place_seed_buy(self, current_price: Decimal) -> None:
-        quote_cost = self._seed_quote()
+        quote_cost = (self._risk_seed_quote(self.config, current_price)
+                      if self._risk_budget_usdt is not None else self._seed_quote())
+        if self._risk_budget_usdt is not None:
+            self._validate_risk_seed(self.config, current_price, self.upper_levels)
         amount = self._amount(quote_cost / current_price)
         self._check_order_size(current_price, amount)
         if self._free_balance(self.market["quote"]) < quote_cost:
@@ -2216,7 +2374,8 @@ class GridBot:
         amount = self._seed_upper_sell_amount(seed_row, level)
         if amount is None:
             return
-        target = self.upper_levels[-level - 1]
+        frozen = self.database.get_state('fee_validation_seed_exits:' + seed_row['order_id'])
+        target = (Decimal(json.loads(frozen)[str(level)]) if frozen else self.upper_levels[-level - 1])
         price = self._grid_order_price(target, "SELL")
         self._check_order_size(price, amount)
         if self._free_bot_base() < amount:
@@ -2296,9 +2455,23 @@ class GridBot:
             price = self._price(
                 self.anchor if level == -1 else self.upper_levels[-level - 2]
             )
-        price = self._grid_order_price(price, "BUY")
+        auto_lane = self._auto_atr_lane(level)
+        if auto_lane is not None:
+            price = self._price(Decimal(auto_lane['buy']))
+            if level > 0:
+                amount = self._amount(self._lower_quote_per_level() / price)
+        else:
+            price = self._grid_order_price(price, "BUY")
         if price <= self.config.stop_loss_price:
             return  # Never create a BUY at or beneath the liquidation floor.
+        if self._inventory_sizing_enabled:
+            amount = self._inventory_buy_amount(level, price, amount)
+            if amount <= 0:
+                return
+        if self._risk_budget_usdt is not None:
+            amount = self._risk_buy_amount(level, price, amount)
+            if amount <= 0:
+                return
         self._check_order_size(price, amount)
         final_residual = False
         if self.database.get_state('total_allocation_cap') == '1':
@@ -2333,16 +2506,23 @@ class GridBot:
 
     def _exhaust_cap(self, order_id: Optional[str], reason: str) -> None:
         with self.database.transaction():
+            new_episode = not self._cap_exhausted()
             self.database.set_state(CAP_STATE_KEY, CAP_EXHAUSTED, trigger_event='ALLOCATION_EXHAUSTED')
             self.database.set_state(CAP_REASON_KEY, reason)
             if order_id:
                 self.database.set_state(CAP_ORDER_KEY, order_id)
+            if self._recycling_enabled and new_episode:
+                self._start_recycling_episode(order_id)
             self.database.clear_state(BREAKOUT_TIMER_KEY)
         self.invalidate_dashboard_reads()
 
     def _clear_cap_exhaustion(self) -> None:
         for key in (CAP_STATE_KEY, CAP_REASON_KEY, CAP_ORDER_KEY):
             self.database.clear_state(key)
+        if self._recycling_enabled:
+            state = self._recycling_state()
+            state['episode'] = None
+            self.database.set_state(recycle_policy.STATE_KEY, json.dumps(state, sort_keys=True))
 
     def _place_sell(self, row: Dict[str, Any]) -> None:
         buy = self._fetch_order(row)
@@ -2368,6 +2548,25 @@ class GridBot:
             )
 
     def _paired_sell_price(self, row: Dict[str, Any]) -> Decimal:
+        frozen = (self.database.get_state(auto_policy.EXIT_PREFIX + row['order_id'])
+                  if row.get('order_id') else None)
+        fee_frozen = (self.database.get_state('fee_validation_exit:' + row['order_id'])
+                      if row.get('order_id') else None)
+        if frozen is not None and fee_frozen is not None and Decimal(frozen) != Decimal(fee_frozen):
+            raise TradingHalt('Frozen ATR and fee-validated exit targets disagree.')
+        frozen = fee_frozen if fee_frozen is not None else frozen
+        if frozen is not None:
+            target = Decimal(frozen)
+            if (not target.is_finite() or target <= 0 or
+                    row.get('price') and target / Decimal(row['price']) - 1 < MIN_GRID_RETURN):
+                raise TradingHalt('Saved automatic ATR exit is invalid.')
+            return self._price(target)
+        if (self._auto_atr_monitor is not None and row.get('order_id') and
+                self._auto_atr_state()['active'] is not None):
+            raise TradingHalt('A BUY lot is missing its frozen automatic ATR exit; review its ledger.')
+        lane = self._auto_atr_lane(row['level']) if not row.get('order_id') else None
+        if lane is not None:
+            return self._price(Decimal(lane['sell']))
         if row["level"] > 0:
             # Exact-level grids derive their own geometric spacing; the legacy
             # configured percentage is not the distance to the next SELL.
@@ -2680,7 +2879,7 @@ class GridBot:
         # inventory even when Yahoo blocks BUYs. Other rebuilds remain gated.
         sell_only_resume = request.get('source') == 'engine_resume' and (
             request.get('phase') == 'placing' or self._bot_btc_balance(refresh=False) > 0)
-        if not self._macro_buys_allowed() and not sell_only_resume:
+        if not self._entry_buys_allowed() and not sell_only_resume:
             self.run_cycle()  # Reconcile/cancel BUYs, retain SELLs, and evaluate the hard stop.
             return False
         if request["phase"] == "canceling":
@@ -2748,7 +2947,7 @@ class GridBot:
             price = self._ticker_price()
             if self._evaluate_automatic_stop(price, bot_btc_balance=carry_amount):
                 return False
-            if not self._macro_buys_allowed() and not (
+            if not self._entry_buys_allowed() and not (
                     request.get('source') == 'engine_resume' and carry_amount > 0):
                 request['cancellation_verified'] = True
                 self.database.set_state('grid_reset', json.dumps(request, sort_keys=True))
@@ -2939,8 +3138,26 @@ class GridBot:
                 if self._price(raw) > self.config.stop_loss_price
             }
             expected = set(range(-1, -len(self.upper_levels) - 1, -1)) | {0}
-            if request.get('source') != 'engine_resume' or self._macro_buys_allowed():
+            if request.get('source') != 'engine_resume' or self._entry_buys_allowed():
                 expected |= safe_buys
+            if self._inventory_sizing_enabled:
+                # A valid inventory deferral is an intentional empty BUY lane,
+                # not an unfinished reset. Never certify unknown exposure.
+                for level in safe_buys - latest.keys():
+                    price = self._grid_order_price(self.levels[level - 1], 'BUY')
+                    requested = self._amount(self._lower_quote_per_level() / price)
+                    if self._inventory_buy_amount(level, price, requested) == 0:
+                        decision = json.loads(self.database.get_state(f'inventory_buy_sizing:{level}') or '{}')
+                        if decision.get('reason') in ('INVENTORY_CEILING', 'BELOW_ORDER_MINIMUM', 'ROUNDED_TO_ZERO'):
+                            expected.discard(level)
+            if self._risk_budget_usdt is not None:
+                for level in safe_buys - latest.keys():
+                    price = self._grid_order_price(self.levels[level - 1], 'BUY')
+                    requested = self._amount(self._lower_quote_per_level() / price)
+                    if self._risk_buy_amount(level, price, requested) == 0:
+                        detail = json.loads(self.database.get_state(f'risk_buy_sizing:{level}') or '{}')
+                        if detail.get('reason') in ('RISK_LIMIT', 'BELOW_ORDER_MINIMUM'):
+                            expected.discard(level)
             if expected <= latest.keys():
                 notification_key = (
                     BREAKOUT_NOTICE_KEY if request.get("source") == "breakout"
@@ -3115,7 +3332,8 @@ class GridBot:
             self.database.set_state(SAFETY_MODE_KEY, LIQUIDATED)
             self.database.set_state(ENGINE_STATUS_KEY, ENGINE_HALTED,
                                     trigger_event="LIQUIDATION_COMPLETE")
-            self.database.set_state("halt_reason", "hard_stop_liquidated")
+            self.database.set_state("halt_reason", 'campaign_risk_limit' if
+                                    state.get('trigger_event') == risk_policy.EXIT_EVENT else 'hard_stop_liquidated')
             self.database.set_state(LIQUIDATION_NOTICE_KEY, "1")
             self.database.clear_state(LIQUIDATION_ALARM_KEY)
             for key in ("grid_reset", BREAKOUT_TIMER_KEY, SAFETY_PAUSE_NOTICE_KEY,
@@ -3124,10 +3342,12 @@ class GridBot:
         self.grid_needs_reset = False
         self.pending_grid_bounds = None
         self.is_paused = True
-        LOGGER.critical(
-            "Hard stop sold %s %s; verified bot inventory is flat. "
-            "Engine is HALTED until admin reset.", sold, self.market["base"],
-        )
+        if state.get('trigger_event') == risk_policy.EXIT_EVENT:
+            LOGGER.critical('Campaign risk exit sold %s %s; verified bot inventory is flat. Campaign remains locked.',
+                            sold, self.market['base'])
+        else:
+            LOGGER.critical('Hard stop sold %s %s; verified bot inventory is flat. '
+                            'Engine is HALTED until admin reset.', sold, self.market['base'])
 
     def _sellable_hard_stop_amount(self, held: Decimal, price: Decimal) -> Decimal:
         """Apply Binance MARKET lot and notional filters before a SELL."""
@@ -3387,7 +3607,8 @@ class GridBot:
                     # when panic was requested from IDLE or a safety pause.
                     self.database.set_state(ENGINE_STATUS_KEY, ENGINE_HALTED,
                                             trigger_event=trigger_event)
-            headline = ("MANUAL PANIC — MARKET LIQUIDATION" if trigger_event == "MANUAL_PANIC_LIQUIDATION"
+            headline = ("CAMPAIGN RISK LIMIT — MARKET EXIT" if trigger_event == risk_policy.EXIT_EVENT else
+                        "MANUAL PANIC — MARKET LIQUIDATION" if trigger_event == "MANUAL_PANIC_LIQUIDATION"
                         else "HARD STOP TRIGGERED — MARKET LIQUIDATION")
             schedule_telegram_alert(
                 f"🚨 *{headline}*"
@@ -3396,7 +3617,8 @@ class GridBot:
                    else f"\nTrigger price: {markdown_text(price)}")
             )
             self.is_paused = True
-            label = "Manual panic requested" if trigger_event == "MANUAL_PANIC_LIQUIDATION" else "Hard stop triggered"
+            label = ('Campaign dollar risk limit reached' if trigger_event == risk_policy.EXIT_EVENT else
+                     'Manual panic requested' if trigger_event == 'MANUAL_PANIC_LIQUIDATION' else 'Hard stop triggered')
             LOGGER.critical("%s at %s %s; liquidating bot inventory.",
                             label, price, self.config.symbol)
         if state["phase"] == "complete":
@@ -3624,6 +3846,8 @@ class GridBot:
 
     def prepare_factory_reset(self) -> Dict[str, Any]:
         """Persist a no-placement state before canceling both bot order sides."""
+        if self.database.get_state(risk_policy.STATE_KEY) is not None:
+            raise TradingHalt('A dollar-risk validation ledger cannot erase its risk history; use a new isolated ledger.')
         with self._cycle_lock:
             self.assert_runner_lease()
             if self.stop_controller.stop_requested.is_set() or self.grid_needs_reset:
@@ -3756,6 +3980,7 @@ class GridBot:
         """Reconcile first; resume matched orders or queue a guarded rebuild."""
         with self._cycle_lock:
             self.assert_runner_lease()
+            self._assert_campaign_risk_open()
             if self.database.get_state(SAFETY_MODE_KEY) == LIQUIDATING:
                 raise TradingHalt('Hard-stop verification or liquidation must finish before START.')
             if self.database.get_state(ENGINE_STOP_CLEANUP_KEY) == "1":
@@ -3890,6 +4115,820 @@ class GridBot:
         return self._cancel_bot_orders(
             side="buy", marker_prefix="safety_pause_buy", limit_only=True
         )
+
+    def _initialize_fee_validation(self) -> None:
+        with self.database.transaction():
+            stored = self.database.get_state(fee_policy.STATE_KEY)
+            if self._fee_policy is None:
+                if stored is not None:
+                    raise TradingHalt('This ledger has a fee validation policy; do not disable it in place.')
+                return
+            expected = dict(self._fee_policy.serialize(), symbol=self.config.symbol)
+            if stored is None:
+                self.database.set_state(fee_policy.STATE_KEY, json.dumps(expected, sort_keys=True))
+            else:
+                try:
+                    valid = json.loads(stored) == expected
+                except (ValueError, TypeError):
+                    valid = False
+                if not valid:
+                    raise TradingHalt('Saved fee/slippage assumptions changed; use a reviewed isolated ledger.')
+
+    def _fee_audit(self) -> Dict[str, Any]:
+        if self._fee_policy is None:
+            return {'allowed': True, 'reason_code': 'DISABLED'}
+        try:
+            expected = dict(self._fee_policy.serialize(), symbol=self.config.symbol)
+            if json.loads(self.database.get_state(fee_policy.STATE_KEY) or 'null') != expected:
+                return {'allowed': False, 'reason_code': 'FEE_POLICY_UNAVAILABLE'}
+            return fee_policy.audit(self.database, self._fee_policy, self.config.symbol,
+                require_verified=bool(getattr(self.exchange, 'has', {}).get('fetchOrderTrades')))
+        except (ValueError, TypeError, KeyError):
+            return {'allowed': False, 'reason_code': 'FEE_POLICY_UNAVAILABLE'}
+
+    def fee_validation_status(self) -> Dict[str, Any]:
+        if self._fee_policy is None:
+            return {'enabled': False}
+        audit = self._fee_audit()
+        return dict(enabled=True, policy=self._fee_policy.serialize(), rate_unit='fraction', symbol=self.config.symbol,
+                    source='Explicit assumptions + persisted execution commissions',
+                    required_gross_return=str(self._fee_policy.required_gross_return()),
+                    available=audit['allowed'], buy_allowed=audit['allowed'],
+                    audit={key:str(value) if isinstance(value, Decimal) else value for key,value in audit.items()},
+                    decision=self.database.get_state('fee_validation_decision'))
+
+    def _fee_decision(self, level: int, reason: str, projection: Optional[Dict[str, Any]] = None) -> None:
+        detail = dict(level=level, reason_code=reason)
+        if projection is not None:
+            detail.update({key:str(value) if isinstance(value, Decimal) else value
+                           for key,value in projection.items()})
+        text = json.dumps(detail, sort_keys=True)
+        with self.database.transaction():
+            key = 'fee_validation_decision:' + str(level)
+            if self.database.get_state(key) != text:
+                self.database.set_state(key, text)
+                self.database.set_state('fee_validation_decision', text)
+                current = self.database.get_state(ENGINE_STATUS_KEY)
+                self.database.record_transition(current, current, 'FEE_VALIDATION', text)
+
+    def _fee_pair(self, buy: Decimal, target: Decimal, amount: Decimal) -> Dict[str, Any]:
+        result = self._fee_policy.project(buy, target, amount, self._amount, base_reserve=SELL_AMOUNT_BUFFER)
+        self._check_order_size(buy, amount)
+        self._check_order_size(target, result['modeled_sell_quantity'])
+        result['allowed'] = result['allowed'] and result['gross_return'] >= MIN_GRID_RETURN
+        return result
+
+    def _validate_net_fee_geometry(self, center, buys, sells) -> None:
+        if self._fee_policy is None:
+            return
+        for side in (buys, sells):
+            previous = self._price(center)
+            for raw in side:
+                price = self._price(raw)
+                buy, target = min(previous, price), max(previous, price)
+                if self._fee_policy.net_return(buy, target) < self._fee_policy.minimum_net_return:
+                    raise GridSizingError('Grid cannot meet the configured net return after fees and execution buffers. '
+                                          'Review wider spacing or fewer levels; no entry was purchased.')
+                previous = price
+
+    def _fee_entry_allowed(self, level: int, price: Decimal, amount: Decimal, *,
+                           order_type: str = 'LIMIT', quote_cost: Optional[Decimal] = None,
+                           target: Optional[Decimal] = None) -> bool:
+        if self._fee_policy is None:
+            return True
+        audit = self._fee_audit()
+        if not audit['allowed']:
+            self._fee_decision(level, audit['reason_code'])
+            return False
+        if order_type == 'MARKET' and quote_cost is None:
+            raise TradingHalt('Fee-validated MARKET BUY requires an explicit quote budget.')
+        try:
+            if order_type == 'MARKET':
+                if level != 0 or not self.upper_levels:
+                    raise ValueError('Only reviewed seeds may use MARKET BUY.')
+                fee_policy.positive(quote_cost)
+                quantity = quote_cost/price/len(self.upper_levels)
+                targets = [self._price(value) for value in self.upper_levels]
+            else:
+                quantity = amount
+                targets = [target if target is not None else self._paired_sell_price({'level': level})]
+            projections = []
+            for exit_price in targets:
+                projection = self._fee_pair(price, exit_price, quantity)
+                if not projection['allowed']:
+                    self._fee_decision(level, 'NET_EDGE_TOO_SMALL', projection)
+                    return False
+                projections.append(projection)
+            self._fee_decision(level, 'NET_EDGE_VALID', min(projections, key=lambda item: item['net_return']))
+            return True
+        except (ValueError, ArithmeticError):
+            self._fee_decision(level, 'FEE_PAIR_UNAVAILABLE_OR_BELOW_MINIMUM')
+            return False
+
+    def _sync_fee_validation(self) -> Tuple[bool, List[Tuple[str, Tuple[str, ...]]]]:
+        if self._fee_policy is None:
+            return True, []
+        audit = self._fee_audit()
+        selected = set()
+        for row in self.database.fetch_active_grids():
+            if row['side'] != 'BUY' or row['order_type'] != 'LIMIT':
+                continue
+            if not audit['allowed'] or not self._fee_entry_allowed(row['level'], Decimal(row['price']),
+                    Decimal(row['amount']), target=self._paired_sell_price(row)):
+                selected.add(row['order_id'])
+        if not audit['allowed']:
+            self._fee_decision(0, audit['reason_code'])
+        if not selected:
+            return audit['allowed'], []
+        with self.database.transaction():
+            for identity in selected:
+                self.database.set_state('fee_pause_buy:' + identity, '1')
+        try:
+            events, _ = self._cancel_bot_orders(side='buy', selected_ids=selected,
+                marker_prefix='fee_pause_buy', limit_only=True)
+            return audit['allowed'], events
+        except (ccxt.BaseError, OSError) as error:
+            _journal_fault(self.database, error, 'FEE_VALIDATION_CANCEL_RETRY')
+            return False, []
+
+    def _initialize_recycling(self) -> None:
+        with self.database.transaction():
+            text = self.database.get_state(recycle_policy.STATE_KEY)
+            if not self._recycling_enabled:
+                if text is not None:
+                    raise TradingHalt('This ledger has recycling history; do not disable it in place.')
+                return
+            if self.database.get_state('total_allocation_cap') != '1':
+                if self.database.fetch_all_orders() or self.database.fetch_trade_history():
+                    raise TradingHalt('Recycling requires an existing total allocation cap or a fresh isolated ledger.')
+                self.database.set_state('total_allocation_cap', '1')
+            if text is None:
+                self.database.set_state(recycle_policy.STATE_KEY, json.dumps(dict(
+                    policy_id=recycle_policy.POLICY_ID, episode=None, last_release=None), sort_keys=True))
+                if self._cap_exhausted():
+                    # Do not count historical sales when opting into an old cap pause.
+                    self._start_recycling_episode(self.database.get_state(CAP_ORDER_KEY))
+            else:
+                self._recycling_state()
+
+    def _recycling_state(self) -> Dict[str, Any]:
+        try:
+            state = json.loads(self.database.get_state(recycle_policy.STATE_KEY) or 'null')
+            if state['policy_id'] != recycle_policy.POLICY_ID:
+                raise ValueError('Unknown policy.')
+            episode = state['episode']
+            if episode is not None and (not isinstance(episode['id'], str) or not episode['id'] or
+                    type(episode['booked_through']) is not int or episode['booked_through'] < 0 or
+                    not isinstance(episode['excluded_sells'], list) or
+                    any(not isinstance(x, str) for x in episode['excluded_sells']) or
+                    episode['final_order_id'] is not None and not isinstance(episode['final_order_id'], str)):
+                raise ValueError('Invalid recycling episode.')
+            state['last_release']  # Required even before the first release.
+            return state
+        except (ValueError, TypeError, KeyError) as error:
+            raise TradingHalt('Recycling episode is missing or corrupt; the cap remains locked.') from error
+
+    def _start_recycling_episode(self, final_order_id: Optional[str]) -> None:
+        state = self._recycling_state()
+        fence, excluded = recycle_policy.sell_fence(self.database)
+        state['episode'] = dict(id=uuid.uuid4().hex, booked_through=fence,
+                                excluded_sells=excluded, final_order_id=final_order_id)
+        self.database.set_state(recycle_policy.STATE_KEY, json.dumps(state, sort_keys=True))
+
+    def capital_recycling_status(self) -> Dict[str, Any]:
+        if not self._recycling_enabled:
+            return {'enabled': False}
+        result = dict(enabled=True, policy_id=recycle_policy.POLICY_ID,
+                      allocation_usdt=str(self.config.investment_quote), profit_compounding=False)
+        try:
+            state = self._recycling_state()
+            held, pending = recycle_policy.exposure(self.database)
+            return dict(result, available=True, episode=state['episode'], last_release=state['last_release'],
+                        held_cost=str(held), pending_buy_cost=str(pending),
+                        decision=self.database.get_state('recycling_decision'))
+        except (TradingHalt, ValueError, TypeError, KeyError, ArithmeticError):
+            return dict(result, available=False, reason_code='RECYCLING_UNAVAILABLE')
+
+    def _recycling_decision(self, reason: str) -> None:
+        with self.database.transaction():
+            if self.database.get_state('recycling_decision') != reason:
+                self.database.set_state('recycling_decision', reason)
+                current = self.database.get_state(ENGINE_STATUS_KEY)
+                self.database.record_transition(current, current, 'RECYCLING_DECISION', reason)
+
+    def _recycling_candidate(self, mark: Decimal) -> Optional[Dict[str, Any]]:
+        latest = self.database.fetch_latest_orders_by_level()
+        priorities = list(range(-1, -len(self.upper_levels)-1, -1)) + list(range(1, len(self.levels)+1))
+        for level in priorities:
+            row = latest.get(level)
+            parent_id = None
+            if row is None:
+                if level < 0:
+                    continue  # Initial seed SELL coverage has priority over a rebuy.
+            elif row['side'] == 'SELL' and row['status'] == 'FILLED':
+                parent_id = row['order_id']
+            elif row['side'] == 'BUY' and row['status'] == 'CANCELED':
+                snapshot = json.loads(self.database.get_state(FILL_SNAPSHOT_PREFIX + row['order_id']) or '{}')
+                if Decimal(snapshot.get('filled_base', '0')) != 0 or not any(
+                        self.database.get_state(prefix + ':' + row['order_id']) == '1'
+                        for prefix in ('safety_pause_buy', 'trailing_stop_buy', 'macro_pause_buy',
+                                       'regime_pause_buy', 'inventory_pause_buy', 'risk_pause_buy',
+                                       'auto_atr_cancel', 'partial_fill_buy')):
+                    continue
+                parent_id = row['parent_order_id']
+            else:
+                continue
+            lane = self._auto_atr_lane(level)
+            target = (self.levels[level-1] if level > 0 else
+                      self.anchor if level == -1 else self.upper_levels[-level-2])
+            price = (self._price(Decimal(lane['buy'])) if lane else self._grid_order_price(target, 'BUY'))
+            if not self.config.stop_loss_price < price < mark:
+                continue
+            if level > 0:
+                amount = self._amount(self._lower_quote_per_level() / price)
+            else:
+                parent = self.database.get_order(parent_id) if parent_id else None
+                if parent is None:
+                    raise TradingHalt('Recycled upper BUY is missing its settled SELL parent.')
+                snapshot = json.loads(self.database.get_state(FILL_SNAPSHOT_PREFIX + parent_id) or '{}')
+                amount = self._amount(Decimal(snapshot['filled_base']))
+            return dict(level=level, price=price, amount=amount, parent_order_id=parent_id)
+        return None
+
+    def _recycling_authorization(self, mark: Decimal) -> Optional[Dict[str, Any]]:
+        """Read-only ledger checks, repeated inside the intent transaction."""
+        if (not self._recycling_enabled or not self._cap_exhausted() or
+                self.database.get_state('total_allocation_cap') != '1' or self.is_paused or
+                self.database.get_state(SAFETY_MODE_KEY) is not None or
+                self.database.get_state(ENGINE_STATUS_KEY) in (ENGINE_IDLE, ENGINE_HALTED) or
+                self.stop_controller.stop_requested.is_set() or self.grid_needs_reset or
+                self.database.get_state('grid_reset') or self.database.get_state(RECONCILE_COVER_KEY) or
+                any(self.database.get_state(key) for key in (ENGINE_FAULT_KEY, ENGINE_STOP_CLEANUP_KEY,
+                    ORDER_CLEANUP_ALARM_KEY, GHOST_ORDER_ALARM_KEY)) or
+                not mark.is_finite() or mark <= self.config.stop_loss_price or
+                not self._auto_atr_entry_in_bounds(mark) or not self._auto_atr_buys_allowed()):
+            return None
+        state = self._recycling_state()
+        episode = state['episode']
+        if episode is None or not recycle_policy.settled_final_order(self.database, episode):
+            return None
+        trade = recycle_policy.eligible_sell(self.database, episode, self.order_client_prefix,
+            require_verified_fees=bool(getattr(self.exchange, 'has', {}).get('fetchOrderTrades')))
+        if trade is None:
+            return None
+        candidate = self._recycling_candidate(mark)
+        if candidate is None:
+            return None
+        price, amount, level = candidate['price'], candidate['amount'], candidate['level']
+        self._check_order_size(price, amount)
+        self._check_order_size(self._paired_sell_price({'level': level}), self._amount(amount * (1-SELL_AMOUNT_BUFFER)))
+        held, pending = recycle_policy.exposure(self.database)
+        if not recycle_policy.fits(self.config.investment_quote, held, pending, price*amount):
+            return None
+        if self._inventory_sizing_enabled and self._inventory_buy_amount(level, price, amount) != amount:
+            return None
+        if self._risk_budget_usdt is not None and self._risk_buy_amount(level, price, amount) != amount:
+            return None
+        if not self._fee_entry_allowed(level, price, amount):
+            return None
+        return dict(episode=episode, trade=trade, candidate=candidate)
+
+    def _try_recycle_cap(self, mark: Decimal) -> Optional[str]:
+        if not self._recycling_enabled or not self._cap_exhausted():
+            return None
+        if not self._entry_buys_allowed():
+            self._recycling_decision('ENTRY_GATE_BLOCKED')
+            return None
+        try:
+            with self.database.transaction():
+                authorization = self._recycling_authorization(mark)
+            if authorization is None:
+                self._recycling_decision('WAITING_FOR_CONFIRMED_SELL_AND_FULL_ORDER_ROOM')
+                return None
+            candidate = authorization['candidate']
+            if self._free_balance(self.market['quote']) < candidate['price']*candidate['amount']*(1+recycle_policy.FEE_RESERVE):
+                self._recycling_decision('INSUFFICIENT_FREE_QUOTE')
+                return None
+        except RunnerLeaseLost:
+            raise
+        except (TradingHalt, ValueError, TypeError, KeyError, ArithmeticError):
+            self._recycling_decision('RECYCLING_UNAVAILABLE')
+            return None
+        identity = self._submit_order(candidate['level'], 'BUY', candidate['price'], candidate['amount'],
+            parent_order_id=candidate['parent_order_id'], recycle_episode=authorization['episode']['id'])
+        if identity is not None:
+            self._recycling_decision('RELEASE_RESERVED')
+        return identity
+
+    def _auto_atr_lane_ids(self) -> List[int]:
+        return list(range(1, len(self.levels) + 1)) + list(range(-1, -len(self.upper_levels) - 1, -1))
+
+    def _auto_atr_state(self) -> Dict[str, Any]:
+        seed = self.database.fetch_latest_orders_by_level().get(0)
+        binding = self.config.breakout_fingerprint() + ':' + (seed['order_id'] if seed else 'unseeded')
+        default = dict(policy_id=auto_policy.POLICY_ID, binding=binding, active=None,
+                       pending=None, last_evaluated_hour=None)
+        text = self.database.get_state(auto_policy.STATE_KEY)
+        if text is None:
+            return default
+        try:
+            state = json.loads(text)
+            if state['policy_id'] != auto_policy.POLICY_ID:
+                raise ValueError('Unknown policy.')
+            if state['binding'] != binding:
+                return default  # An explicit manual reset installed a different grid/seed.
+            evaluated = state['last_evaluated_hour']
+            if evaluated is not None and (type(evaluated) is not int or evaluated < 0 or
+                                          evaluated % auto_policy.HOUR_MS):
+                raise ValueError('Invalid evaluated hour.')
+            for field in ('active', 'pending'):
+                plan = state[field]
+                if plan is None:
+                    continue
+                hour = plan['closed_at_ms']
+                if type(hour) is not int or hour % auto_policy.HOUR_MS:
+                    raise ValueError('Invalid plan hour.')
+                for key in ('center', 'atr', 'gap', 'lower', 'upper'):
+                    value = Decimal(plan[key])
+                    if not value.is_finite() or value <= 0:
+                        raise ValueError('Invalid plan price.')
+                if set(plan['lanes']) != set(map(str, self._auto_atr_lane_ids())):
+                    raise ValueError('ATR lane count changed.')
+                previous = Decimal(plan['center'])
+                for level in self._auto_atr_lane_ids():
+                    lane = plan['lanes'][str(level)]
+                    buy, sell = Decimal(lane['buy']), Decimal(lane['sell'])
+                    if (not buy.is_finite() or not sell.is_finite() or not 0 < buy < previous or
+                            sell / buy - 1 < MIN_GRID_RETURN):
+                        raise ValueError('Invalid saved ATR lane.')
+                    previous = buy
+                if Decimal(plan['lower']) != previous or Decimal(plan['upper']) <= Decimal(plan['center']):
+                    raise ValueError('Invalid adaptive entry bounds.')
+            return state
+        except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+            raise TradingHalt('Automatic ATR plan is corrupt; review the saved ledger.') from error
+
+    def _auto_atr_lane(self, level: int) -> Optional[Dict[str, str]]:
+        if self._auto_atr_monitor is None:
+            return None
+        plan = self._auto_atr_state()['active']
+        return plan['lanes'].get(str(level)) if plan else None
+
+    def _auto_atr_data_ready(self) -> bool:
+        return self._auto_atr_monitor is None or self._auto_atr_monitor.read() is not None
+
+    def _auto_atr_buys_allowed(self) -> bool:
+        return (self._auto_atr_monitor is None or
+                (self._auto_atr_data_ready() and self._auto_atr_state()['pending'] is None))
+
+    def _auto_atr_replacement_price(self, row: Dict[str, Any]) -> Decimal:
+        lane = self._auto_atr_lane(row['level'])
+        return Decimal(lane['buy']) if lane else Decimal(row['price'])
+
+    def _auto_atr_entry_in_bounds(self, price: Decimal) -> bool:
+        if self._auto_atr_monitor is not None:
+            plan = self._auto_atr_state()['active']
+            if plan is not None:
+                return Decimal(plan['lower']) <= price <= Decimal(plan['upper'])
+        return self._within_grid_bounds(price)
+
+    def auto_atr_status(self) -> Dict[str, Any]:
+        if self._auto_atr_monitor is None:
+            return {'enabled': False}
+        result = dict(enabled=True, policy_id=auto_policy.POLICY_ID, source='Binance Mainnet Spot',
+                      cooldown_hours=4, spacing_atr_fraction='0.5', minimum_gross_return=str(MIN_GRID_RETURN))
+        try:
+            state = self._auto_atr_state()
+            return dict(result, **self._auto_atr_monitor.status(), active=state['active'],
+                        pending=state['pending'], last_evaluated_hour=state['last_evaluated_hour'],
+                        decision=self.database.get_state('auto_atr_decision'))
+        except (TradingHalt, ValueError, TypeError, KeyError):
+            return dict(result, available=False, reason_code='PLAN_UNAVAILABLE')
+
+    def _auto_atr_decision(self, reason: str) -> None:
+        with self.database.transaction():
+            if self.database.get_state('auto_atr_decision') != reason:
+                self.database.set_state('auto_atr_decision', reason)
+                current = self.database.get_state(ENGINE_STATUS_KEY)
+                self.database.record_transition(current, current, 'AUTO_ATR_DECISION', reason)
+
+    def _freeze_auto_atr_exits(self) -> None:
+        # Freeze before changing any BUY geometry or issuing a cancel. Late fills
+        # retain the target under which their BUY was originally submitted.
+        with self.database.transaction():
+            for row in self.database.fetch_all_orders():
+                if row['side'] == 'BUY' and row['order_type'] == 'LIMIT':
+                    key = auto_policy.EXIT_PREFIX + row['order_id']
+                    if self.database.get_state(key) is None:
+                        self.database.set_state(key, str(self._paired_sell_price(row)))
+
+    def _sync_auto_atr(self, price: Decimal) -> Tuple[bool, List[Tuple[str, Tuple[str, ...]]]]:
+        if self._auto_atr_monitor is None:
+            return True, []
+        snapshot = self._auto_atr_monitor.refresh()
+        state = self._auto_atr_state()
+        events = []
+        pending = state['pending']
+        if snapshot is None or pending is not None:
+            self._freeze_auto_atr_exits()
+            try:
+                cancel_events, complete = self._cancel_bot_orders(
+                    side='buy', marker_prefix=auto_policy.CANCEL_PREFIX, limit_only=True)
+                events.extend(cancel_events)
+            except (ccxt.BaseError, OSError) as error:
+                _journal_fault(self.database, error, 'AUTO_ATR_CANCEL_RETRY')
+                return False, events
+            if snapshot is None:
+                self._auto_atr_decision('DATA_UNAVAILABLE')
+                return False, events
+            if not complete or any(r['side'] == 'BUY' for r in self.database.fetch_active_grids()):
+                return False, events
+        if (self.is_paused or self.database.get_state(SAFETY_MODE_KEY) is not None or
+                self.grid_needs_reset or self.database.get_state('grid_reset') or
+                self.stop_controller.stop_requested.is_set() or self._cap_exhausted() or
+                not self._entry_buys_allowed()):
+            self._auto_atr_decision('ENTRY_CONTROL_BLOCKED')
+            return pending is None, events
+        seed = self.database.fetch_latest_orders_by_level().get(0)
+        if seed is None or seed['status'] != 'FILLED':
+            self._auto_atr_decision('WAITING_FOR_SEED')
+            return True, events
+        if pending is not None:
+            # Cancellations can outlive an hour or the candidate's entry window.
+            valid = (snapshot.closed_at_ms == pending['closed_at_ms'] and
+                     abs(price / Decimal(pending['center']) - 1) <= Decimal(pending['gap']) / 2 and
+                     Decimal(pending['lower']) > self.config.stop_loss_price)
+            state['pending'] = None
+            state['last_evaluated_hour'] = snapshot.closed_at_ms
+            if valid:
+                state['active'] = pending
+            with self.database.transaction():
+                self.database.set_state(auto_policy.STATE_KEY, json.dumps(state, sort_keys=True))
+                current = self.database.get_state(ENGINE_STATUS_KEY)
+                self.database.record_transition(current, current,
+                    'AUTO_ATR_REANCHORED' if valid else 'AUTO_ATR_CANDIDATE_WITHDRAWN')
+            self._auto_atr_decision('APPLIED' if valid else 'CANDIDATE_DRIFTED')
+            self.invalidate_dashboard_reads()
+            return True, events
+        if state['last_evaluated_hour'] == snapshot.closed_at_ms:
+            return True, events
+        state['last_evaluated_hour'] = snapshot.closed_at_ms
+        if not auto_policy.needs_update(state['active'], snapshot, price):
+            self.database.set_state(auto_policy.STATE_KEY, json.dumps(state, sort_keys=True))
+            self._auto_atr_decision('COOLDOWN_OR_SMALL_CHANGE')
+            return True, events
+        try:
+            filters = (self.market.get('info') or {}).get('filters') or []
+            tick = next((Decimal(str(f['tickSize'])) for f in filters
+                         if f.get('filterType') == 'PRICE_FILTER'), Decimal('.01'))
+            plan = auto_policy.make_plan(price, snapshot.atr, self._auto_atr_lane_ids(),
+                                         self.config.stop_loss_price, tick, self._price)
+            for level in range(1, len(self.levels) + 1):
+                lane = plan['lanes'][str(level)]
+                buy, sell = Decimal(lane['buy']), Decimal(lane['sell'])
+                amount = self._amount(self._lower_quote_per_level() / buy)
+                self._check_order_size(buy, amount)
+                self._check_order_size(sell, self._amount(amount * (1 - SELL_AMOUNT_BUFFER)))
+                if self._fee_policy is not None and not self._fee_pair(buy, sell, amount)['allowed']:
+                    self._fee_decision(level, 'AUTO_ATR_NET_EDGE_TOO_SMALL')
+                    self.database.set_state(auto_policy.STATE_KEY, json.dumps(state, sort_keys=True))
+                    self._auto_atr_decision('FEE_NET_EDGE_TOO_SMALL')
+                    return True, events  # Retain the previous net; never widen held exits.
+            plan['closed_at_ms'] = snapshot.closed_at_ms
+        except (ValueError, ArithmeticError):
+            self.database.set_state(auto_policy.STATE_KEY, json.dumps(state, sort_keys=True))
+            self._auto_atr_decision('UNFUNDABLE_OR_STOP_CONFLICT')
+            return True, events
+        with self.database.transaction():
+            self._freeze_auto_atr_exits()
+            state['pending'] = plan
+            self.database.set_state(auto_policy.STATE_KEY, json.dumps(state, sort_keys=True))
+        self._auto_atr_decision('CANCELING_OLD_BUYS')
+        return False, events  # Verify cancellations on the next cycle before activation.
+
+    def _initialize_campaign_risk(self) -> None:
+        with self.database.transaction():
+            text = self.database.get_state(risk_policy.STATE_KEY)
+            if text is not None:
+                if self._risk_budget_usdt is None:
+                    raise TradingHalt('This ledger has a dollar risk budget; it cannot be disabled in place.')
+                self._campaign_risk_state()
+                return
+            if self._risk_budget_usdt is None:
+                return
+            if (self.database.fetch_all_orders() or self.database.fetch_trade_history() or
+                    self.database.fetch_dust_reserves()):
+                raise TradingHalt('Dollar risk validation requires a fresh isolated ledger; existing history cannot be rebased.')
+            self.database.set_state(risk_policy.STATE_KEY, json.dumps(dict(
+                policy_id=risk_policy.POLICY_ID, budget_usdt=str(self._risk_budget_usdt),
+                symbol=self.config.symbol, initial_allocation=str(self.config.investment_quote),
+                latched=False, created_at=datetime.now(timezone.utc).isoformat()), sort_keys=True))
+
+    def _campaign_risk_state(self) -> Dict[str, Any]:
+        try:
+            state = json.loads(self.database.get_state(risk_policy.STATE_KEY) or 'null')
+            if (not isinstance(state, dict) or state['policy_id'] != risk_policy.POLICY_ID or
+                    Decimal(state['budget_usdt']) != self._risk_budget_usdt or
+                    state['symbol'] != self.config.symbol or type(state['latched']) is not bool):
+                raise ValueError('Risk policy changed.')
+            return state
+        except (ValueError, KeyError, TypeError, ArithmeticError) as error:
+            raise TradingHalt('Saved dollar risk budget is missing, corrupt, or changed; use a reviewed isolated ledger.') from error
+
+    def _assert_campaign_risk_open(self) -> None:
+        if self._risk_budget_usdt is not None and self._campaign_risk_state()['latched']:
+            raise TradingHalt('Campaign dollar risk limit is latched; a new reviewed isolated ledger is required.')
+
+    def _campaign_risk_view(self, *, mark: Optional[Decimal] = None,
+                            stop: Optional[Decimal] = None) -> Dict[str, Any]:
+        try:
+            with self.database.transaction():
+                state = self._campaign_risk_state()
+                wallet = _portfolio_wallet(self.database, decimal_values=True)
+                if wallet['btc_held'] is None:
+                    raise ValueError('Unknown risk inventory.')
+                quantity = Decimal(str(wallet['btc_held']))
+                cost = quantity*Decimal(str(wallet['average_cost'])) if quantity else Decimal(0)
+                booked = sum((Decimal(row['profit']) for row in self.database.fetch_trade_history()), Decimal(0))
+                unbooked = risk_policy.unbooked_sell_losses(self.database)
+                if mark is None:
+                    mark = Decimal(self.database.get_state(LAST_MARKET_PRICE_KEY) or str(self.anchor))
+                result = risk_policy.projection(self._risk_budget_usdt, booked+unbooked,
+                    cost, quantity, self.config.stop_loss_price if stop is None else stop,
+                    mark, risk_policy.pending_buys(self.database))
+                result.update(latched=state['latched'], booked_realized_pnl=booked,
+                              unbooked_loss_reserve=unbooked)
+                if state['latched']:
+                    result['headroom'] = Decimal(0)
+                return result
+        except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+            raise TradingHalt('Campaign risk exposure cannot be verified.') from error
+
+    def campaign_risk_status(self) -> Dict[str, Any]:
+        if self._risk_budget_usdt is None:
+            return {'enabled': False}
+        result = dict(enabled=True, policy_id=risk_policy.POLICY_ID,
+                      budget_usdt=str(self._risk_budget_usdt), exit_fraction=str(risk_policy.EXIT_FRACTION))
+        try:
+            view = self._campaign_risk_view()
+        except TradingHalt:
+            return dict(result, available=False, reason_code='RISK_UNAVAILABLE')
+        return dict(result, available=True, **{k:str(v) if isinstance(v, Decimal) else v for k,v in view.items()})
+
+    def _risk_seed_quote(self, config: GridConfig, price: Decimal) -> Decimal:
+        if self._risk_budget_usdt >= config.investment_quote:
+            raise GridSizingError('Dollar risk budget must remain below allocated capital.')
+        view = self._campaign_risk_view(mark=price, stop=config.stop_loss_price)
+        return risk_policy.seed_quote(config.investment_quote*config.initial_inventory_percent/100,
+            price, config.stop_loss_price, view['headroom'], config.initial_inventory_percent/100)
+
+    def _validate_risk_seed(self, config: GridConfig, price: Decimal, uppers: List[Decimal]) -> None:
+        try:
+            quote = self._risk_seed_quote(config, price)
+            amount = self._amount(quote/price)
+            self._check_order_size(price, amount)
+            allocations = self._split_sell_amounts(amount*(1-SELL_AMOUNT_BUFFER),
+                                                  list(range(-1, -len(uppers)-1, -1)))
+            for index, target in enumerate(uppers, start=1):
+                self._check_order_size(self._price(target), allocations[-index])
+        except GridSizingError as error:
+            raise GridSizingError('Dollar risk budget cannot fund the seed and its SELL lanes after rounding. '
+                                  'Review fewer levels or an explicitly different risk budget; no seed was purchased.') from error
+
+    def _risk_buy_decision(self, level: int, reason: str) -> None:
+        key = f'risk_buy_sizing:{level}'
+        detail = json.dumps(dict(policy_id=risk_policy.POLICY_ID, reason=reason, level=level), sort_keys=True)
+        with self.database.transaction():
+            if self.database.get_state(key) != detail:
+                self.database.set_state(key, detail)
+                state = self.database.get_state(ENGINE_STATUS_KEY)
+                self.database.record_transition(state, state, 'RISK_BUY_SIZING', detail)
+
+    def _risk_buy_amount(self, level: int, price: Decimal, requested: Decimal) -> Decimal:
+        try:
+            view = self._campaign_risk_view(mark=price)
+        except TradingHalt:
+            self._risk_buy_decision(level, 'RISK_UNAVAILABLE')
+            return Decimal(0)
+        if view['latched']:
+            self._risk_buy_decision(level, 'RISK_LIMIT')
+            return Decimal(0)
+        try:
+            amount = risk_policy.limit_quantity(requested, price, self.config.stop_loss_price,
+                                                view['headroom'], self._amount)
+        except ValueError as error:
+            raise TradingHalt('Risk-sized BUY quantity could not be verified.') from error
+        if amount <= 0:
+            self._risk_buy_decision(level, 'RISK_LIMIT')
+            return Decimal(0)
+        try:
+            self._check_order_size(price, amount)
+            reverse = self._amount(amount*(1-SELL_AMOUNT_BUFFER))
+            if not 0 <= reverse <= amount:
+                raise TradingHalt('Risk-sized SELL precision exceeded acquired BTC.')
+            self._check_order_size(self._paired_sell_price({'level':level}), reverse)
+        except GridSizingError:
+            self._risk_buy_decision(level, 'BELOW_ORDER_MINIMUM')
+            return Decimal(0)
+        self._risk_buy_decision(level, 'TRIMMED' if amount < requested else 'UNCHANGED')
+        return amount
+
+    def _evaluate_campaign_risk(self, price: Decimal) -> bool:
+        if self._risk_budget_usdt is None:
+            return False
+        state = self._campaign_risk_state()
+        if not state['latched']:
+            try:
+                view = self._campaign_risk_view(mark=price)
+            except TradingHalt:
+                self._risk_buy_decision(0, 'RISK_UNAVAILABLE')
+                return False  # BUY synchronization fails closed; price stop stays active.
+            if view['estimated_exit_pnl'] > -view['exit_trigger_usdt']:
+                return False
+            state.update(latched=True, trigger_price=str(price),
+                         estimated_exit_pnl=str(view['estimated_exit_pnl']),
+                         triggered_at=datetime.now(timezone.utc).isoformat())
+            with self.database.transaction():
+                self.database.set_state(risk_policy.STATE_KEY, json.dumps(state, sort_keys=True))
+                current = self.database.get_state(ENGINE_STATUS_KEY)
+                self.database.record_transition(current, current, risk_policy.EXIT_EVENT)
+        self._liquidate_locked(price, trigger_event=risk_policy.EXIT_EVENT)
+        return True
+
+    def _sync_campaign_risk_buys(self) -> Tuple[bool, List[Tuple[str, Tuple[str, ...]]]]:
+        if self._risk_budget_usdt is None:
+            return True, []
+        try:
+            view = self._campaign_risk_view()
+            blocked = view['latched'] or view['modeled_risk'] > self._risk_budget_usdt
+        except TradingHalt:
+            blocked = True
+        if not blocked:
+            return True, []
+        with self.database.transaction():
+            for row in self.database.fetch_active_grids():
+                if row['side'] == 'BUY' and row['order_type'] == 'LIMIT':
+                    self.database.set_state(f"risk_pause_buy:{row['order_id']}", '1')
+        try:
+            events, _ = self._cancel_bot_orders(side='buy', marker_prefix='risk_pause_buy', limit_only=True)
+            return False, events
+        except (ccxt.BaseError, OSError) as error:
+            _journal_fault(self.database, error, 'CAMPAIGN_RISK_CANCEL_RETRY')
+            return False, []
+
+    def _inventory_budget(self, *, allocation: Optional[Decimal] = None) -> Dict[str, Decimal]:
+        try:
+            with self.database.transaction():
+                return inventory_budget(self.config.investment_quote if allocation is None else allocation,
+                                        tracked_position_cost(self.database),
+                                        pending_buy_commitment(self.database))
+        except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+            raise TradingHalt('Cannot verify inventory sizing exposure.') from error
+
+    def inventory_sizing_status(self) -> Dict[str, Any]:
+        if not self._inventory_sizing_enabled:
+            return {'enabled': False}
+        result = {'enabled': True, 'policy_id': INVENTORY_POLICY_ID,
+                  'soft_fraction': '0.50', 'ceiling_fraction': '0.75', 'basis': 'purchase_cost'}
+        try:
+            budget = self._inventory_budget()
+        except TradingHalt:
+            return dict(result, available=False, reason_code='EXPOSURE_UNAVAILABLE')
+        return dict(result, available=True, **{k: str(v) for k, v in budget.items()})
+
+    def _inventory_decision(self, level: int, reason: str, **values: Any) -> None:
+        detail = json.dumps(dict(policy_id=INVENTORY_POLICY_ID, level=level,
+                                 reason=reason, **{k: str(v) for k, v in values.items()}), sort_keys=True)
+        key = f'inventory_buy_sizing:{level}'
+        with self.database.transaction():
+            if self.database.get_state(key) != detail:
+                self.database.set_state(key, detail)
+                state = self.database.get_state(ENGINE_STATUS_KEY)
+                self.database.record_transition(state, state, 'INVENTORY_BUY_SIZING', detail)
+                LOGGER.info('Inventory BUY sizing at lane %s: %s.', level, reason)
+
+    def _inventory_buy_amount(self, level: int, price: Decimal, requested: Decimal) -> Decimal:
+        try:
+            budget = self._inventory_budget()
+        except TradingHalt:
+            self._inventory_decision(level, 'EXPOSURE_UNAVAILABLE')
+            return Decimal(0)
+        try:
+            plan = inventory_buy_size(requested, price, self.config.investment_quote,
+                                      budget['position_cost'], budget['pending_cost'], self._amount)
+        except ValueError as error:
+            raise TradingHalt('Invalid inventory BUY sizing or exchange precision.') from error
+        if plan.amount <= 0:
+            self._inventory_decision(level, plan.reason)
+            return Decimal(0)
+        try:
+            self._check_order_size(price, plan.amount)
+            reverse = self._amount(plan.amount * (1 - SELL_AMOUNT_BUFFER))
+            if not 0 <= reverse <= plan.amount:
+                raise TradingHalt('Exchange precision exceeded paired SELL inventory.')
+            self._check_order_size(self._paired_sell_price({'level': level}), reverse)
+        except GridSizingError:
+            self._inventory_decision(level, 'BELOW_ORDER_MINIMUM')
+            return Decimal(0)
+        self._inventory_decision(level, plan.reason, amount=plan.amount,
+                                 requested=requested, factor=plan.factor)
+        return plan.amount
+
+    def _sync_inventory_buy_budget(self) -> Tuple[bool, List[Tuple[str, Tuple[str, ...]]]]:
+        if not self._inventory_sizing_enabled:
+            return True, []
+        try:
+            budget = self._inventory_budget()
+            excess = budget['position_cost'] + budget['pending_cost'] > budget['ceiling']
+        except TradingHalt:
+            budget, excess = None, True
+        if not excess:
+            return True, []
+        with self.database.transaction():
+            for row in self.database.fetch_active_grids():
+                if row['side'] == 'BUY' and row['order_type'] == 'LIMIT':
+                    self.database.set_state(f"inventory_pause_buy:{row['order_id']}", '1')
+        try:
+            events, complete = self._cancel_bot_orders(
+                side='buy', marker_prefix='inventory_pause_buy', limit_only=True)
+        except (ccxt.BaseError, OSError) as error:
+            _journal_fault(self.database, error, 'INVENTORY_BUY_CANCEL_RETRY')
+            return False, []
+        if not complete:
+            return False, events
+        # Recompute after cancellation/fill races; never rely on released budget
+        # until cancellation is verified. Existing SELLs are untouched.
+        try:
+            budget = self._inventory_budget()
+            return budget['position_cost'] < budget['ceiling'], events
+        except TradingHalt:
+            return False, events
+
+    def regime_status(self) -> Dict[str, Any]:
+        if self._regime_monitor is None:
+            return {'enabled': False, 'buy_allowed': True, 'reason_code': 'DISABLED'}
+        try:
+            return self._regime_monitor.status()
+        except Exception:
+            return {'enabled': True, 'available': False, 'buy_allowed': False,
+                    'reason_code': 'DATA_UNAVAILABLE'}
+
+    def _regime_buys_allowed(self) -> bool:
+        if self._regime_monitor is None:
+            return True
+        try:
+            return self._regime_monitor.buys_allowed() is True
+        except Exception:
+            return False
+
+    def _entry_buys_allowed(self) -> bool:
+        regime = self._regime_buys_allowed()
+        inventory = True
+        if self._inventory_sizing_enabled:
+            try:
+                budget = self._inventory_budget()
+                inventory = budget['factor'] > 0 and budget['room'] > 0
+            except TradingHalt:
+                inventory = False
+        risk = True
+        if self._risk_budget_usdt is not None:
+            try:
+                risk = self._campaign_risk_view()['headroom'] > 0
+            except TradingHalt:
+                risk = False
+        return (self._macro_buys_allowed() and regime and inventory and risk and
+                self._auto_atr_data_ready() and self._fee_audit()['allowed'])
+
+    def _sync_regime_buy_pause(self) -> Tuple[bool, List[Tuple[str, Tuple[str, ...]]]]:
+        if self._regime_monitor is None:
+            return True, []
+        allowed = self._regime_buys_allowed()
+        status = self.regime_status()
+        reason = status.get('reason_code', 'DATA_UNAVAILABLE') if not allowed else 'RANGE'
+        if not allowed and reason in ('RANGE', 'DISABLED'):
+            reason = 'DATA_UNAVAILABLE'
+        if self.database.get_state('regime_buy_reason') != reason:
+            with self.database.transaction():
+                self.database.set_state('regime_buy_reason', reason)
+                self.database.set_state('regime_buy_pause', '0' if allowed else '1')
+                state = self.database.get_state(ENGINE_STATUS_KEY)
+                self.database.record_transition(state, state, 'REGIME_BUY_GATE_CHANGED', reason)
+            LOGGER.info('Hourly regime BUY gate: %s; SELLs and risk exits remain active.', reason)
+        if allowed:
+            return True, []
+        with self.database.transaction():
+            for row in self.database.fetch_active_grids():
+                if row['side'] == 'BUY' and row['order_type'] == 'LIMIT':
+                    self.database.set_state(f"regime_pause_buy:{row['order_id']}", '1')
+        try:
+            events, complete = self._cancel_bot_orders(
+                side='buy', marker_prefix='regime_pause_buy', limit_only=True)
+            if not complete:
+                LOGGER.warning('Regime BUY cancellation unverified; retrying next cycle.')
+            return False, events
+        except (ccxt.BaseError, OSError) as error:
+            _journal_fault(self.database, error, 'REGIME_BUY_CANCEL_RETRY')
+            return False, []
 
     def _macro_buys_allowed(self) -> bool:
         """Non-blocking cached Yahoo gate; provider failures never relax protection."""
@@ -4037,6 +5076,8 @@ class GridBot:
         bot_btc_balance = self._bot_btc_balance(refresh=False)
         if self._evaluate_automatic_stop(current_price, bot_btc_balance=bot_btc_balance):
             return events
+        if self._evaluate_campaign_risk(current_price):
+            return events
         # Routine account audits cannot gate a witnessed emergency price exit.
         self._audit_full_book_if_due()
         for row, order in observed_orders:
@@ -4045,6 +5086,8 @@ class GridBot:
             event = self._reconcile_order(row, order=order)
             if event:
                 events.append(event)
+        if self._evaluate_campaign_risk(current_price):
+            return events
         if mode == PAUSED_RESET:
             cancel_events, complete = self._cancel_bot_orders()
             events.extend(cancel_events)
@@ -4053,8 +5096,19 @@ class GridBot:
             return events
         if bot_btc_balance > 0:
             self._cancel_buys_below_stop()
-        macro_buys_allowed, macro_events = self._sync_macro_buy_pause()
+        macro_allowed, macro_events = self._sync_macro_buy_pause()
         events.extend(macro_events)
+        regime_buys_allowed, regime_events = self._sync_regime_buy_pause()
+        events.extend(regime_events)
+        inventory_allowed, inventory_events = self._sync_inventory_buy_budget()
+        events.extend(inventory_events)
+        risk_allowed, risk_events = self._sync_campaign_risk_buys()
+        events.extend(risk_events)
+        fee_allowed, fee_events = self._sync_fee_validation()
+        events.extend(fee_events)
+        auto_allowed, auto_events = self._sync_auto_atr(current_price)
+        events.extend(auto_events)
+        buys_allowed = macro_allowed and regime_buys_allowed and inventory_allowed and risk_allowed and auto_allowed and fee_allowed
         pending_reset = (self.database.get_state("grid_reset")
                          if self.grid_needs_reset else None)
         if pending_reset and json.loads(pending_reset)["phase"] == "canceling":
@@ -4071,7 +5125,7 @@ class GridBot:
                     if _order_decimal(self._fetch_order(row).get("filled")) > 0:
                         self._place_sell(row)
             return events
-        if macro_buys_allowed and mode != PAUSED_SIZING and self._observe_upper_breakout(
+        if self._auto_atr_monitor is None and buys_allowed and mode != PAUSED_SIZING and self._observe_upper_breakout(
                 current_price, bot_btc_balance=bot_btc_balance):
             return events
         if self.is_paused:
@@ -4111,7 +5165,7 @@ class GridBot:
         if seed_row is None:
             if cover_text:
                 raise TradingHalt("Inventory cover has no saved seed lot; manual review required.")
-            if (macro_buys_allowed and not self._cap_exhausted() and not self.is_paused and self._within_grid_bounds(current_price)
+            if (buys_allowed and not self._cap_exhausted() and not self.is_paused and self._within_grid_bounds(current_price)
                     and current_price > self.config.stop_loss_price):
                 self._check_grid_buy_capital(
                     self.config, self.levels, self.config.stop_loss_price,
@@ -4125,9 +5179,16 @@ class GridBot:
             return events
 
         latest = self.database.fetch_latest_orders_by_level()
+        if self._recycling_enabled and self._cap_exhausted():
+            for row in latest.values():
+                if row['side'] == 'SELL' and row['status'] == 'FILLED':
+                    self._record_filled_sell(row)
+            if buys_allowed and not cover_text:
+                self._try_recycle_cap(current_price)
+            latest = self.database.fetch_latest_orders_by_level()
         in_bounds = (
-            macro_buys_allowed and not self._cap_exhausted() and not self.is_paused and not cover_text and
-            self._within_grid_bounds(current_price)
+            buys_allowed and not self._cap_exhausted() and not self.is_paused and not cover_text and
+            self._auto_atr_entry_in_bounds(current_price)
         )
         if in_bounds and all(
             level not in latest for level in range(1, len(self.levels) + 1)
@@ -4184,11 +5245,21 @@ class GridBot:
                    self.database.get_state(
                       f"macro_pause_buy:{row['order_id']}") == "1" or
                    self.database.get_state(
+                      f"regime_pause_buy:{row['order_id']}") == "1" or
+                   self.database.get_state(
+                      f"inventory_pause_buy:{row['order_id']}") == "1" or
+                   self.database.get_state(
+                      f"risk_pause_buy:{row['order_id']}") == "1" or
+                   self.database.get_state(
+                      f"auto_atr_cancel:{row['order_id']}") == "1" or
+                   self.database.get_state(
+                      f"fee_pause_buy:{row['order_id']}") == "1" or
+                   self.database.get_state(
                       f"partial_fill_buy:{row['order_id']}") == "1")):
                 canceled_buy = self._fetch_order(row)
                 if _order_decimal(canceled_buy.get("filled")) > 0:
                     self._place_sell(row)
-                elif in_bounds and Decimal(row["price"]) < current_price:
+                elif in_bounds and self._auto_atr_replacement_price(row) < current_price:
                     self._place_buy(level, row.get("parent_order_id"))
             else:
                 raise TradingHalt("A grid lane ended unexpectedly; inspect local orders.")
@@ -4254,7 +5325,11 @@ class GridBot:
             return
         mode = self.database.get_state(SAFETY_MODE_KEY)
         try:
-            await notifier.notify_hard_stop(mode == LIQUIDATED)
+            state = json.loads(self.database.get_state(LIQUIDATION_KEY) or '{}')
+            if state.get('trigger_event') == risk_policy.EXIT_EVENT:
+                await notifier.notify_campaign_risk(mode == LIQUIDATED)
+            else:
+                await notifier.notify_hard_stop(mode == LIQUIDATED)
         except Exception as error:
             LOGGER.warning("Hard-stop Telegram alert failed: %s", type(error).__name__)
         else:
