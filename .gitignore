@@ -1,4 +1,6 @@
 .env
+trend-paper.env
+*.env.local
 .venv/
 __pycache__/
 *.py[cod]

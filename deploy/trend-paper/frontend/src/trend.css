@@ -1,0 +1,85 @@
+.trend-terminal, .trend-login-shell { color: #dbe7f5; background: #080f1e; font-family: Inter, ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
+.trend-terminal { height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+.trend-terminal * { box-sizing: border-box; }
+.trend-terminal button, .trend-login button { border: 1px solid #38bdf833; border-radius: 7px; padding: 8px 12px; background: #12334a; color: #d9f2ff; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.trend-terminal button:disabled, .trend-login button:disabled { opacity: .4; cursor: default; }
+.trend-terminal button:not(:disabled):hover, .trend-login button:hover { background: #1b4661; }
+.trend-terminal button:focus-visible, .trend-login :focus-visible { outline: 2px solid #38bdf8; outline-offset: 3px; }
+.trend-header { display: flex; align-items: center; gap: 28px; padding: 16px 20px; background: #101b2e; border-bottom: 1px solid #ffffff0d; flex: none; }
+.trend-brand { min-width: 160px; display: grid; gap: 7px; }
+.trend-brand b { font-size: 12px; letter-spacing: .12em; }
+.trend-brand > span { color: #95a9c3; font-weight: 600; }
+.trend-brand em { font-size: 9px; font-style: normal; color: #7dd3fc; border: 1px solid #38bdf847; padding: 2px 5px; border-radius: 4px; margin-left: 8px; }
+.trend-header-metrics { display: flex; gap: clamp(16px, 3vw, 58px); flex: 1; }
+.trend-metric { display: grid; gap: 9px; min-width: 0; align-content: center; }
+.trend-metric > span { color: #91a4c1; font-size: 10px; letter-spacing: .07em; white-space: nowrap; }
+.trend-metric strong { font-family: ui-monospace, monospace; font-size: 16px; font-weight: 600; white-space: nowrap; }
+.trend-metric small { font-size: 11px; font-weight: 400; }
+.trend-actions { display: flex; align-items: center; gap: 12px; }
+.trend-connection { font-size: 9px; letter-spacing: .03em; white-space: nowrap; }
+.trend-terminal .trend-icon { background: transparent; border-color: transparent; font-size: 19px; padding: 4px; color: #91a4c1; }
+.trend-positive { color: #33dab0 !important; }
+.trend-negative { color: #ff8390 !important; }
+.trend-warning { color: #f6c96a; }
+.trend-scope { padding: 8px 20px; background: #0c1b2b; color: #8da9bd; font-size: 10px; border-bottom: 1px solid #ffffff0b; }
+.trend-scope > span { color: #7dd3fc; letter-spacing: .1em; margin-right: 12px; font-weight: 700; }
+.trend-alert { color: #f6d17b; background: #382d141f; padding: 8px 20px; border-bottom: 1px solid #f6c96a33; }
+.trend-workspace { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 330px; min-height: 0; }
+.trend-main-column { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.trend-signal-card { margin: 15px 18px 6px; padding: 17px 19px; background: #111e31; border: 1px solid #ffffff0c; border-radius: 10px; flex: none; }
+.trend-eyebrow { color: #7f94b1; font-size: 10px; letter-spacing: .1em; font-weight: 600; }
+.trend-signal-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; }
+.trend-signal-heading h1 { font-size: 21px; line-height: 1.3; margin: 7px 0 12px; font-weight: 500; letter-spacing: -.03em; }
+.trend-signal-time { color: #8498b3; font-size: 10px; text-align: right; display: grid; gap: 5px; }
+.trend-signal-time b { font-weight: 400; color: #c0cede; }
+.trend-signal-time small { color: #7dd3fc; }
+.trend-checks { display: flex; gap: 22px; font-size: 11px; color: #a5b6cb; }
+.trend-checks i { font-style: normal; margin-right: 6px; color: #657791; }
+.trend-chart-panel { flex: 1; min-height: 150px; display: flex; flex-direction: column; padding: 10px 18px 0; }
+.trend-chart-title { display: flex; gap: 25px; align-items: center; font-size: 10px; color: #7e92ae; flex: none; height: 29px; }
+.trend-chart-title b { color: #bdd1e6; font-weight: 600; letter-spacing: .07em; }
+.trend-chart-title > span:last-child { margin-left: auto; }
+.trend-chart-title i { font-style: normal; margin-right: 16px; }
+.trend-ema-fast { color: #38bdf8; } .trend-ema-slow { color: #c084fc; } .trend-ema-long { color: #fbbf24; }
+.trend-chart-wrap { position: relative; flex: 1; min-height: 0; }
+.trend-chart-host { width: 100%; height: 100%; }
+.trend-chart-empty { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; color: #647895; font-size: 12px; }
+.trend-position-strip { flex: none; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 18px; margin: 12px 18px 0; background: #111e31; border: 1px solid #ffffff0c; border-radius: 9px; padding: 19px 16px; }
+.trend-position-strip .trend-metric strong { font-size: 14px; }
+.trend-position-strip .trend-metric > span { font-size: 9px; letter-spacing: .04em; }
+.trend-footer { display: flex; justify-content: space-between; flex: none; gap: 12px; padding: 12px 19px; font-size: 9px; color: #7185a1; }
+.trend-sidebar { border-left: 1px solid #ffffff0d; background: #0c1526; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.trend-sidebar-heading { display: flex; justify-content: space-between; padding: 17px 17px 12px; color: #9fb4cd; font-size: 10px; letter-spacing: .05em; flex: none; }
+.trend-sidebar-heading span { font-size: 9px; color: #7388a5; letter-spacing: 0; }
+.trend-position-details { padding: 0 17px 16px; border-bottom: 1px solid #ffffff0b; flex: none; }
+.trend-position-details > div { display: flex; justify-content: space-between; gap: 9px; margin: 11px 0; font-size: 11px; color: #7f94b0; }
+.trend-position-details strong { color: #c6d5e6; font-weight: 400; font-family: ui-monospace, monospace; }
+.trend-position-details small { display: block; font-size: 10px; color: #b7a473; margin: 10px 0; }
+.trend-terminal .trend-close { width: 100%; margin-top: 7px; padding: 7px; color: #f3a7af; background: #f26a780a; border-color: #f26a7826; font-size: 11px; }
+.trend-fill-list { min-height: 0; overflow-y: auto; flex: 1; scrollbar-width: thin; }
+.trend-fill { border-bottom: 1px solid #ffffff08; padding: 10px 17px; }
+.trend-fill > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-family: ui-monospace, monospace; font-size: 11px; }
+.trend-fill > div:first-child { margin-bottom: 7px; }
+.trend-fill strong { font-weight: 500; margin-right: auto; }
+.trend-fill time, .trend-fill > div:nth-child(2) { color: #8ca0ba; font-size: 10px; }
+.trend-fill > small { font-size: 9px; color: #697e9b; display: block; margin-top: 6px; text-transform: capitalize; }
+.trend-empty { padding: 8px 18px 22px; line-height: 1.8; color: #8095b2; font-size: 11px; }
+.trend-activity { padding: 16px 17px 3px; border-top: 1px solid #ffffff0b; flex: none; }
+.trend-activity p { font-size: 10px; color: #9aadc5; line-height: 1.6; margin: 12px 0; overflow-wrap: anywhere; }
+.trend-activity time { color: #5f7797; display: inline-block; margin-right: 10px; }
+.trend-decision { margin: 10px 17px 17px; padding: 10px; background: #101f31; border-radius: 6px; color: #8ba7c0; font-size: 10px; line-height: 1.6; flex: none; }
+.trend-modal-backdrop { position: fixed; inset: 0; display: grid; place-items: center; background: #020617bb; z-index: 50; padding: 20px; }
+.trend-modal { width: min(560px, 100%); max-height: 90dvh; overflow-y: auto; background: #111e31; border: 1px solid #ffffff17; border-radius: 12px; padding: 24px; }
+.trend-modal-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.trend-modal h2 { font-size: 18px; }
+.trend-modal dl > div { display: grid; grid-template-columns: 135px 1fr; gap: 20px; border-top: 1px solid #ffffff0a; padding: 12px 0; font-size: 12px; }
+.trend-modal dt { color: #8198b6; } .trend-modal dd { color: #c0d3e7; }
+.trend-modal p { margin: 14px 0 0; font-size: 11px; color: #8da4bd; line-height: 1.7; }
+.trend-login-shell { min-height: 100dvh; display: grid; place-items: center; }
+.trend-login { width: min(390px, 90vw); display: grid; gap: 16px; padding: 32px; background: #111e31; border: 1px solid #ffffff0d; border-radius: 12px; }
+.trend-login h1 { font-size: 25px; } .trend-login p { color: #8fa6c1; font-size: 12px; line-height: 1.8; }
+.trend-login label { font-size: 12px; color: #a2b8ce; }
+.trend-login input { background: #080f1e; color: #dbe7f5; border: 1px solid #ffffff17; padding: 11px; border-radius: 6px; }
+@media (max-width: 1250px) { .trend-header { gap: 18px; padding: 13px 16px; } .trend-connection { display: none; } .trend-header-metrics { gap: 18px; } .trend-workspace { grid-template-columns: minmax(0, 1fr) 295px; } .trend-position-strip { gap: 10px; } .trend-metric strong { font-size: 14px; } }
+@media (max-width: 1000px) { .trend-header { flex-wrap: wrap; } .trend-header-metrics { order: 3; width: 100%; justify-content: space-between; } .trend-actions { margin-left: auto; } .trend-position-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; } .trend-checks { gap: 10px; flex-wrap: wrap; } .trend-signal-time { display: none; } .trend-footer > span:last-child { display: none; } }
+@media (max-width: 720px) { .trend-terminal { height: auto; min-height: 100dvh; overflow: visible; } .trend-workspace { display: flex; flex-direction: column; } .trend-chart-panel { height: 340px; flex: none; } .trend-header-metrics { flex-wrap: wrap; gap: 16px; } .trend-header-metrics > div { width: 45%; } .trend-sidebar { border-left: none; border-top: 1px solid #ffffff12; } .trend-scope { line-height: 1.8; } .trend-signal-card { padding: 14px; } .trend-chart-title { gap: 12px; } .trend-chart-title > span:last-child { display: none; } .trend-signal-heading h1 { font-size: 19px; } .trend-position-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .trend-position-strip > div:last-child { grid-column: span 2; } .trend-activity { padding-top: 20px; } .trend-fill-list { max-height: 400px; } }

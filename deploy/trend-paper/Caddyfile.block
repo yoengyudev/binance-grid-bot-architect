@@ -1,0 +1,12 @@
+# Separate paper site. Existing grid host and its reverse proxy are retained.
+trend.13-239-48-244.sslip.io {
+    encode gzip
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8010
+    }
+    handle {
+        root * /var/www/trend-paper/current
+        try_files {path} /index.html
+        file_server
+    }
+}
